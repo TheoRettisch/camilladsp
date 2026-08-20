@@ -1,6 +1,5 @@
 /target
 **/*.rs.bk
-Cargo.lock
 *.raw
 *.wav
 default_config.yml
