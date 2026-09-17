@@ -458,6 +458,7 @@ mod tests {
             config::CompressorParameters {
                 channels: 1,
                 monitor_channels: None,
+                monitor_mode: None,
                 process_channels: None,
                 attack: finite!(0.0),
                 attack_unit: TimeUnit::Seconds,
