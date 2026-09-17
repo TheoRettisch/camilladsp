@@ -45,10 +45,12 @@ jobs:
           result=$?
           printf 'apply\t%s\n' "$result" >> "$E/status.tsv"
           if [ "$result" -ne 0 ]; then cat "$E/apply.log"; exit "$result"; fi
-          runcheck candidate-format cargo fmt
+          runcheck candidate-format rustfmt --edition 2024 --config skip_children=true src/config/mod.rs src/processors/mod.rs src/processors/monitor.rs src/processors/compressor.rs src/processors/noisegate.rs src/processors/lookahead_limiter.rs src/processors/compressor_monitor_tests.rs src/processors/noisegate_monitor_tests.rs tests/monitor_modes.rs tests/monitor_allocations.rs benches/monitor_modes.rs
           runcheck candidate-fmt cargo fmt --check
           runcheck candidate-f64 cargo test
           runcheck candidate-f32 env RUSTFLAGS="--cfg camillafloat_f32" CARGO_TARGET_DIR=/tmp/monitor-target-f32 cargo test
+          runcheck candidate-focused-f32 env RUSTFLAGS="--cfg camillafloat_f32" CARGO_TARGET_DIR=/tmp/monitor-target-f32 cargo test --test monitor_modes --test monitor_allocations
+          runcheck candidate-monitor-unit-f32 env RUSTFLAGS="--cfg camillafloat_f32" CARGO_TARGET_DIR=/tmp/monitor-target-f32 cargo test --lib monitor
           runcheck candidate-clippy cargo clippy --all-targets --all-features
           git add -N -- src tests benches exampleconfigs Cargo.toml README.md CHANGELOG.md
           runcheck candidate-diff-check git diff --check
