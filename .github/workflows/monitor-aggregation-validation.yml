@@ -2,9 +2,9 @@ name: Monitor aggregation draft validation
 on:
   push:
     branches: [work/monitor-aggregation-validation-20260917]
-    paths: [.rfc-bootstrap/bundle.py]
+    paths: ['.rfc-bootstrap/**']
 permissions:
-  contents: read
+  contents: write
 jobs:
   validate:
     runs-on: ubuntu-24.04
@@ -45,7 +45,11 @@ jobs:
           result=$?
           printf 'apply\t%s\n' "$result" >> "$E/status.tsv"
           if [ "$result" -ne 0 ]; then cat "$E/apply.log"; exit "$result"; fi
-          runcheck candidate-format rustfmt --edition 2024 --config skip_children=true src/config/mod.rs src/processors/mod.rs src/processors/monitor.rs src/processors/compressor.rs src/processors/noisegate.rs src/processors/lookahead_limiter.rs src/processors/compressor_monitor_tests.rs src/processors/noisegate_monitor_tests.rs tests/monitor_modes.rs tests/monitor_allocations.rs benches/monitor_modes.rs
+          python "$GITHUB_WORKSPACE/.rfc-bootstrap/revisions.py" /tmp/monitor-source > "$E/revisions.log" 2>&1
+          result=$?
+          printf 'revisions\t%s\n' "$result" >> "$E/status.tsv"
+          if [ "$result" -ne 0 ]; then cat "$E/revisions.log"; exit "$result"; fi
+          runcheck candidate-format rustfmt --edition 2024 --config skip_children=true src/config/mod.rs src/processors/mod.rs src/processors/monitor.rs src/processors/compressor.rs src/processors/noisegate.rs src/processors/lookahead_limiter.rs src/filters/lookahead_limiter.rs src/processors/compressor_monitor_tests.rs src/processors/noisegate_monitor_tests.rs tests/monitor_modes.rs tests/monitor_allocations.rs benches/monitor_modes.rs
           runcheck candidate-fmt cargo fmt --check
           runcheck candidate-f64 cargo test
           runcheck candidate-f32 env RUSTFLAGS="--cfg camillafloat_f32" CARGO_TARGET_DIR=/tmp/monitor-target-f32 cargo test
@@ -59,14 +63,37 @@ jobs:
           git diff --name-only > "$E/changed-files.txt"
           cp Cargo.lock "$E/Cargo.lock" 2>/dev/null || true
           python - "$E" <<'PY'
-          import hashlib, json, pathlib, sys
+          import hashlib, json, pathlib, shutil, sys
           e = pathlib.Path(sys.argv[1])
           results = dict(line.rstrip().split('\t') for line in (e/'status.tsv').read_text().splitlines())
+          for relative in (e/'changed-files.txt').read_text().splitlines():
+              target = e/'changed-source'/relative
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(relative, target)
           report = {'baseline': '99e97241fd73de289d34e0bcef81cc5bc5684040', 'results': results, 'patch_sha256': hashlib.sha256((e/'implementation.patch').read_bytes()).hexdigest(), 'hardware_validation': False, 'benchmarks_run': False}
           (e/'report.json').write_text(json.dumps(report, indent=2)+'\n')
           print(json.dumps(report, indent=2))
           sys.exit(any(int(value) for name,value in results.items() if name.startswith('candidate-')))
           PY
+      - name: Store reviewable implementation draft in fork only
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/monitor-source
+          test "$(git rev-parse HEAD)" = 99e97241fd73de289d34e0bcef81cc5bc5684040
+          target=refs/heads/feature/monitor-aggregation-next5
+          if [ -n "$(git ls-remote --heads origin "$target")" ]; then
+            echo 'Refusing to replace an existing implementation branch.'
+            exit 1
+          fi
+          git add -- src tests benches exampleconfigs Cargo.toml README.md CHANGELOG.md
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Add selectable monitor aggregation for dynamics processors' -m 'Implementation draft for HEnquist/camilladsp#528. Compressor and NoiseGate retain Sum; LookaheadLimiter provisionally retains Max pending maintainer confirmation. Includes software tests and documentation. No hardware validation or release assignment.'
+          git rev-parse HEAD > "$GITHUB_WORKSPACE/monitor-evidence/implementation-commit.txt"
+          git rev-parse HEAD^{tree} > "$GITHUB_WORKSPACE/monitor-evidence/implementation-tree.txt"
+          git push origin HEAD:"$target"
       - name: Retain results even on failure
         if: always()
         uses: actions/upload-artifact@v4
