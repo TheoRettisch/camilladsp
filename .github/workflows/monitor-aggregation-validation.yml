@@ -1,0 +1,74 @@
+name: Monitor aggregation draft validation
+on:
+  push:
+    branches: [work/monitor-aggregation-validation-20260917]
+    paths: [.rfc-bootstrap/bundle.py]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install development dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libdbus-1-dev libssl-dev pkg-config
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - name: Prepare exact upstream baseline
+        run: |
+          git worktree add --detach /tmp/monitor-source 99e97241fd73de289d34e0bcef81cc5bc5684040
+          mkdir -p "$GITHUB_WORKSPACE/monitor-evidence"
+          rustc -Vv > "$GITHUB_WORKSPACE/monitor-evidence/toolchain.txt"
+          cargo -V >> "$GITHUB_WORKSPACE/monitor-evidence/toolchain.txt"
+          uname -a >> "$GITHUB_WORKSPACE/monitor-evidence/toolchain.txt"
+      - name: Baseline and candidate software checks
+        shell: bash
+        run: |
+          set +e
+          E="$GITHUB_WORKSPACE/monitor-evidence"
+          cd /tmp/monitor-source
+          runcheck() {
+            local name="$1"; shift
+            "$@" > "$E/$name.log" 2>&1
+            local result=$?
+            printf '%s\t%s\n' "$name" "$result" >> "$E/status.tsv"
+          }
+          runcheck baseline-fmt cargo fmt --check
+          runcheck baseline-f64 cargo test
+          runcheck baseline-f32 env RUSTFLAGS="--cfg camillafloat_f32" CARGO_TARGET_DIR=/tmp/monitor-target-f32 cargo test
+          python "$GITHUB_WORKSPACE/.rfc-bootstrap/bundle.py" /tmp/monitor-source > "$E/apply.log" 2>&1
+          result=$?
+          printf 'apply\t%s\n' "$result" >> "$E/status.tsv"
+          if [ "$result" -ne 0 ]; then cat "$E/apply.log"; exit "$result"; fi
+          runcheck candidate-format cargo fmt
+          runcheck candidate-fmt cargo fmt --check
+          runcheck candidate-f64 cargo test
+          runcheck candidate-f32 env RUSTFLAGS="--cfg camillafloat_f32" CARGO_TARGET_DIR=/tmp/monitor-target-f32 cargo test
+          runcheck candidate-clippy cargo clippy --all-targets --all-features
+          git add -N -- src tests benches exampleconfigs Cargo.toml README.md CHANGELOG.md
+          runcheck candidate-diff-check git diff --check
+          git diff --binary > "$E/implementation.patch"
+          git diff --stat > "$E/diff-stat.txt"
+          git diff --name-only > "$E/changed-files.txt"
+          cp Cargo.lock "$E/Cargo.lock" 2>/dev/null || true
+          python - "$E" <<'PY'
+          import hashlib, json, pathlib, sys
+          e = pathlib.Path(sys.argv[1])
+          results = dict(line.rstrip().split('\t') for line in (e/'status.tsv').read_text().splitlines())
+          report = {'baseline': '99e97241fd73de289d34e0bcef81cc5bc5684040', 'results': results, 'patch_sha256': hashlib.sha256((e/'implementation.patch').read_bytes()).hexdigest(), 'hardware_validation': False, 'benchmarks_run': False}
+          (e/'report.json').write_text(json.dumps(report, indent=2)+'\n')
+          print(json.dumps(report, indent=2))
+          sys.exit(any(int(value) for name,value in results.items() if name.startswith('candidate-')))
+          PY
+      - name: Retain results even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-aggregation-evidence
+          path: monitor-evidence/
+          if-no-files-found: warn
