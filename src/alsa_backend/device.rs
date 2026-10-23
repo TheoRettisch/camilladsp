@@ -1439,11 +1439,11 @@ mod protection_tests {
         guard.install(&conf).unwrap();
         let mut retired = chunk();
         retired.waveforms[0][7] = 1.0;
-        guard.process(&mut retired, false);
+        guard.process(&mut retired);
         let trip = guard.trip();
         guard.install(&conf).unwrap();
         let mut current = chunk();
-        guard.process(&mut current, false);
+        guard.process(&mut current);
         let statuses = play_chunks(vec![retired, current]);
         assert!(
             matches!(statuses.as_slice(), [StatusMessage::PlaybackDone]),
@@ -1458,10 +1458,10 @@ mod protection_tests {
         guard.install(&configuration()).unwrap();
         let mut incomplete = chunk();
         incomplete.waveforms[1].clear();
-        guard.process(&mut incomplete, false);
+        guard.process(&mut incomplete);
         let trip = guard.trip();
         let mut current = chunk();
-        guard.process(&mut current, false);
+        guard.process(&mut current);
         let statuses = play_chunks(vec![incomplete, current]);
         assert!(
             matches!(statuses.as_slice(), [StatusMessage::PlaybackDone]),
@@ -1475,7 +1475,7 @@ mod protection_tests {
         let mut guard = Guard::new(Arc::new(Shared::default()));
         guard.install(&configuration()).unwrap();
         let mut output = chunk();
-        guard.process(&mut output, false);
+        guard.process(&mut output);
         let stamp = output.protection.unwrap();
         guard.install(&configuration()).unwrap();
         let (pcm, manager) = null_pcm();

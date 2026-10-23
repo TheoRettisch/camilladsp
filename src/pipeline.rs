@@ -271,8 +271,8 @@ impl Pipeline {
             }
         }
         let current_volume = processing_params.current_volume(0);
-        let mute = false; // Main mute is applied only after guard assessment.
-        let mut volume = filters::basicfilters::Volume::new(
+        let mute = processing_params.is_mute(0);
+        let volume = filters::basicfilters::Volume::new(
             "default",
             conf.devices.ramp_time(),
             conf.devices.volume_limit(),
@@ -283,7 +283,6 @@ impl Pipeline {
             processing_params.clone(),
             0,
         );
-        volume.defer_mute_to_guard();
         let secs_per_chunk = conf.devices.chunksize as f32 / conf.devices.samplerate as f32;
         if conf.devices.multithreaded() {
             steps = parallelize_filters(&mut steps, conf.devices.capture.channels());

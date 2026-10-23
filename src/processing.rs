@@ -134,7 +134,7 @@ pub fn run_processing(
                 Ok(AudioMessage::Audio(mut chunk)) => {
                     //trace!("AudioMessage::Audio received");
                     chunk = pipeline.process_chunk(chunk);
-                    protection.process(&mut chunk, processing_params.is_mute(0));
+                    protection.process(&mut chunk);
                     let msg = AudioMessage::Audio(chunk);
                     if tx_pb.send(msg).is_err() {
                         info!("Playback thread has already stopped.");

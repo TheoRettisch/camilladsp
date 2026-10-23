@@ -291,7 +291,7 @@ impl Guard {
         ]);
     }
 
-    pub fn process(&mut self, chunk: &mut AudioChunk, main_mute: bool) {
+    pub fn process(&mut self, chunk: &mut AudioChunk) {
         chunk.protection = None;
         let begin = monotonic_ns();
         let shape_valid = self.parameters.is_some()
@@ -321,7 +321,7 @@ impl Guard {
         if !shape_valid {
             self.latch(Reason::Coverage, None, self.frames);
         }
-        if main_mute || !self.active || self.trip.is_some() || !shape_valid {
+        if !self.active || self.trip.is_some() || !shape_valid {
             for waveform in &mut chunk.waveforms {
                 waveform.fill(0.0);
             }
@@ -421,7 +421,7 @@ pub(crate) mod tests {
         guard.install(&conf).unwrap();
         let mut input = chunk();
         input.waveforms[1][5] = 1.0;
-        guard.process(&mut input, false);
+        guard.process(&mut input);
         let stamp = input.protection.unwrap();
         let trip = guard.trip;
         let mut invalid = conf.clone();
@@ -432,23 +432,8 @@ pub(crate) mod tests {
         guard.install(&conf).unwrap();
         assert_eq!(guard.trip, trip);
         let mut safe = chunk();
-        guard.process(&mut safe, false);
+        guard.process(&mut safe);
         assert!(safe.waveforms.iter().flatten().all(|s| *s == 0.0));
-    }
-
-    #[test]
-    fn actual_pipeline_preserves_candidate_under_main_mute() {
-        let conf = configuration();
-        let params = Arc::new(crate::ProcessingParameters::new(&[0.0; 5], &[true; 5]));
-        let mut pipeline = crate::pipeline::Pipeline::from_config(conf.clone(), params);
-        let mut input = chunk();
-        input.waveforms[0][5] = 1.0;
-        let mut candidate = pipeline.process_chunk(input);
-        assert_eq!(candidate.waveforms[0][5], 1.0);
-        let mut guard = guard();
-        guard.process(&mut candidate, true);
-        assert_eq!(guard.trip.unwrap().reason, Reason::Peak);
-        assert!(candidate.waveforms.iter().flatten().all(|s| *s == 0.0));
     }
 
     #[test]
@@ -458,14 +443,14 @@ pub(crate) mod tests {
                 let mut guard = guard();
                 let mut input = chunk();
                 input.waveforms[channel][offset] = guard.peak_limit;
-                guard.process(&mut input, false);
+                guard.process(&mut input);
                 assert!(input.waveforms.iter().flatten().all(|s| *s == 0.0));
                 let trip = guard.trip.unwrap();
                 assert_eq!(trip.reason, Reason::Peak);
                 assert_eq!(trip.channel, Some(channel));
                 assert_eq!(trip.frame, offset as u64);
                 let mut safe = chunk();
-                guard.process(&mut safe, false);
+                guard.process(&mut safe);
                 assert!(safe.waveforms.iter().flatten().all(|s| *s == 0.0));
                 assert_eq!(guard.trip, Some(trip));
                 assert_eq!(guard.frames, 2 * FRAMES as u64);
@@ -475,13 +460,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nonfinite_on_any_channel_is_contained_including_under_main_mute() {
+    fn nonfinite_at_guard_on_any_channel_is_contained() {
         for channel in 0..CHANNELS {
             for sample in [PrcFmt::NAN, PrcFmt::INFINITY, PrcFmt::NEG_INFINITY] {
                 let mut guard = guard();
                 let mut input = chunk();
                 input.waveforms[channel][FRAMES - 1] = sample;
-                guard.process(&mut input, true);
+                guard.process(&mut input);
                 assert_eq!(guard.trip.unwrap().reason, Reason::Nonfinite);
                 assert!(input.waveforms.iter().flatten().all(|s| *s == 0.0));
             }
@@ -489,15 +474,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn known_safe_samples_forward_exactly_and_main_mute_is_final() {
+    fn known_safe_samples_forward_exactly() {
         let mut guard = guard();
         let mut input = chunk();
-        guard.process(&mut input, false);
+        guard.process(&mut input);
         assert!(input.waveforms.iter().flatten().all(|s| *s == 0.1));
         assert!(guard.trip.is_none());
-        guard.process(&mut input, true);
-        assert!(guard.trip.is_none());
-        assert!(input.waveforms.iter().flatten().all(|s| *s == 0.0));
     }
 
     #[test]
@@ -576,43 +558,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn loudness_main_fader_preserves_candidate_under_main_mute() {
-        let mut conf = serde_json::to_value(configuration()).unwrap();
-        conf["filters"] = serde_json::json!({"loudness": {"type": "Loudness",
-            "parameters": {"reference_level": -20}}});
-        conf["pipeline"].as_array_mut().unwrap().insert(
-            0,
-            serde_json::json!({"type": "Filter", "names": ["loudness"]}),
-        );
-        let mut conf: config::Configuration = serde_json::from_value(conf).unwrap();
-        config::validate_config(&mut conf, None).unwrap();
-        admission(&conf).unwrap();
-        let mut candidates = Vec::new();
-        for mute in [false, true] {
-            let params = Arc::new(crate::ProcessingParameters::new(&[-30.0; 5], &[mute; 5]));
-            let mut pipeline = crate::pipeline::Pipeline::from_config(conf.clone(), params);
-            let input = AudioChunk::new(
-                vec![vec![100.0; FRAMES]; CHANNELS],
-                100.0,
-                100.0,
-                FRAMES,
-                FRAMES,
-            );
-            candidates.push(pipeline.process_chunk(input));
-        }
-        assert_eq!(candidates[0].waveforms, candidates[1].waveforms);
-        let mut guard = guard();
-        guard.process(&mut candidates[1], true);
-        assert_eq!(guard.trip.unwrap().reason, Reason::Peak);
-        assert!(candidates[1].waveforms.iter().flatten().all(|s| *s == 0.0));
-    }
-
-    #[test]
     fn incomplete_coverage_is_not_silence_or_protected_progress() {
         let mut guard = guard();
         let mut input = chunk();
         input.waveforms[1].clear();
-        guard.process(&mut input, false);
+        guard.process(&mut input);
         assert_eq!(guard.trip.unwrap().reason, Reason::Coverage);
         assert_eq!(guard.frames, 0);
         assert!(input.protection.is_none());
@@ -625,7 +575,7 @@ pub(crate) mod tests {
         let mut input = chunk();
         input.waveforms[0][2] = 1.0;
         input.waveforms[3].clear();
-        guard.process(&mut input, false);
+        guard.process(&mut input);
         assert_eq!(guard.trip.unwrap().reason, Reason::Peak);
         assert!(input.protection.is_none());
     }
@@ -634,7 +584,7 @@ pub(crate) mod tests {
     fn retired_stamps_cannot_be_submitted() {
         let mut guard = guard();
         let mut input = chunk();
-        guard.process(&mut input, false);
+        guard.process(&mut input);
         let stamp = input.protection.unwrap();
         assert!(stamp.is_current());
         guard.shared.epoch.fetch_add(1, Ordering::SeqCst);
@@ -646,7 +596,7 @@ pub(crate) mod tests {
         let mut guard = guard();
         let mut input = chunk();
         input.waveforms[0][0] = 1.0;
-        guard.process(&mut input, false);
+        guard.process(&mut input);
         let first = guard.shared.guard_record.read().unwrap();
         assert_eq!(first.1[5], Reason::Peak as u64);
         assert_eq!(guard.shared.guard_record.read(), Some(first));
@@ -656,5 +606,122 @@ pub(crate) mod tests {
             .sequence
             .store(first.0 + 1, Ordering::SeqCst);
         assert!(guard.shared.guard_record.read().is_none());
+    }
+    #[test]
+    fn ordinary_mute_ramps_and_interruptions_match_original_volume() {
+        use crate::filters::basicfilters::Volume;
+        for initial_mute in [false, true] {
+            let mut conf = configuration();
+            conf.devices.volume_ramp_time = Some(400.0);
+            let params = Arc::new(crate::ProcessingParameters::new(
+                &[0.0; 5],
+                &[initial_mute; 5],
+            ));
+            let mut reference = Volume::new(
+                "reference",
+                400.0,
+                0.0,
+                0.0,
+                initial_mute,
+                FRAMES,
+                SAMPLE_RATE,
+                params.clone(),
+                0,
+            );
+            let mut pipeline = crate::pipeline::Pipeline::from_config(conf, params.clone());
+            let mut guard = guard(); // Test-only admission; production stays inactive.
+            for block in 0..420 {
+                match block {
+                    10 | 60 | 160 | 340 => params.set_mute(0, true),
+                    30 | 140 | 180 => params.set_mute(0, false),
+                    45 => params.set_target_volume(0, -6.0),
+                    260 => params.set_target_volume(0, 0.0),
+                    _ => (),
+                }
+                let mut expected = chunk();
+                reference.process_chunk(&mut expected);
+                let mut actual = pipeline.process_chunk(chunk());
+                guard.process(&mut actual);
+                assert!(guard.trip().is_none());
+                assert_eq!(
+                    actual.waveforms, expected.waveforms,
+                    "block {block}, initial mute {initial_mute}"
+                );
+                if block == 10 && !initial_mute {
+                    assert!(actual.waveforms[0][0] > 0.09);
+                    assert!(actual.waveforms[0][FRAMES - 1] < actual.waveforms[0][0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mute_cannot_qualify_an_unintegrated_guard_or_hide_unmuted_fault() {
+        let mut conf = configuration();
+        conf.devices.volume_ramp_time = Some(400.0);
+        let params = Arc::new(crate::ProcessingParameters::new(&[0.0; 5], &[true; 5]));
+        let mut pipeline = crate::pipeline::Pipeline::from_config(conf.clone(), params.clone());
+        let mut guard = Guard::new(params.protection.clone());
+        guard.install(&conf).unwrap();
+        for block in 0..160 {
+            if block == 80 {
+                params.set_mute(0, false);
+            }
+            let mut input = chunk();
+            input.waveforms[0].fill(2.0);
+            let mut candidate = pipeline.process_chunk(input);
+            if block < 80 {
+                assert!(candidate.waveforms[0].iter().all(|s| *s == 0.0));
+            }
+            guard.process(&mut candidate);
+            assert!(!guard.active);
+            assert!(candidate.waveforms.iter().flatten().all(|s| *s == 0.0));
+        }
+        assert_eq!(guard.trip().unwrap().reason, Reason::Peak);
+        assert!(!params.is_mute(0)); // The external request, not a guard/reset side effect.
+    }
+
+    #[test]
+    fn final_candidate_faults_override_an_in_progress_user_fade() {
+        for offset in [0, FRAMES - 1] {
+            for channel in [0, 1] {
+                for value in [
+                    1.0,
+                    -1.0,
+                    PrcFmt::NAN,
+                    PrcFmt::INFINITY,
+                    PrcFmt::NEG_INFINITY,
+                ] {
+                    let mut conf = configuration();
+                    conf.devices.volume_ramp_time = Some(400.0);
+                    let params = Arc::new(crate::ProcessingParameters::new(&[0.0; 5], &[false; 5]));
+                    let mut pipeline = crate::pipeline::Pipeline::from_config(conf, params.clone());
+                    let mut guard = guard();
+                    let mut previous = pipeline.process_chunk(chunk());
+                    guard.process(&mut previous);
+                    params.set_mute(0, true);
+                    let mut candidate = pipeline.process_chunk(chunk());
+                    assert!(candidate.waveforms[0][FRAMES - 1] > 0.0);
+                    // Inject after processing so neither mute nor crossover can remove it.
+                    candidate.waveforms[channel][offset] = value;
+                    guard.process(&mut candidate);
+                    assert!(candidate.waveforms.iter().flatten().all(|s| *s == 0.0));
+                    let trip = guard.trip().unwrap();
+                    assert_eq!(trip.frame, (FRAMES + offset) as u64);
+                    assert_eq!(
+                        trip.reason,
+                        if value.is_finite() {
+                            Reason::Peak
+                        } else {
+                            Reason::Nonfinite
+                        }
+                    );
+                    let mut following = pipeline.process_chunk(chunk());
+                    guard.process(&mut following);
+                    assert!(following.waveforms.iter().flatten().all(|s| *s == 0.0));
+                    assert_eq!(guard.trip(), Some(trip));
+                }
+            }
+        }
     }
 }
