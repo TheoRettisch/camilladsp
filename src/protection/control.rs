@@ -23,6 +23,7 @@ pub enum Mode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Expected {
     pub pipeline: u64,
+    pub backend: u64,
     pub reset: u64,
     pub trip_generation: u64,
     pub revision: u64,
@@ -58,6 +59,7 @@ pub struct Receipt {
     pub command_id: u64,
     pub result: Result,
     pub pipeline: u64,
+    pub backend: u64,
     pub reset: u64,
     pub revision: u64,
     pub parent_reset_generation: u64,
@@ -93,6 +95,7 @@ impl Guard {
     pub fn expected(&self) -> Expected {
         Expected {
             pipeline: self.epoch,
+            backend: self.backend,
             reset: self.reset,
             trip_generation: self.trip_generation,
             revision: self.control.revision,
@@ -102,7 +105,7 @@ impl Guard {
     pub fn state(&self) -> State {
         if self.trip.is_some() {
             State::Tripped
-        } else if self.active {
+        } else if self.active && !self.activation_inhibited() {
             // Ordinary mute preserves an already admitted fade-out trajectory.
             // candidate_observable is false and no new armed receipt is allowed.
             State::Active
@@ -123,6 +126,8 @@ impl Guard {
 
     /// No candidate or invented progress. Pause/resume needs a fresh attempt.
     pub fn pause(&mut self) {
+        self.sync_backend();
+        self.invalidate_activity();
         self.invalidate_qualification();
         self.candidate_observable = false;
         self.processing_valid = false;
@@ -131,6 +136,7 @@ impl Guard {
 
     /// Explicit wakeup service on the same owner, including capture pauses.
     pub fn control_only(&mut self, command: Command) {
+        self.sync_backend();
         self.apply_control(command, false);
         self.publish();
     }
@@ -141,6 +147,7 @@ impl Guard {
             command_id: command.id,
             result,
             pipeline: self.epoch,
+            backend: self.backend,
             reset: self.reset,
             revision: self.control.revision,
             parent_reset_generation: self.control.parent_reset_generation,
@@ -192,6 +199,7 @@ impl Guard {
                     .reset
                     .store(self.reset, std::sync::atomic::Ordering::SeqCst);
                 self.frame_floor = self.frames;
+                self.invalidate_activity();
                 self.processing_valid = false;
                 self.source_begin_ns = 0;
                 self.source_end_ns = 0;
@@ -223,6 +231,7 @@ impl Guard {
                     return Result::StateMismatch;
                 }
                 if !has_candidate
+                    || self.activation_inhibited()
                     || !self.active
                     || !self.candidate_observable
                     || self.attempt_required

@@ -1673,6 +1673,8 @@ impl PipelineStepProcessor {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
+    #[serde(skip)]
+    pub protection_identity: Option<crate::protection::identity::Identity>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]

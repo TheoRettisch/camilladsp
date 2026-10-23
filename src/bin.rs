@@ -174,7 +174,10 @@ fn run(
     );
 
     // Playback thread
-    let mut playback_dev = audiodevice::new_playback_device(conf_pb.devices);
+    let mut playback_dev = audiodevice::new_playback_device(
+        conf_pb.devices,
+        status_structs.processing.protection.clone(),
+    );
     let pb_handle = playback_dev
         .start(rx_pb, barrier_pb, tx_status_pb, status_structs.playback)
         .unwrap();

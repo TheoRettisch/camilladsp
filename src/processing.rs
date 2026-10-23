@@ -35,6 +35,7 @@ fn send_output(
     loop {
         crossbeam_channel::select! {
             send(tx, message) -> result => return result.is_ok(),
+            recv(shared.backend_wakeups()) -> _ => protection.backend_wakeup(),
             recv(shared.commands()) -> command => {
                 protection.control_only(command.expect("owned control mailbox disconnected"));
             }
@@ -151,6 +152,10 @@ pub fn run_processing(
         loop {
             let audio = crossbeam_channel::select! {
                 recv(rx_cap) -> audio => audio,
+                recv(shared.backend_wakeups()) -> _ => {
+                    protection.backend_wakeup();
+                    continue;
+                }
                 recv(shared.commands()) -> command => {
                     protection.control_only(command.expect("owned control mailbox disconnected"));
                     continue;
@@ -281,6 +286,7 @@ mod tests {
             id,
             expected: Expected {
                 pipeline: snapshot.pipeline,
+                backend: snapshot.backend,
                 reset: snapshot.reset,
                 trip_generation: snapshot.trip_generation,
                 revision: snapshot.control.revision,

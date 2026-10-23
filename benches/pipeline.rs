@@ -163,6 +163,7 @@ fn build_pipeline(chunksize: usize, multithreaded: bool, with_conv: bool) -> Pip
     mixers.insert("mix_4_to_2".to_string(), mixer);
 
     let conf = config::Configuration {
+        protection_identity: None,
         title: None,
         description: None,
         devices: config::Devices {

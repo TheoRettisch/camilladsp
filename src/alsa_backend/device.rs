@@ -61,6 +61,7 @@ use crate::{CaptureStatus, PlaybackStatus, ProcessingParameters};
 static ALSA_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 pub struct AlsaPlaybackDevice {
+    pub protection: Arc<crate::protection::Shared>,
     pub devname: String,
     pub samplerate: usize,
     pub chunksize: usize,
@@ -118,152 +119,80 @@ fn flush_protected_playback(pcmdevice: &alsa::PCM, channels: &PlaybackChannels) 
     true
 }
 
-/// Play a buffer.
+/// Play only the remaining contiguous range of a protected chunk. A PCM
+/// discontinuity returns to the owner for retirement before recovery; no retry
+/// may replay an old stream's buffer into a freshly prepared ring.
 fn play_buffer(
-    mut buffer: &[u8],
+    mut buffer: &mut [u8],
     pcmdevice: &alsa::PCM,
     io: &alsa::pcm::IO<u8>,
     millis_per_frame: f32,
     bytes_per_frame: usize,
     buf_manager: &PlaybackBufferManager,
     protection: &crate::protection::Stamp,
+    progress: &mut crate::protection::playback::Playback,
 ) -> Res<PlaybackResult> {
-    let playback_state = pcmdevice.state_raw();
-    xtrace!("Playback state {:?}", playback_state);
-    if playback_state < 0 {
-        // This should never happen but sometimes does anyway,
-        // for example if a USB device is unplugged.
-        let nixerr = Errno::from_raw(-playback_state);
-        error!(
-            "PB: Alsa snd_pcm_state() of playback device returned an unexpected error: {nixerr}"
-        );
-        return Err(Box::new(nixerr));
-    } else if playback_state == alsa_sys::SND_PCM_STATE_XRUN as i32 {
-        warn!("PB: Prepare playback after buffer underrun");
-        pcmdevice.prepare()?;
-        buf_manager.sleep_for_target_delay(millis_per_frame);
-    } else if playback_state == alsa_sys::SND_PCM_STATE_SUSPENDED as i32 {
-        recover_suspended_pcm(pcmdevice, "PB")?;
-        buf_manager.sleep_for_target_delay(millis_per_frame);
-    } else if playback_state == alsa_sys::SND_PCM_STATE_PREPARED as i32 {
-        info!("PB: Starting playback from Prepared state");
-        // This sleep applies for the first chunk and in combination with the threshold=1 (i.e. start at first write)
-        // and the next chunk generates the initial target delay.
-        buf_manager.sleep_for_target_delay(millis_per_frame);
-    } else if playback_state == alsa_sys::SND_PCM_STATE_PAUSED as i32 {
-        debug!("PB: Device is in paused state, unpausing.");
-        if let Err(err) = pcmdevice.pause(false) {
-            warn!("Error unpausing playback device {err:?}");
-        }
-    } else if playback_state != alsa_sys::SND_PCM_STATE_RUNNING as i32 {
-        warn!(
-            "PB: device is in an unexpected state: {}",
-            state_desc(playback_state as u32)
-        );
+    if !progress.accepts(protection) {
+        return Ok(PlaybackResult::Discarded);
     }
-
-    let frames_to_write = buffer.len() / bytes_per_frame;
-    let mut retry_count: usize = 0;
-    loop {
-        retry_count += 1;
-        if retry_count >= 100 {
-            warn!("PB: giving up after {retry_count} write attempts");
-            return Err(DeviceError::new("Aborting playback after too many write attempts").into());
+    match pcmdevice.state() {
+        alsa::pcm::State::Prepared if progress.permits_prepared() => {
+            buf_manager.sleep_for_target_delay(millis_per_frame);
         }
-        let timeout_millis = (2.0 * millis_per_frame * frames_to_write as f32) as u32;
-        trace!("PB: write try {retry_count}, pcmdevice.wait with timeout {timeout_millis} ms");
-        let start = if log_enabled!(log::Level::Trace) {
-            Some(Instant::now())
-        } else {
-            None
-        };
-        match pcmdevice.wait(Some(timeout_millis)) {
-            Ok(true) => {
-                trace!(
-                    "PB: device waited for {:?}, ready",
-                    start.map(|s| s.elapsed())
-                );
-            }
-            Ok(false) => {
-                trace!("PB: Wait timed out, playback device takes too long to drain buffer");
-                return Ok(PlaybackResult::Stalled);
-            }
-            Err(err) => match Errno::from_raw(err.errno()) {
-                Errno::EPIPE => {
-                    warn!("PB: wait underrun, trying to recover. Error: {err}");
-                    trace!("snd_pcm_prepare");
-                    pcmdevice.prepare()?;
-                }
-                Errno::ESTRPIPE => {
-                    warn!("PB: wait interrupted by suspend, trying to recover. Error: {err}");
-                    recover_suspended_pcm(pcmdevice, "PB")?;
-                    buf_manager.sleep_for_target_delay(millis_per_frame);
-                }
-                _ => {
-                    warn!(
-                        "PB: device failed while waiting for available buffer space, error: {err}"
-                    );
-                    return Err(Box::new(err));
-                }
-            },
+        alsa::pcm::State::Paused => pcmdevice.pause(false)?,
+        alsa::pcm::State::Running => {}
+        _ => return Ok(PlaybackResult::Discarded),
+    }
+    let size = buf_manager.data().buffersize() as u64;
+    let write_begin = crate::protection::monotonic_ns();
+    for _ in 0..100 {
+        let remaining = buffer.len() / bytes_per_frame;
+        let timeout = (2.0 * millis_per_frame * remaining as f32) as u32;
+        if !pcmdevice.wait(Some(timeout))? {
+            return Ok(PlaybackResult::Stalled);
         }
-
-        //trace!("Delay BEFORE writing {} is {:?} frames",  buffer.len() / bytes_per_frame, pcmdevice.status().ok().map(|status| status.get_delay()));
-        if !protection.is_current() {
+        if !protection.is_stream_current() {
             return Ok(PlaybackResult::Discarded);
         }
+        if !protection.is_current() {
+            // A policy reset preserves write accounting. Old-reset candidates
+            // become same-length zeros, including a not-yet-written suffix.
+            buffer.fill(0);
+        }
         match io.writei(buffer) {
-            Ok(frames_written) => {
-                let cur_frames_to_write = buffer.len() / bytes_per_frame;
-                //trace!("Delay AFTER writing {} is {:?} frames", frames_written, pcmdevice.status().ok().map(|status| status.get_delay()));
-                if frames_written == cur_frames_to_write {
-                    trace!("PB: wrote {frames_written} frames to playback device as requested");
-                    break;
-                } else {
-                    trace!(
-                        "PB: wrote {frames_written} instead of requested {cur_frames_to_write}, trying again to write the rest"
-                    );
-                    buffer = &buffer[frames_written * bytes_per_frame..];
-                    // repeat writing
-                    continue;
-                }
+            Ok(frames) => {
+                progress
+                    .written(frames, remaining)
+                    .map_err(DeviceError::new)?;
+                buffer = &mut buffer[frames * bytes_per_frame..];
             }
-            Err(err) => match Errno::from_raw(err.errno()) {
-                Errno::EAGAIN => {
-                    trace!("PB: encountered EAGAIN error on write, trying again");
-                    continue;
-                }
-                Errno::EPIPE => {
-                    warn!("PB: write underrun, trying to recover. Error: {err}");
-                    trace!("snd_pcm_prepare");
-                    pcmdevice.prepare()?;
-                    buf_manager.sleep_for_target_delay(millis_per_frame);
-                    if !protection.is_current() {
-                        return Ok(PlaybackResult::Discarded);
-                    }
-                    io.writei(buffer)?;
-                    break;
-                }
-                Errno::ESTRPIPE => {
-                    warn!("PB: write interrupted by suspend, trying to recover. Error: {err}");
-                    recover_suspended_pcm(pcmdevice, "PB")?;
-                    buf_manager.sleep_for_target_delay(millis_per_frame);
-                    continue;
-                }
-                _ => {
-                    warn!("PB: write failed, error: {err}");
-                    return Err(Box::new(err));
-                }
-            },
-        };
+            Err(err) if Errno::from_raw(err.errno()) == Errno::EAGAIN => continue,
+            Err(err) => return Err(Box::new(err)),
+        }
+        // Positive writes are accounted before state/availability or logging.
+        // Observe only RUNNING around the hardware-synchronized avail read.
+        if pcmdevice.state() != alsa::pcm::State::Running {
+            return Ok(PlaybackResult::Discarded);
+        }
+        let begin = crate::protection::monotonic_ns();
+        let available = pcmdevice.avail()?;
+        let end = crate::protection::monotonic_ns();
+        if pcmdevice.state() != alsa::pcm::State::Running {
+            return Ok(PlaybackResult::Discarded);
+        }
+        progress
+            .observe(size, available, begin, end)
+            .map_err(DeviceError::new)?;
+        if buffer.is_empty() {
+            progress.completed(protection, write_begin, crate::protection::monotonic_ns());
+            return Ok(if protection.is_stream_current() {
+                PlaybackResult::Normal
+            } else {
+                PlaybackResult::Discarded
+            });
+        }
     }
-    // Retirement may also race the final successful write. Flush that ring
-    // before admitting another epoch and never publish this chunk's meters.
-    if protection.is_current() {
-        Ok(PlaybackResult::Normal)
-    } else {
-        Ok(PlaybackResult::Discarded)
-    }
+    Err(DeviceError::new("Aborting playback after too many write attempts").into())
 }
 
 /// Capture a buffer.
@@ -518,7 +447,7 @@ fn playback_loop_bytes(
     let millis_per_frame: f32 = 1000.0 / params.samplerate as f32;
     let mut device_stalled = false;
     let mut pcm_paused = false;
-    let mut previous_protection: Option<crate::protection::Stamp> = None;
+    let mut progress = crate::protection::playback::Playback::new(params.protection.clone());
     let can_pause = pcmdevice
         .hw_params_current()
         .map(|p| p.can_pause())
@@ -529,8 +458,6 @@ fn playback_loop_bytes(
     let io = pcmdevice.io_bytes();
     debug!("Playback loop uses a buffer of {} frames", params.chunksize);
     let mut buffer = vec![0u8; params.chunksize * params.bytes_per_frame];
-    let zero_stall_buf =
-        vec![0u8; buf_manager.data().buffersize() as usize * params.bytes_per_frame];
     let pcminfo = pcmdevice.info().unwrap();
     let card = pcminfo.get_card();
     let device = pcminfo.get_device();
@@ -571,37 +498,29 @@ fn playback_loop_bytes(
         }
     };
     loop {
-        let eos_in_drain = if device_stalled {
-            drain_check_eos(&channels.audio)
-        } else {
-            None
-        };
-        let msg = match eos_in_drain {
-            Some(eos) => Ok(eos),
-            None => {
-                /* waiting for a new message */
-                //trace!("PB: delay BEFORE chunk recv: {:?} frames", pcmdevice.status().ok().map(|status| status.get_delay()));
-                channels.audio.recv()
-            } /* waiting for a new message */
-        };
-        let rejected_chunk = matches!(&msg, Ok(AudioMessage::Audio(chunk))
-            if chunk.protection.as_ref().is_none_or(|stamp| !stamp.is_current()));
-        if rejected_chunk
-            || previous_protection
-                .as_ref()
-                .is_some_and(|stamp| !stamp.is_current())
-        {
+        let msg = channels.audio.recv();
+        if progress.pipeline_changed() {
+            progress.retire();
             if !flush_protected_playback(pcmdevice, &channels) {
                 break;
             }
-            previous_protection = None;
             device_stalled = false;
             pcm_paused = false;
             timer.restart();
             buffer_avg.restart();
-            if rejected_chunk {
-                continue;
+        }
+        let rejected_chunk = matches!(&msg, Ok(AudioMessage::Audio(chunk))
+            if chunk.protection.as_ref().is_none_or(|stamp| !stamp.is_stream_current()));
+        if rejected_chunk {
+            // Retired frames are discarded without disturbing the new stream.
+            // Missing stamps also invalidate any existing ring continuity.
+            if matches!(&msg, Ok(AudioMessage::Audio(chunk)) if chunk.protection.is_none()) {
+                progress.retire();
+                if !flush_protected_playback(pcmdevice, &channels) {
+                    break;
+                }
             }
+            continue;
         }
         match msg {
             Ok(AudioMessage::Audio(mut chunk)) => {
@@ -624,20 +543,21 @@ fn playback_loop_bytes(
                 chunk.update_stats(&mut chunk_stats);
                 conversion_result =
                     chunk_to_buffer_rawbytes(chunk, &mut buffer, &params.sample_format);
+                progress.converted(conversion_result.1);
 
                 let playback_res = play_buffer(
-                    &buffer,
+                    &mut buffer,
                     pcmdevice,
                     &io,
                     millis_per_frame,
                     params.bytes_per_frame,
                     buf_manager,
                     &protection,
+                    &mut progress,
                 );
                 pcm_paused = false;
                 device_stalled = match playback_res {
                     Ok(PlaybackResult::Normal) => {
-                        previous_protection = Some(protection);
                         if device_stalled {
                             info!("PB: device resumed normal operation");
                             timer.restart();
@@ -645,49 +565,34 @@ fn playback_loop_bytes(
                         }
                         false
                     }
-                    Ok(PlaybackResult::Discarded) => {
+                    Ok(PlaybackResult::Discarded | PlaybackResult::Stalled) => {
+                        progress.retire();
                         if !flush_protected_playback(pcmdevice, &channels) {
                             break;
                         }
-                        previous_protection = None;
-                        device_stalled = false;
+                        device_stalled = true;
                         timer.restart();
                         buffer_avg.restart();
                         continue;
                     }
-                    Ok(PlaybackResult::Stalled) => {
-                        if !device_stalled {
-                            // first stall detected
-                            info!("PB: device stalled");
-                            // restarting the device to drop outdated samples
-                            pcmdevice
-                                .drop()
-                                .unwrap_or_else(|err| warn!("PB: Playback error {err:?}"));
-                            pcmdevice
-                                .prepare()
-                                .unwrap_or_else(|err| warn!("PB: Playback error {err:?}"));
-                            // Write preallocated zeros so pcmdevice.wait can detect when playback starts draining again.
-                            let stall_bytes =
-                                buf_manager.frames_to_stall() as usize * params.bytes_per_frame;
-                            match io.writei(&zero_stall_buf[..stall_bytes]) {
-                                Ok(frames) => {
-                                    trace!("PB: Wrote {frames} zero frames");
-                                }
-                                Err(err) => {
-                                    warn!("PB: Writing stall-check zeros failed with {err:?}");
-                                }
-                            };
-                        }
-                        true
-                    }
                     Err(msg) => {
+                        // Publish retirement before diagnostics or PCM recovery.
+                        progress.retire();
+                        if !flush_protected_playback(pcmdevice, &channels) {
+                            break;
+                        }
                         channels
                             .status
                             .send(StatusMessage::PlaybackError(msg.to_string()))
                             .unwrap_or(());
-                        device_stalled
+                        break;
                     }
                 };
+                if !protection.is_current() {
+                    // Same-length reset zeros were written, but this chunk's
+                    // old samples are not current telemetry/meter evidence.
+                    continue;
+                }
                 if !device_stalled {
                     // updates only for non-stalled device
                     crate::update_playback_signal_status(
@@ -751,6 +656,7 @@ fn playback_loop_bytes(
                 }
             }
             Ok(AudioMessage::EndOfStream) => {
+                progress.retire();
                 channels
                     .status
                     .send(StatusMessage::PlaybackDone)
@@ -764,6 +670,7 @@ fn playback_loop_bytes(
                 break;
             }
             Err(err) => {
+                progress.retire();
                 error!("PB: Message channel error: {err}");
                 channels
                     .status
@@ -789,16 +696,6 @@ fn playback_loop_bytes(
             }
         };
     }
-}
-
-fn drain_check_eos(audio: &crossbeam_channel::Receiver<AudioMessage>) -> Option<AudioMessage> {
-    let mut eos: Option<AudioMessage> = None;
-    while let Some(msg) = audio.try_iter().next() {
-        if let AudioMessage::EndOfStream = msg {
-            eos = Some(msg);
-        }
-    }
-    eos
 }
 
 fn capture_loop_bytes(
@@ -1193,6 +1090,7 @@ impl PlaybackDevice for AlsaPlaybackDevice {
         status_channel: crossbeam_channel::Sender<StatusMessage>,
         playback_status: Arc<RwLock<PlaybackStatus>>,
     ) -> Res<Box<thread::JoinHandle<()>>> {
+        let protection = self.protection.clone();
         let devname = self.devname.clone();
         let target_level = if self.target_level > 0 {
             self.target_level
@@ -1228,6 +1126,7 @@ impl PlaybackDevice for AlsaPlaybackDevice {
                         barrier.wait();
                         debug!("Starting playback loop");
                         let pb_params = PlaybackParams {
+                            protection,
                             channels,
                             target_level,
                             adjust_period,
@@ -1389,7 +1288,11 @@ mod protection_tests {
         (pcm, manager)
     }
 
-    fn play_chunks(chunks: Vec<crate::audiochunk::AudioChunk>) -> Vec<StatusMessage> {
+    fn play_chunks(
+        chunks: Vec<crate::audiochunk::AudioChunk>,
+        shared: Arc<Shared>,
+        expect_meter: bool,
+    ) -> Vec<StatusMessage> {
         let (pcm, manager) = null_pcm();
         let (tx_audio, rx_audio) = crossbeam_channel::unbounded();
         let (tx_status, rx_status) = crossbeam_channel::unbounded();
@@ -1411,6 +1314,7 @@ mod protection_tests {
             },
             &pcm,
             PlaybackParams {
+                protection: shared,
                 channels: CHANNELS,
                 target_level: 0,
                 adjust_period: 0.0,
@@ -1423,11 +1327,8 @@ mod protection_tests {
             },
             &manager,
         );
-        // A later admitted zero chunk still reaches playback after rejection.
-        assert_eq!(
-            status.read().signal_peak.last().unwrap().values,
-            vec![0.0; CHANNELS]
-        );
+        let observed = status.read().signal_peak.last().map(|r| r.values.clone());
+        assert_eq!(observed, expect_meter.then(|| vec![0.0; CHANNELS]));
         assert_eq!(status.read().clipped_samples, 0);
         rx_status.try_iter().collect()
     }
@@ -1444,7 +1345,7 @@ mod protection_tests {
         guard.install(&conf).unwrap();
         let mut current = chunk();
         guard.process(&mut current);
-        let statuses = play_chunks(vec![retired, current]);
+        let statuses = play_chunks(vec![retired, current], guard.shared.clone(), true);
         assert!(
             matches!(statuses.as_slice(), [StatusMessage::PlaybackDone]),
             "playback did not reach normal end of stream"
@@ -1462,11 +1363,22 @@ mod protection_tests {
         let trip = guard.trip();
         let mut current = chunk();
         guard.process(&mut current);
-        let statuses = play_chunks(vec![incomplete, current]);
+        // The missing stamp retires this stream. Already queued frames cannot
+        // become evidence for its replacement merely because they were safe.
+        let backend = guard.expected().backend;
+        let statuses = play_chunks(vec![incomplete, current], guard.shared.clone(), false);
         assert!(
             matches!(statuses.as_slice(), [StatusMessage::PlaybackDone]),
             "playback did not reach normal end of stream"
         );
+        assert_eq!(guard.trip(), trip);
+        guard.backend_wakeup();
+        assert!(guard.expected().backend > backend);
+        let mut fresh = chunk();
+        guard.process(&mut fresh);
+        assert!(fresh.protection.as_ref().unwrap().is_current());
+        let statuses = play_chunks(vec![fresh], guard.shared.clone(), true);
+        assert!(matches!(statuses.as_slice(), [StatusMessage::PlaybackDone]));
         assert_eq!(guard.trip(), trip);
     }
 
@@ -1480,13 +1392,14 @@ mod protection_tests {
         guard.install(&configuration()).unwrap();
         let (pcm, manager) = null_pcm();
         let result = play_buffer(
-            &vec![0; FRAMES * CHANNELS * 3],
+            &mut vec![0; FRAMES * CHANNELS * 3],
             &pcm,
             &pcm.io_bytes(),
             1000.0 / SAMPLE_RATE as f32,
             CHANNELS * 3,
             &manager,
             &stamp,
+            &mut crate::protection::playback::Playback::new(guard.shared.clone()),
         );
         assert!(
             matches!(result, Ok(PlaybackResult::Discarded)),

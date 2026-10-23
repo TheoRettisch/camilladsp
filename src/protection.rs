@@ -10,15 +10,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod control;
+pub mod identity;
 #[cfg(test)]
 mod lifecycle_tests;
+pub mod playback;
+pub mod wire;
 use control::{Command, Control, Mode, Operation, Receipt, State};
 
 pub const CHANNELS: usize = 24;
 pub const FRAMES: usize = 256;
 pub const SAMPLE_RATE: usize = 48_000;
 // Initial policy's local window. Full sustained-policy implementation remains
-// required before a production context can be supplied.
+// required before production activation can be enabled.
 pub const QUALIFICATION_FRAMES: u64 = 2 * SAMPLE_RATE as u64;
 
 fn bump(value: u64) -> u64 {
@@ -136,16 +139,20 @@ impl<const N: usize> AtomicRecord<N> {
 
     fn read(&self) -> Option<(u64, [u64; N])> {
         for _ in 0..3 {
-            let before = self.sequence.load(Ordering::SeqCst);
-            if before & 1 != 0 {
-                continue;
-            }
-            let values = std::array::from_fn(|i| self.values[i].load(Ordering::SeqCst));
-            if before == self.sequence.load(Ordering::SeqCst) {
-                return Some((before, values));
+            if let Some(record) = self.read_once() {
+                return Some(record);
             }
         }
         None
+    }
+
+    fn read_once(&self) -> Option<(u64, [u64; N])> {
+        let before = self.sequence.load(Ordering::SeqCst);
+        if before & 1 != 0 {
+            return None;
+        }
+        let values = std::array::from_fn(|i| self.values[i].load(Ordering::SeqCst));
+        (before == self.sequence.load(Ordering::SeqCst)).then_some((before, values))
     }
 }
 
@@ -169,8 +176,14 @@ pub struct Trip {
 #[derive(Debug)]
 pub struct Shared {
     epoch: AtomicU64,
+    backend: AtomicU64,
     reset: AtomicU64,
-    guard_record: AtomicRecord<29>,
+    guard_record: AtomicRecord<43>,
+    playback_record: AtomicRecord<43>,
+    host: Option<wire::Host>,
+    conversion_count: AtomicU64,
+    backend_wakeup: crossbeam_channel::Sender<()>,
+    backend_wakeup_rx: crossbeam_channel::Receiver<()>,
     commands: crossbeam_channel::Sender<Command>,
     command_rx: crossbeam_channel::Receiver<Command>,
 }
@@ -178,22 +191,29 @@ pub struct Shared {
 impl Default for Shared {
     fn default() -> Self {
         let (commands, command_rx) = crossbeam_channel::bounded(1);
+        let (backend_wakeup, backend_wakeup_rx) = crossbeam_channel::bounded(1);
         Self {
             epoch: AtomicU64::new(0),
+            backend: AtomicU64::new(1),
             reset: AtomicU64::new(0),
             guard_record: AtomicRecord::default(),
+            playback_record: AtomicRecord::default(),
+            host: wire::Host::load(),
+            conversion_count: AtomicU64::new(0),
+            backend_wakeup,
+            backend_wakeup_rx,
             commands,
             command_rx,
         }
     }
 }
 
-/// Internal coherent processing record. This deliberately contains no claimed
-/// backend consumption or version-1 wire identity/telemetry.
+/// Coherent processing-owner record. Playback consumption has a separate writer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub sequence: u64,
     pub pipeline: u64,
+    pub backend: u64,
     pub reset: u64,
     pub frame_floor: u64,
     pub frames: u64,
@@ -207,6 +227,11 @@ pub struct Snapshot {
     pub trip_generation: u64,
     pub trip: Option<Trip>,
     pub control: Control,
+    pub identity: identity::Identity,
+    pub final_guard: bool,
+    pub activity_generation: u64,
+    pub silent_frames: u64,
+    pub last_active_end_frame: u64,
 }
 
 impl Shared {
@@ -219,16 +244,27 @@ impl Shared {
         &self.command_rx
     }
 
+    pub(crate) fn backend_wakeups(&self) -> &crossbeam_channel::Receiver<()> {
+        &self.backend_wakeup_rx
+    }
+
     /// Read-only projection; publication and epoch retirement belong to Guard.
     pub fn guard_snapshot(&self) -> Option<Snapshot> {
+        (0..3).find_map(|_| self.guard_snapshot_once())
+    }
+
+    fn guard_snapshot_once(&self) -> Option<Snapshot> {
         let epoch = self.epoch.load(Ordering::SeqCst);
+        let backend = self.backend.load(Ordering::SeqCst);
         let reset = self.reset.load(Ordering::SeqCst);
-        let (sequence, v) = self.guard_record.read()?;
+        let (sequence, v) = self.guard_record.read_once()?;
         if sequence == 0
             || v[0] != epoch
             || v[9] != reset
+            || v[29] != backend
             || epoch != self.epoch.load(Ordering::SeqCst)
             || reset != self.reset.load(Ordering::SeqCst)
+            || backend != self.backend.load(Ordering::SeqCst)
         {
             return None;
         }
@@ -259,6 +295,7 @@ impl Shared {
         Some(Snapshot {
             sequence,
             pipeline: v[0],
+            backend: v[29],
             frames: v[1],
             source_begin_ns: v[2],
             source_end_ns: v[3],
@@ -291,6 +328,7 @@ impl Shared {
                     command_id: v[21],
                     result,
                     pipeline: v[23],
+                    backend: v[30],
                     reset: v[24],
                     revision: v[25],
                     parent_reset_generation: v[26],
@@ -299,6 +337,14 @@ impl Shared {
                 // Not exported: it is an owner-side replay fence, not status.
                 command_high_water: 0,
             },
+            identity: identity::Identity {
+                graph: v[31..35].try_into().unwrap(),
+                profile: v[35..39].try_into().unwrap(),
+            },
+            final_guard: v[39] != 0,
+            activity_generation: v[40],
+            silent_frames: v[41],
+            last_active_end_frame: v[42],
         })
     }
 }
@@ -308,17 +354,23 @@ impl Shared {
 pub struct Stamp {
     shared: Arc<Shared>,
     epoch: u64,
+    backend: u64,
     reset: u64,
     pub frame_begin: u64,
     pub frame_end: u64,
     pub source_begin_ns: u64,
     pub source_end_ns: u64,
+    pub rms_power: [f64; CHANNELS],
 }
 
 impl Stamp {
-    pub fn is_current(&self) -> bool {
+    pub fn is_stream_current(&self) -> bool {
         self.epoch == self.shared.epoch.load(Ordering::SeqCst)
-            && self.reset == self.shared.reset.load(Ordering::SeqCst)
+            && self.backend == self.shared.backend.load(Ordering::SeqCst)
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.is_stream_current() && self.reset == self.shared.reset.load(Ordering::SeqCst)
     }
 }
 
@@ -347,8 +399,9 @@ pub fn monotonic_ns() -> u64 {
 
 #[derive(Debug)]
 pub struct Guard {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
     epoch: u64,
+    backend: u64,
     parameters: Option<Parameters>,
     peak_limit: PrcFmt,
     frames: u64,
@@ -368,11 +421,18 @@ pub struct Guard {
     // No production caller supplies a context until wire/backend/policy and
     // transition acceptance are complete. Tests exercise this same lifecycle.
     pub(crate) active: bool,
+    #[cfg(test)]
+    activation_inhibited: bool,
+    identity: Option<identity::Identity>,
+    activity_generation: u64,
+    silent_frames: u64,
+    last_active_end_frame: u64,
 }
 
 impl Guard {
     pub fn new(shared: Arc<Shared>) -> Self {
         Self {
+            backend: shared.backend.load(Ordering::SeqCst),
             shared,
             epoch: 0,
             parameters: None,
@@ -392,10 +452,17 @@ impl Guard {
             attempt_required: true,
             last_main_mute: None,
             active: false,
+            #[cfg(test)]
+            activation_inhibited: true,
+            identity: None,
+            activity_generation: 0,
+            silent_frames: 0,
+            last_active_end_frame: 0,
         }
     }
 
     pub fn install(&mut self, conf: &config::Configuration) -> Res<()> {
+        self.sync_backend();
         // Retire queued stamps even when the replacement is invalid.
         self.epoch = self
             .shared
@@ -405,6 +472,8 @@ impl Guard {
             .unwrap();
         assert!(self.epoch <= i64::MAX as u64);
         self.parameters = None;
+        self.identity = None;
+        self.invalidate_activity();
         self.frames = 0;
         self.frame_floor = 0;
         self.processing_valid = false;
@@ -417,8 +486,22 @@ impl Guard {
         let parameters = admission(conf)?;
         self.peak_limit = 10.0_f64.powf(parameters.max_allowed_peak_db / 20.0) as PrcFmt;
         self.parameters = Some(parameters);
+        self.identity = conf.protection_identity;
         self.publish();
         Ok(())
+    }
+
+    // Fixed build-time barrier until the separately reviewed activation gate.
+    // Only the test build carries a bypass field; no production option exists.
+    fn activation_inhibited(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.activation_inhibited
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
     }
 
     pub fn trip(&self) -> Option<Trip> {
@@ -451,6 +534,7 @@ impl Guard {
         });
         let owner = self.control.owner.unwrap_or(0);
         let receipt = self.control.last_command;
+        let identity = self.identity.unwrap_or_default();
         self.shared.guard_record.publish([
             self.epoch,
             self.frames,
@@ -481,6 +565,20 @@ impl Guard {
             receipt.map_or(0, |r| r.parent_reset_generation),
             receipt.map_or(0, |r| r.qualification_id),
             self.processing_valid as u64,
+            self.backend,
+            receipt.map_or(0, |r| r.backend),
+            identity.graph[0],
+            identity.graph[1],
+            identity.graph[2],
+            identity.graph[3],
+            identity.profile[0],
+            identity.profile[1],
+            identity.profile[2],
+            identity.profile[3],
+            (self.parameters.is_some() && self.identity.is_some()) as u64,
+            self.activity_generation,
+            self.silent_frames,
+            self.last_active_end_frame,
         ]);
     }
 
@@ -489,6 +587,7 @@ impl Guard {
     }
 
     pub fn process_with_command(&mut self, chunk: &mut AudioChunk, command: Option<Command>) {
+        self.sync_backend();
         let armed = command.filter(|c| c.operation == Operation::Context(Mode::Armed));
         if let Some(command) = command.filter(|c| c.operation != Operation::Context(Mode::Armed)) {
             self.apply_control(command, false);
@@ -527,7 +626,7 @@ impl Guard {
             // Current-chunk hazards and qualification precede armed receipt.
             self.apply_control(command, true);
         }
-        if !self.active || self.trip.is_some() || !shape_valid {
+        if self.activation_inhibited() || !self.active || self.trip.is_some() || !shape_valid {
             for waveform in &mut chunk.waveforms {
                 waveform.fill(0.0);
             }
@@ -539,6 +638,20 @@ impl Guard {
             self.frames = self.frames.checked_add(FRAMES as u64).unwrap();
             assert!(self.frames <= i64::MAX as u64);
         }
+        let mut rms_power = [0.0; CHANNELS];
+        if shape_valid {
+            for (rms, waveform) in rms_power.iter_mut().zip(&chunk.waveforms) {
+                *rms = waveform.iter().map(|x| x * x).sum::<PrcFmt>() as f64 / FRAMES as f64;
+            }
+            if rms_power.iter().any(|power| *power > 1e-7) {
+                self.silent_frames = 0;
+                self.last_active_end_frame = self.frames;
+            } else {
+                self.silent_frames = self.silent_frames.checked_add(FRAMES as u64).unwrap();
+            }
+        } else {
+            self.invalidate_activity();
+        }
         let end = monotonic_ns();
         self.processing_valid = shape_valid;
         self.source_begin_ns = if shape_valid { begin } else { 0 };
@@ -548,13 +661,43 @@ impl Guard {
             chunk.protection = Some(Stamp {
                 shared: self.shared.clone(),
                 epoch: self.epoch,
+                backend: self.backend,
                 reset: self.reset,
                 frame_begin,
                 frame_end: self.frames,
                 source_begin_ns: begin,
                 source_end_ns: end,
+                rms_power,
             });
         }
+    }
+
+    // Only the processing owner rebases protected frames. Playback retires its
+    // atomic generation before any PCM recovery; old queued stamps then fail.
+    fn sync_backend(&mut self) {
+        let backend = self.shared.backend.load(Ordering::SeqCst);
+        if backend != self.backend {
+            self.backend = backend;
+            self.frames = 0;
+            self.frame_floor = 0;
+            self.processing_valid = false;
+            self.source_begin_ns = 0;
+            self.source_end_ns = 0;
+            self.candidate_observable = false;
+            self.invalidate_activity();
+            self.invalidate_qualification();
+        }
+    }
+
+    pub fn backend_wakeup(&mut self) {
+        self.sync_backend();
+        self.publish();
+    }
+
+    fn invalidate_activity(&mut self) {
+        self.activity_generation = bump(self.activity_generation);
+        self.silent_frames = 0;
+        self.last_active_end_frame = 0;
     }
 
     fn observe_main_volume(&mut self, chunk: &AudioChunk, shape_valid: bool) {
@@ -611,6 +754,7 @@ pub(crate) mod tests {
         guard.parameters = Some(parameters());
         guard.peak_limit = 10.0_f64.powf(-0.5 / 20.0) as PrcFmt;
         guard.active = true;
+        guard.activation_inhibited = false;
         guard
     }
 

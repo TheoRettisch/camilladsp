@@ -65,6 +65,7 @@ pub struct CaptureParams {
 }
 
 pub struct PlaybackParams {
+    pub protection: Arc<crate::protection::Shared>,
     pub channels: usize,
     pub target_level: usize,
     pub adjust_period: f32,

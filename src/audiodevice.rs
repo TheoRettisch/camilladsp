@@ -116,7 +116,10 @@ pub trait CaptureDevice {
 }
 
 /// Create a playback device.
-pub fn new_playback_device(conf: config::Devices) -> Box<dyn PlaybackDevice> {
+pub fn new_playback_device(
+    conf: config::Devices,
+    protection: Arc<crate::protection::Shared>,
+) -> Box<dyn PlaybackDevice> {
     match conf.playback {
         #[cfg(target_os = "linux")]
         config::PlaybackDevice::Alsa {
@@ -124,6 +127,8 @@ pub fn new_playback_device(conf: config::Devices) -> Box<dyn PlaybackDevice> {
             ref device,
             format,
         } => Box::new(alsadevice::AlsaPlaybackDevice {
+            #[cfg(not(feature = "threaded-alsa"))]
+            protection,
             devname: device.clone(),
             samplerate: conf.samplerate,
             chunksize: conf.chunksize,

@@ -11,6 +11,7 @@ fn setup(muted: bool, ramp_ms: f32) -> (Arc<ProcessingParameters>, Pipeline, Gua
     conf.devices.volume_ramp_time = Some(ramp_ms);
     let pipeline = Pipeline::from_config(conf.clone(), params.clone());
     let mut guard = Guard::new(params.protection.clone());
+    guard.activation_inhibited = false; // Offline forwarding fixture only.
     guard.install(&conf).unwrap();
     (params, pipeline, guard)
 }
@@ -398,6 +399,7 @@ fn bounded_mailbox_rejects_a_second_pending_command() {
         id: 1,
         expected: Expected {
             pipeline: 0,
+            backend: 1,
             reset: 0,
             trip_generation: 0,
             revision: 0,

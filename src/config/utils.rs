@@ -801,6 +801,7 @@ pub fn validate_config(conf: &mut Configuration, filename: Option<&str>) -> Res<
         return Err(ConfigError::new(&msg).into());
     }
     crate::protection::admission(conf)?;
+    conf.protection_identity = Some(crate::protection::identity::prepare(conf)?);
     Ok(())
 }
 

@@ -582,6 +582,17 @@ macro_rules! make_handler {
                     let msg_res = websocket.read();
                     match msg_res {
                         Ok(msg) => {
+                            if let Message::Text(text) = &msg
+                                && let Some(reply) = shared_data_inst
+                                    .processing_params
+                                    .protection
+                                    .protection_reply(text)
+                            {
+                                if websocket.send(Message::text(reply)).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
                             trace!("received: {:?}", msg);
                             let command = parse_command(msg);
                             debug!("parsed command: {:?}", command);
