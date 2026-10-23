@@ -83,19 +83,6 @@ pub fn admission(conf: &config::Configuration) -> Res<Parameters> {
             parameters.validate()?;
             found = Some(parameters.clone());
         }
-        if let config::PipelineStep::Filter(step) = step {
-            for name in &step.names {
-                if let Some(config::Filter::Loudness { parameters, .. }) =
-                    conf.filters.as_ref().and_then(|f| f.get(name))
-                    && parameters.fader() == 0
-                {
-                    return Err(config::ConfigError::new(
-                        "Protection cannot admit another main-fader consumer",
-                    )
-                    .into());
-                }
-            }
-        }
     }
     found.ok_or_else(|| {
         config::ConfigError::new("Required final Protection processor is missing").into()
@@ -105,7 +92,7 @@ pub fn admission(conf: &config::Configuration) -> Res<Parameters> {
 /// Every element is atomic; the sequence counter does not excuse non-atomic
 /// seqlock reads. SeqCst gives a simple auditable ordering for this small record.
 #[derive(Debug)]
-pub struct AtomicRecord<const N: usize> {
+struct AtomicRecord<const N: usize> {
     sequence: AtomicU64,
     values: [AtomicU64; N],
 }
@@ -121,7 +108,7 @@ impl<const N: usize> Default for AtomicRecord<N> {
 
 impl<const N: usize> AtomicRecord<N> {
     // There is exactly one audio owner per record. Readers never write or wait.
-    pub fn publish(&self, values: [u64; N]) {
+    fn publish(&self, values: [u64; N]) {
         let sequence = self.sequence.load(Ordering::SeqCst);
         assert!(
             sequence < i64::MAX as u64 - 2,
@@ -134,7 +121,7 @@ impl<const N: usize> AtomicRecord<N> {
         self.sequence.store(sequence + 2, Ordering::SeqCst);
     }
 
-    pub fn read(&self) -> Option<(u64, [u64; N])> {
+    fn read(&self) -> Option<(u64, [u64; N])> {
         for _ in 0..3 {
             let before = self.sequence.load(Ordering::SeqCst);
             if before & 1 != 0 {
@@ -168,13 +155,20 @@ pub struct Trip {
 
 #[derive(Debug, Default)]
 pub struct Shared {
-    pub epoch: AtomicU64,
+    epoch: AtomicU64,
     // epoch, processed frames, interval begin/end, trip generation/reason/channel/frame/time
-    pub guard_record: AtomicRecord<9>,
+    guard_record: AtomicRecord<9>,
+}
+
+impl Shared {
+    /// Read-only projection; publication and epoch retirement belong to Guard.
+    pub fn guard_snapshot(&self) -> Option<(u64, [u64; 9])> {
+        self.guard_record.read()
+    }
 }
 
 /// The guard alone constructs stamps, after assessment and whole-chunk masking.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Stamp {
     shared: Arc<Shared>,
     epoch: u64,
@@ -219,8 +213,8 @@ pub struct Guard {
     epoch: u64,
     parameters: Option<Parameters>,
     peak_limit: PrcFmt,
-    pub frames: u64,
-    pub trip: Option<Trip>,
+    frames: u64,
+    trip: Option<Trip>,
     // P2's control owner will supply qualification. Incomplete integration is contained.
     pub(crate) active: bool,
 }
@@ -257,14 +251,18 @@ impl Guard {
         Ok(())
     }
 
-    fn latch(&mut self, reason: Reason, channel: Option<usize>, frame: u64, at_ns: u64) {
+    pub fn trip(&self) -> Option<Trip> {
+        self.trip
+    }
+
+    fn latch(&mut self, reason: Reason, channel: Option<usize>, frame: u64) {
         if self.trip.is_none() {
             self.trip = Some(Trip {
                 generation: 1,
                 reason,
                 channel,
                 frame,
-                at_ns,
+                at_ns: monotonic_ns(),
             });
         }
         self.active = false;
@@ -316,12 +314,12 @@ impl Guard {
                     None
                 };
                 if let Some(reason) = reason {
-                    self.latch(reason, Some(channel), self.frames + offset as u64, begin);
+                    self.latch(reason, Some(channel), self.frames + offset as u64);
                 }
             }
         }
         if !shape_valid {
-            self.latch(Reason::Coverage, None, self.frames, begin);
+            self.latch(Reason::Coverage, None, self.frames);
         }
         if main_mute || !self.active || self.trip.is_some() || !shape_valid {
             for waveform in &mut chunk.waveforms {
@@ -354,7 +352,7 @@ impl Guard {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn parameters() -> Parameters {
@@ -373,11 +371,11 @@ mod tests {
         guard
     }
 
-    fn chunk() -> AudioChunk {
+    pub(crate) fn chunk() -> AudioChunk {
         AudioChunk::new(vec![vec![0.1; FRAMES]; CHANNELS], 0.1, 0.1, FRAMES, FRAMES)
     }
 
-    fn configuration() -> config::Configuration {
+    pub(crate) fn configuration() -> config::Configuration {
         serde_json::from_value(serde_json::json!({
             "devices": {"samplerate": 48000, "chunksize": 256, "volume_ramp_time": 0,
                 "capture": {"type": "SignalGenerator", "channels": 24,
@@ -497,10 +495,116 @@ mod tests {
         guard.process(&mut input, false);
         assert!(input.waveforms.iter().flatten().all(|s| *s == 0.1));
         assert!(guard.trip.is_none());
-        input.waveforms[1][3] = 1.0;
         guard.process(&mut input, true);
-        assert_eq!(guard.trip.unwrap().reason, Reason::Peak);
+        assert!(guard.trip.is_none());
         assert!(input.waveforms.iter().flatten().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn validate_config_enforces_complete_guard_admission() {
+        let conf = configuration();
+        config::validate_config(&mut conf.clone(), None).unwrap();
+        let base = serde_json::to_value(conf).unwrap();
+        let mut invalid = Vec::new();
+        let mut missing = base.clone();
+        missing["pipeline"] = serde_json::json!([]);
+        invalid.push(("missing", missing));
+        let mut bypassed = base.clone();
+        bypassed["pipeline"][0]["bypassed"] = serde_json::json!(true);
+        invalid.push(("bypassed", bypassed));
+        let mut repeated = base.clone();
+        repeated["pipeline"]
+            .as_array_mut()
+            .unwrap()
+            .push(base["pipeline"][0].clone());
+        invalid.push(("repeated", repeated));
+        for (name, step, definitions) in [
+            (
+                "trailing filter",
+                serde_json::json!({"type": "Filter", "names": ["gain"]}),
+                serde_json::json!({"filters": {"gain": {"type": "Gain", "parameters": {"gain": 6}}}}),
+            ),
+            (
+                "trailing mixer",
+                serde_json::json!({"type": "Mixer", "name": "mix"}),
+                serde_json::json!({"mixers": {"mix": {"channels": {"in": 24, "out": 24}, "mapping": []}}}),
+            ),
+            (
+                "trailing processor",
+                serde_json::json!({"type": "Processor", "name": "comp"}),
+                serde_json::json!({"processors": {"comp": {"type": "Compressor", "parameters": {
+                    "channels": 24, "attack": 0.01, "release": 0.1, "threshold": -20,
+                    "factor": 2, "makeup_gain": 0}}}}),
+            ),
+        ] {
+            let mut nonfinal = base.clone();
+            for (key, value) in definitions.as_object().unwrap() {
+                if key == "processors" {
+                    nonfinal[key]
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(value.as_object().unwrap().clone());
+                } else {
+                    nonfinal[key] = value.clone();
+                }
+            }
+            nonfinal["pipeline"].as_array_mut().unwrap().push(step);
+            invalid.push((name, nonfinal));
+        }
+        for (name, key, value) in [
+            ("sample rate", "samplerate", 44100),
+            ("chunk size", "chunksize", 128),
+        ] {
+            let mut wrong_shape = base.clone();
+            wrong_shape["devices"][key] = serde_json::json!(value);
+            invalid.push((name, wrong_shape));
+        }
+        let mut wrong_backend = base.clone();
+        wrong_backend["devices"]["playback"]["device"] = serde_json::json!("plughw:D624,0");
+        invalid.push(("backend", wrong_backend));
+        let mut wrong_format = base.clone();
+        wrong_format["devices"]["playback"]["format"] = serde_json::json!("S16_LE");
+        invalid.push(("format", wrong_format));
+        let mut accepted = Vec::new();
+        for (name, value) in invalid {
+            let mut conf = serde_json::from_value(value).unwrap();
+            if config::validate_config(&mut conf, None).is_ok() {
+                accepted.push(name);
+            }
+        }
+        assert!(accepted.is_empty(), "invalid graphs accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn loudness_main_fader_preserves_candidate_under_main_mute() {
+        let mut conf = serde_json::to_value(configuration()).unwrap();
+        conf["filters"] = serde_json::json!({"loudness": {"type": "Loudness",
+            "parameters": {"reference_level": -20}}});
+        conf["pipeline"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({"type": "Filter", "names": ["loudness"]}),
+        );
+        let mut conf: config::Configuration = serde_json::from_value(conf).unwrap();
+        config::validate_config(&mut conf, None).unwrap();
+        admission(&conf).unwrap();
+        let mut candidates = Vec::new();
+        for mute in [false, true] {
+            let params = Arc::new(crate::ProcessingParameters::new(&[-30.0; 5], &[mute; 5]));
+            let mut pipeline = crate::pipeline::Pipeline::from_config(conf.clone(), params);
+            let input = AudioChunk::new(
+                vec![vec![100.0; FRAMES]; CHANNELS],
+                100.0,
+                100.0,
+                FRAMES,
+                FRAMES,
+            );
+            candidates.push(pipeline.process_chunk(input));
+        }
+        assert_eq!(candidates[0].waveforms, candidates[1].waveforms);
+        let mut guard = guard();
+        guard.process(&mut candidates[1], true);
+        assert_eq!(guard.trip.unwrap().reason, Reason::Peak);
+        assert!(candidates[1].waveforms.iter().flatten().all(|s| *s == 0.0));
     }
 
     #[test]

@@ -33,10 +33,17 @@ pub fn run_processing(
     processing_params: Arc<ProcessingParameters>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut protection = processing_params
-            .protection_owner
-            .lock()
-            .expect("Protection owner poisoned");
+        let mut protection = match processing_params.protection_owner.lock() {
+            Ok(owner) => owner,
+            Err(_) => {
+                // Do not trust possibly interrupted safety state or strand the
+                // supervisor/capture/playback participants in wait mode.
+                error!("Protection owner poisoned; DSP process restart required");
+                barrier_proc.wait();
+                let _ = tx_pb.send(AudioMessage::EndOfStream);
+                return;
+            }
+        };
         if let Err(err) = protection.install(&conf_proc) {
             error!("Protection admission rejected: {err}");
             barrier_proc.wait();
@@ -203,4 +210,114 @@ pub fn run_processing(
             };
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protection::tests::{chunk, configuration};
+    use std::time::Duration;
+
+    #[test]
+    fn poisoned_owner_reaches_startup_barrier_and_stops_without_audio() {
+        let params = Arc::new(ProcessingParameters::default());
+        let poisoned = params.clone();
+        assert!(
+            thread::spawn(move || {
+                let _owner = poisoned.protection_owner.lock().unwrap();
+                panic!("simulated processing panic while owning the guard");
+            })
+            .join()
+            .is_err()
+        );
+        let (tx_pb, rx_pb) = crossbeam_channel::unbounded();
+        let (_tx_cap, rx_cap) = crossbeam_channel::unbounded();
+        let (_tx_conf, rx_conf) = crossbeam_channel::unbounded();
+        let barrier = Arc::new(Barrier::new(2));
+        let handle = run_processing(
+            configuration(),
+            barrier.clone(),
+            tx_pb,
+            rx_cap,
+            rx_conf,
+            params.clone(),
+        );
+        let (tx_ready, rx_ready) = crossbeam_channel::bounded(1);
+        let waiter = thread::spawn(move || {
+            barrier.wait();
+            tx_ready.send(()).unwrap();
+        });
+        rx_ready
+            .recv_timeout(Duration::from_secs(2))
+            .expect("processing stranded the startup barrier");
+        assert!(matches!(
+            rx_pb.recv_timeout(Duration::from_secs(2)).unwrap(),
+            AudioMessage::EndOfStream
+        ));
+        handle.join().unwrap();
+        waiter.join().unwrap();
+        assert!(params.protection_owner.is_poisoned());
+        assert!(rx_pb.try_recv().is_err());
+    }
+
+    #[test]
+    fn running_processing_retires_queued_audio_and_preserves_trip_on_updates() {
+        let conf = configuration();
+        let params = Arc::new(ProcessingParameters::default());
+        let (tx_pb, rx_pb) = crossbeam_channel::unbounded();
+        let (tx_cap, rx_cap) = crossbeam_channel::unbounded();
+        let (tx_conf, rx_conf) = crossbeam_channel::unbounded();
+        let barrier = Arc::new(Barrier::new(2));
+        let handle = run_processing(
+            conf.clone(),
+            barrier.clone(),
+            tx_pb,
+            rx_cap,
+            rx_conf,
+            params.clone(),
+        );
+        barrier.wait();
+        let mut updated = conf.clone();
+        updated.title = Some("updated title".to_string());
+        tx_conf
+            .send((config::config_diff(&conf, &updated), updated))
+            .unwrap();
+        let mut unsafe_input = chunk();
+        unsafe_input.waveforms[0][7] = 1.0;
+        tx_cap.send(AudioMessage::Audio(unsafe_input)).unwrap();
+        tx_cap.send(AudioMessage::Audio(chunk())).unwrap();
+        tx_cap.send(AudioMessage::EndOfStream).unwrap();
+        let AudioMessage::Audio(retired) = rx_pb.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("missing first output")
+        };
+        let AudioMessage::Audio(current) = rx_pb.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("missing replacement output")
+        };
+        assert!(matches!(
+            rx_pb.recv_timeout(Duration::from_secs(2)).unwrap(),
+            AudioMessage::EndOfStream
+        ));
+        handle.join().unwrap();
+        assert!(!retired.protection.unwrap().is_current());
+        assert!(current.protection.unwrap().is_current());
+        assert!(
+            current
+                .waveforms
+                .iter()
+                .flatten()
+                .all(|sample| *sample == 0.0)
+        );
+        assert_eq!(
+            params
+                .protection_owner
+                .lock()
+                .unwrap()
+                .trip()
+                .unwrap()
+                .frame,
+            7
+        );
+    }
 }

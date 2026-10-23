@@ -103,6 +103,19 @@ struct PlaybackChannels {
 enum PlaybackResult {
     Normal,
     Stalled,
+    Discarded,
+}
+
+/// Flush retired or unadmitted audio without ending the DSP process. Only an
+/// actual PCM failure is a PlaybackError; the processing owner keeps its latch.
+fn flush_protected_playback(pcmdevice: &alsa::PCM, channels: &PlaybackChannels) -> bool {
+    if let Err(err) = pcmdevice.drop().and_then(|_| pcmdevice.prepare()) {
+        let _ = channels
+            .status
+            .send(StatusMessage::PlaybackError(err.to_string()));
+        return false;
+    }
+    true
 }
 
 /// Play a buffer.
@@ -197,7 +210,7 @@ fn play_buffer(
 
         //trace!("Delay BEFORE writing {} is {:?} frames",  buffer.len() / bytes_per_frame, pcmdevice.status().ok().map(|status| status.get_delay()));
         if !protection.is_current() {
-            return Err(DeviceError::new("Retired protection stamp").into());
+            return Ok(PlaybackResult::Discarded);
         }
         match io.writei(buffer) {
             Ok(frames_written) => {
@@ -226,7 +239,7 @@ fn play_buffer(
                     pcmdevice.prepare()?;
                     buf_manager.sleep_for_target_delay(millis_per_frame);
                     if !protection.is_current() {
-                        return Err(DeviceError::new("Retired protection stamp").into());
+                        return Ok(PlaybackResult::Discarded);
                     }
                     io.writei(buffer)?;
                     break;
@@ -244,7 +257,13 @@ fn play_buffer(
             },
         };
     }
-    Ok(PlaybackResult::Normal)
+    // Retirement may also race the final successful write. Flush that ring
+    // before admitting another epoch and never publish this chunk's meters.
+    if protection.is_current() {
+        Ok(PlaybackResult::Normal)
+    } else {
+        Ok(PlaybackResult::Discarded)
+    }
 }
 
 /// Capture a buffer.
@@ -499,6 +518,7 @@ fn playback_loop_bytes(
     let millis_per_frame: f32 = 1000.0 / params.samplerate as f32;
     let mut device_stalled = false;
     let mut pcm_paused = false;
+    let mut previous_protection: Option<crate::protection::Stamp> = None;
     let can_pause = pcmdevice
         .hw_params_current()
         .map(|p| p.can_pause())
@@ -564,18 +584,30 @@ fn playback_loop_bytes(
                 channels.audio.recv()
             } /* waiting for a new message */
         };
+        let rejected_chunk = matches!(&msg, Ok(AudioMessage::Audio(chunk))
+            if chunk.protection.as_ref().is_none_or(|stamp| !stamp.is_current()));
+        if rejected_chunk
+            || previous_protection
+                .as_ref()
+                .is_some_and(|stamp| !stamp.is_current())
+        {
+            if !flush_protected_playback(pcmdevice, &channels) {
+                break;
+            }
+            previous_protection = None;
+            device_stalled = false;
+            pcm_paused = false;
+            timer.restart();
+            buffer_avg.restart();
+            if rejected_chunk {
+                continue;
+            }
+        }
         match msg {
             Ok(AudioMessage::Audio(mut chunk)) => {
-                let protection = match chunk.protection.take() {
-                    Some(stamp) if stamp.is_current() => stamp,
-                    _ => {
-                        let _ = pcmdevice.drop();
-                        let _ = channels.status.send(StatusMessage::PlaybackError(
-                            "Missing or retired final-protection admission".to_string(),
-                        ));
-                        break;
-                    }
-                };
+                // Presence was checked above; play_buffer rechecks retirement
+                // at every write boundary, including recovery writes.
+                let protection = chunk.protection.take().unwrap();
                 // measure delay only on running non-stalled device
                 let avail_at_chunk_recvd = if !device_stalled
                     && pcmdevice.state_raw() == alsa_sys::SND_PCM_STATE_RUNNING as i32
@@ -605,12 +637,23 @@ fn playback_loop_bytes(
                 pcm_paused = false;
                 device_stalled = match playback_res {
                     Ok(PlaybackResult::Normal) => {
+                        previous_protection = Some(protection);
                         if device_stalled {
                             info!("PB: device resumed normal operation");
                             timer.restart();
                             buffer_avg.restart();
                         }
                         false
+                    }
+                    Ok(PlaybackResult::Discarded) => {
+                        if !flush_protected_playback(pcmdevice, &channels) {
+                            break;
+                        }
+                        previous_protection = None;
+                        device_stalled = false;
+                        timer.restart();
+                        buffer_avg.restart();
+                        continue;
                     }
                     Ok(PlaybackResult::Stalled) => {
                         if !device_stalled {
@@ -1322,5 +1365,132 @@ impl CaptureDevice for AlsaCaptureDevice {
             })
             .unwrap();
         Ok(Box::new(handle))
+    }
+}
+
+#[cfg(test)]
+mod protection_tests {
+    use super::*;
+    use crate::protection::tests::{chunk, configuration};
+    use crate::protection::{CHANNELS, FRAMES, Guard, SAMPLE_RATE, Shared};
+
+    fn null_pcm() -> (alsa::PCM, PlaybackBufferManager) {
+        let mut manager = PlaybackBufferManager::new(FRAMES as Frames, 0);
+        // The software null PCM touches no sound card and cannot produce audio.
+        let (pcm, _) = open_pcm(
+            "null".to_string(),
+            SAMPLE_RATE as u32,
+            CHANNELS as u32,
+            &Some(AlsaSampleFormat::S24_3_LE),
+            &mut manager,
+            false,
+        )
+        .unwrap();
+        (pcm, manager)
+    }
+
+    fn play_chunks(chunks: Vec<crate::audiochunk::AudioChunk>) -> Vec<StatusMessage> {
+        let (pcm, manager) = null_pcm();
+        let (tx_audio, rx_audio) = crossbeam_channel::unbounded();
+        let (tx_status, rx_status) = crossbeam_channel::unbounded();
+        for chunk in chunks {
+            tx_audio.send(AudioMessage::Audio(chunk)).unwrap();
+        }
+        tx_audio.send(AudioMessage::EndOfStream).unwrap();
+        let status = Arc::new(RwLock::new(PlaybackStatus {
+            update_interval: 100,
+            clipped_samples: 0,
+            buffer_level: 0,
+            signal_rms: countertimer::ValueHistory::new(10, CHANNELS),
+            signal_peak: countertimer::ValueHistory::new(10, CHANNELS),
+        }));
+        playback_loop_bytes(
+            PlaybackChannels {
+                audio: rx_audio,
+                status: tx_status,
+            },
+            &pcm,
+            PlaybackParams {
+                channels: CHANNELS,
+                target_level: 0,
+                adjust_period: 0.0,
+                adjust_enabled: false,
+                sample_format: crate::config::BinarySampleFormat::S24_3_LE,
+                playback_status: status.clone(),
+                bytes_per_frame: CHANNELS * 3,
+                samplerate: SAMPLE_RATE,
+                chunksize: FRAMES,
+            },
+            &manager,
+        );
+        // A later admitted zero chunk still reaches playback after rejection.
+        assert_eq!(
+            status.read().signal_peak.last().unwrap().values,
+            vec![0.0; CHANNELS]
+        );
+        assert_eq!(status.read().clipped_samples, 0);
+        rx_status.try_iter().collect()
+    }
+
+    #[test]
+    fn retired_queued_chunk_does_not_stop_playback_or_clear_trip() {
+        let mut guard = Guard::new(Arc::new(Shared::default()));
+        let conf = configuration();
+        guard.install(&conf).unwrap();
+        let mut retired = chunk();
+        retired.waveforms[0][7] = 1.0;
+        guard.process(&mut retired, false);
+        let trip = guard.trip();
+        guard.install(&conf).unwrap();
+        let mut current = chunk();
+        guard.process(&mut current, false);
+        let statuses = play_chunks(vec![retired, current]);
+        assert!(
+            matches!(statuses.as_slice(), [StatusMessage::PlaybackDone]),
+            "playback did not reach normal end of stream"
+        );
+        assert_eq!(guard.trip(), trip);
+    }
+
+    #[test]
+    fn coverage_fault_does_not_stop_playback_or_clear_trip() {
+        let mut guard = Guard::new(Arc::new(Shared::default()));
+        guard.install(&configuration()).unwrap();
+        let mut incomplete = chunk();
+        incomplete.waveforms[1].clear();
+        guard.process(&mut incomplete, false);
+        let trip = guard.trip();
+        let mut current = chunk();
+        guard.process(&mut current, false);
+        let statuses = play_chunks(vec![incomplete, current]);
+        assert!(
+            matches!(statuses.as_slice(), [StatusMessage::PlaybackDone]),
+            "playback did not reach normal end of stream"
+        );
+        assert_eq!(guard.trip(), trip);
+    }
+
+    #[test]
+    fn retirement_at_write_boundary_is_a_discard_not_a_device_error() {
+        let mut guard = Guard::new(Arc::new(Shared::default()));
+        guard.install(&configuration()).unwrap();
+        let mut output = chunk();
+        guard.process(&mut output, false);
+        let stamp = output.protection.unwrap();
+        guard.install(&configuration()).unwrap();
+        let (pcm, manager) = null_pcm();
+        let result = play_buffer(
+            &vec![0; FRAMES * CHANNELS * 3],
+            &pcm,
+            &pcm.io_bytes(),
+            1000.0 / SAMPLE_RATE as f32,
+            CHANNELS * 3,
+            &manager,
+            &stamp,
+        );
+        assert!(
+            matches!(result, Ok(PlaybackResult::Discarded)),
+            "retirement was not discarded: {result:?}"
+        );
     }
 }
