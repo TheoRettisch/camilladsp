@@ -24,20 +24,57 @@ use audio_thread_priority::{
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+struct ProcessingControl {
+    paused: bool,
+    armed: Option<crate::protection::control::Command>,
+}
+
+impl ProcessingControl {
+    fn service(
+        &mut self,
+        protection: &mut crate::protection::Guard,
+        command: crate::protection::control::Command,
+    ) {
+        use crate::protection::control::{Mode, Operation};
+        if !self.paused && command.operation == Operation::Context(Mode::Armed) {
+            // Between chunks is not a capture pause. Assess the next candidate
+            // before applying armed; the parent retains its 30 ms deadline.
+            self.armed = Some(command);
+        } else {
+            protection.control_only(command);
+        }
+    }
+
+    fn pause(&mut self, protection: &mut crate::protection::Guard) {
+        self.paused = true;
+        protection.pause();
+        if let Some(command) = self.armed.take() {
+            protection.control_only(command);
+        }
+    }
+}
+
 // Continue servicing the sole control mailbox even if playback stops draining.
 // A reset can retire this pending chunk; the backend must check its stamp.
 fn send_output(
     protection: &mut crate::protection::Guard,
+    control: &mut ProcessingControl,
     shared: &crate::protection::Shared,
     tx: &crossbeam_channel::Sender<AudioMessage>,
     message: AudioMessage,
 ) -> bool {
+    let no_commands = crossbeam_channel::never();
     loop {
+        let commands = if control.armed.is_none() {
+            shared.commands()
+        } else {
+            &no_commands
+        };
         crossbeam_channel::select! {
             send(tx, message) -> result => return result.is_ok(),
             recv(shared.backend_wakeups()) -> _ => protection.backend_wakeup(),
-            recv(shared.commands()) -> command => {
-                protection.control_only(command.expect("owned control mailbox disconnected"));
+            recv(commands) -> command => {
+                control.service(protection, command.expect("owned control mailbox disconnected"));
             }
         }
     }
@@ -149,26 +186,40 @@ pub fn run_processing(
         barrier_proc.wait();
         debug!("Processing loop starts now!");
         let shared = processing_params.protection.clone();
+        let mut control = ProcessingControl {
+            paused: true,
+            armed: None,
+        };
+        let no_commands = crossbeam_channel::never();
         loop {
+            let commands = if control.armed.is_none() {
+                shared.commands()
+            } else {
+                &no_commands
+            };
             let audio = crossbeam_channel::select! {
                 recv(rx_cap) -> audio => audio,
                 recv(shared.backend_wakeups()) -> _ => {
                     protection.backend_wakeup();
                     continue;
                 }
-                recv(shared.commands()) -> command => {
-                    protection.control_only(command.expect("owned control mailbox disconnected"));
+                recv(commands) -> command => {
+                    control.service(&mut protection, command.expect("owned control mailbox disconnected"));
                     continue;
                 }
             };
             match audio {
                 Ok(AudioMessage::Audio(mut chunk)) => {
+                    control.paused = false;
                     //trace!("AudioMessage::Audio received");
                     chunk = pipeline.process_chunk(chunk);
-                    let command = shared.commands().try_recv().ok();
+                    let command = control
+                        .armed
+                        .take()
+                        .or_else(|| shared.commands().try_recv().ok());
                     protection.process_with_command(&mut chunk, command);
                     let msg = AudioMessage::Audio(chunk);
-                    if !send_output(&mut protection, &shared, &tx_pb, msg) {
+                    if !send_output(&mut protection, &mut control, &shared, &tx_pb, msg) {
                         info!("Playback thread has already stopped.");
                         break;
                     }
@@ -176,16 +227,17 @@ pub fn run_processing(
                 Ok(AudioMessage::EndOfStream) => {
                     trace!("AudioMessage::EndOfStream received");
                     let msg = AudioMessage::EndOfStream;
-                    if !send_output(&mut protection, &shared, &tx_pb, msg) {
+                    control.pause(&mut protection);
+                    if !send_output(&mut protection, &mut control, &shared, &tx_pb, msg) {
                         info!("Playback thread has already stopped.");
                     }
                     break;
                 }
                 Ok(AudioMessage::Pause) => {
                     trace!("AudioMessage::Pause received");
-                    protection.pause();
+                    control.pause(&mut protection);
                     let msg = AudioMessage::Pause;
-                    if !send_output(&mut protection, &shared, &tx_pb, msg) {
+                    if !send_output(&mut protection, &mut control, &shared, &tx_pb, msg) {
                         info!("Playback thread has already stopped.");
                         break;
                     }
@@ -193,7 +245,8 @@ pub fn run_processing(
                 Err(err) => {
                     error!("Message channel error: {err}");
                     let msg = AudioMessage::EndOfStream;
-                    if !send_output(&mut protection, &shared, &tx_pb, msg) {
+                    control.pause(&mut protection);
+                    if !send_output(&mut protection, &mut control, &shared, &tx_pb, msg) {
                         info!("Playback thread has already stopped.");
                     }
                     break;
@@ -230,7 +283,7 @@ pub fn run_processing(
                 };
             };
         }
-        protection.pause();
+        control.pause(&mut protection);
         processing_params.set_processing_load(0.0);
         processing_params.set_resampler_load(0.0);
         if let Some(h) = thread_handle {
@@ -296,6 +349,71 @@ mod tests {
                 + u64::from(operation == Operation::Reset),
             qualification_id,
             operation,
+        }
+    }
+
+    #[test]
+    fn between_chunk_arm_waits_for_audio_or_explicit_pause() {
+        use crate::protection::control::{Mode, Operation, Result as ControlResult};
+        for pause in [false, true] {
+            let params = Arc::new(ProcessingParameters::default());
+            let (tx_pb, rx_pb) = crossbeam_channel::bounded(1);
+            let (tx_cap, rx_cap) = crossbeam_channel::bounded(2);
+            let (_tx_conf, rx_conf) = crossbeam_channel::bounded(1);
+            let barrier = Arc::new(Barrier::new(2));
+            let handle = run_processing(
+                configuration(),
+                barrier.clone(),
+                tx_pb,
+                rx_cap,
+                rx_conf,
+                params.clone(),
+            );
+            barrier.wait();
+            let initial = params.protection.guard_snapshot().unwrap();
+            params
+                .protection
+                .submit(request(initial, 1, Operation::Context(Mode::Prearm), 1))
+                .unwrap();
+            wait_receipt(&params.protection, 1);
+            tx_cap.send(AudioMessage::Audio(chunk())).unwrap();
+            assert!(matches!(
+                rx_pb.recv_timeout(Duration::from_secs(2)).unwrap(),
+                AudioMessage::Audio(_)
+            ));
+            let before = params.protection.guard_snapshot().unwrap();
+            params
+                .protection
+                .submit(request(before, 2, Operation::Context(Mode::Armed), 1))
+                .unwrap();
+            // Exercise the real receive loop while no chunk is in hand. This
+            // is a scheduling regression, not a target latency measurement.
+            thread::sleep(Duration::from_millis(20));
+            let waiting = params.protection.guard_snapshot().unwrap();
+            let premature_receipt = waiting.control.last_command.unwrap().command_id == 2;
+            tx_cap
+                .send(if pause {
+                    AudioMessage::Pause
+                } else {
+                    AudioMessage::Audio(chunk())
+                })
+                .unwrap();
+            rx_pb.recv_timeout(Duration::from_secs(2)).unwrap();
+            let receipt = wait_receipt(&params.protection, 2);
+            tx_cap.send(AudioMessage::EndOfStream).unwrap();
+            rx_pb.recv_timeout(Duration::from_secs(2)).unwrap();
+            handle.join().unwrap();
+            assert!(
+                !premature_receipt,
+                "between-chunk idle was treated as pause"
+            );
+            assert_eq!(receipt.frames, before.frames + if pause { 0 } else { 256 });
+            // Production activation is deliberately still inhibited in this
+            // integration fixture; candidate-time acceptance is tested by Guard.
+            assert_eq!(
+                receipt.control.last_command.unwrap().result,
+                ControlResult::NotQualified
+            );
         }
     }
 
