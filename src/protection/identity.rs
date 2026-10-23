@@ -114,10 +114,15 @@ pub fn prepare(conf: &config::Configuration) -> Res<Identity> {
     // canonicalization so f32 config scalars have the same text semantics.
     let graph: Value = yaml_serde::from_str(&yaml_serde::to_string(conf)?)?;
     let profile = serde_json::json!({
-        "algorithm": "protection-p2-instantaneous-v1",
+        "algorithm": "protection-audio-time-v1",
         "parameters": parameters,
-        "qualification_frames": super::QUALIFICATION_FRAMES,
-        "demand_threshold_db": -70.0,
+        "qualification_frames": super::policy::Policy::new(&parameters).qualification_frames,
+        "enabled": {"rms": parameters.max_tweeter_rms_db.is_some(),
+            "short_power": parameters.max_tweeter_avg_power_db.is_some(),
+            "long_power": parameters.max_tweeter_long_avg_power_db.is_some(),
+            "tone": parameters.tone_min_rms_db.is_some(), "dc_frozen": true},
+        "short_prearm_factor": 2.5,
+        "qualification_rule": "candidate-baseline-max-windows-short-veto-v1",
         "activation_inhibited": true,
     });
     Ok(Identity {

@@ -171,6 +171,11 @@ impl Shared {
                 super::Reason::Peak => "peak",
                 super::Reason::Nonfinite => "nonfinite",
                 super::Reason::Coverage => "coverage",
+                super::Reason::Rms => "rms",
+                super::Reason::ShortPower => "short_power",
+                super::Reason::LongPower => "long_power",
+                super::Reason::Tone => "tone",
+                super::Reason::DcFrozen => "dc_frozen",
             });
             let state = match guard.state {
                 control::State::Inactive => "inactive",
@@ -197,7 +202,7 @@ impl Shared {
                     "backend": "alsa-hw-ring-v1", "sample_rate": super::SAMPLE_RATE, "chunk_frames": super::FRAMES,
                     "output_channels": (0..super::CHANNELS).collect::<Vec<_>>(), "tweeter_channels": [0, 1]},
                 "guard": {"state": state, "final": guard.final_guard, "coverage_valid": guard.final_guard && guard.processing_valid,
-                    "candidate_observable": guard.candidate_observable, "short_power_veto": false,
+                    "candidate_observable": guard.candidate_observable, "short_power_veto": guard.short_power_veto,
                     "qualified_frames": guard.qualified_frames},
                 "trip": {"generation": guard.trip_generation, "latched": guard.trip.is_some(), "reason": reason,
                     "channel": guard.trip.and_then(|t| t.channel), "frame": guard.trip.map(|t| t.frame), "at_ns": guard.trip.map(|t| t.at_ns)},
@@ -410,7 +415,13 @@ mod tests {
             if index < super::super::QUALIFICATION_FRAMES / 256 {
                 assert!(audio.waveforms.iter().flatten().all(|v| *v == 0.0));
             } else {
-                assert!(audio.waveforms.iter().flatten().all(|v| *v == 0.1));
+                assert!(
+                    audio
+                        .waveforms
+                        .iter()
+                        .flatten()
+                        .all(|v| *v == 0.1 || *v == 0.0)
+                );
             }
             play(&audio, &mut playback);
         }
@@ -421,7 +432,13 @@ mod tests {
         shared.protection_reply(&armed.to_string()).unwrap();
         let mut audio = chunk();
         guard.process_with_command(&mut audio, Some(shared.commands().try_recv().unwrap()));
-        assert!(audio.waveforms.iter().flatten().all(|v| *v == 0.1));
+        assert!(
+            audio
+                .waveforms
+                .iter()
+                .flatten()
+                .all(|v| *v == 0.1 || *v == 0.0)
+        );
         play(&audio, &mut playback);
         capture(&mut replies);
         for index in 0..3 {

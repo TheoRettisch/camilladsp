@@ -203,6 +203,8 @@ impl Guard {
                 self.processing_valid = false;
                 self.source_begin_ns = 0;
                 self.source_end_ns = 0;
+                self.history = [super::policy::History::default(); 2];
+                self.short_power_veto = false;
                 self.trip = None; // The process-lifetime trip generation survives.
                 self.invalidate_qualification();
                 self.candidate_observable = false;
@@ -232,6 +234,7 @@ impl Guard {
                 }
                 if !has_candidate
                     || self.activation_inhibited()
+                    || self.short_power_veto
                     || !self.active
                     || !self.candidate_observable
                     || self.attempt_required

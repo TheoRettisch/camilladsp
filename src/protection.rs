@@ -14,14 +14,14 @@ pub mod identity;
 #[cfg(test)]
 mod lifecycle_tests;
 pub mod playback;
+mod policy;
 pub mod wire;
 use control::{Command, Control, Mode, Operation, Receipt, State};
 
 pub const CHANNELS: usize = 24;
 pub const FRAMES: usize = 256;
 pub const SAMPLE_RATE: usize = 48_000;
-// Initial policy's local window. Full sustained-policy implementation remains
-// required before production activation can be enabled.
+// Default DC window; parameter-dependent qualification is compiled in Policy.
 pub const QUALIFICATION_FRAMES: u64 = 2 * SAMPLE_RATE as u64;
 
 fn bump(value: u64) -> u64 {
@@ -35,6 +35,19 @@ pub struct Parameters {
     pub output_channels: [usize; CHANNELS],
     pub tweeter_channels: [usize; 2],
     pub max_allowed_peak_db: f64,
+    pub dc_freeze_seconds: f64,
+    pub dc_freeze_peak_rms_tolerance_db: f64,
+    pub level_freshness_epsilon_db: f64,
+    pub max_tweeter_rms_db: Option<f64>,
+    pub tweeter_rms_fault_seconds: f64,
+    pub max_tweeter_avg_power_db: Option<f64>,
+    pub tweeter_avg_power_tau_seconds: f64,
+    pub max_tweeter_long_avg_power_db: Option<f64>,
+    pub tweeter_long_avg_power_tau_seconds: f64,
+    pub tone_min_rms_db: Option<f64>,
+    pub tone_crest_db: f64,
+    pub tone_fault_seconds: f64,
+    pub silence_threshold_db: f64,
 }
 
 impl Parameters {
@@ -49,6 +62,7 @@ impl Parameters {
                 config::ConfigError::new("Invalid protection channel map or peak limit").into(),
             );
         }
+        policy::validate(self)?;
         Ok(())
     }
 }
@@ -162,6 +176,11 @@ pub enum Reason {
     Peak = 1,
     Nonfinite = 2,
     Coverage = 3,
+    Rms = 4,
+    ShortPower = 5,
+    LongPower = 6,
+    Tone = 7,
+    DcFrozen = 8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,7 +197,7 @@ pub struct Shared {
     epoch: AtomicU64,
     backend: AtomicU64,
     reset: AtomicU64,
-    guard_record: AtomicRecord<43>,
+    guard_record: AtomicRecord<44>,
     playback_record: AtomicRecord<43>,
     host: Option<wire::Host>,
     conversion_count: AtomicU64,
@@ -223,6 +242,7 @@ pub struct Snapshot {
     pub state: State,
     pub candidate_observable: bool,
     pub qualified_frames: u64,
+    pub short_power_veto: bool,
     pub attempt_required: bool,
     pub trip_generation: u64,
     pub trip: Option<Trip>,
@@ -276,6 +296,11 @@ impl Shared {
                     1 => Reason::Peak,
                     2 => Reason::Nonfinite,
                     3 => Reason::Coverage,
+                    4 => Reason::Rms,
+                    5 => Reason::ShortPower,
+                    6 => Reason::LongPower,
+                    7 => Reason::Tone,
+                    8 => Reason::DcFrozen,
                     _ => return None,
                 },
                 channel: v[6].checked_sub(1).map(|c| c as usize),
@@ -312,6 +337,7 @@ impl Shared {
             },
             candidate_observable: v[12] != 0,
             qualified_frames: v[13],
+            short_power_veto: v[43] != 0,
             attempt_required: v[14] != 0,
             processing_valid: v[28] != 0,
             control: Control {
@@ -404,6 +430,9 @@ pub struct Guard {
     backend: u64,
     parameters: Option<Parameters>,
     peak_limit: PrcFmt,
+    policy: policy::Policy,
+    history: [policy::History; 2],
+    short_power_veto: bool,
     frames: u64,
     trip: Option<Trip>,
     trip_generation: u64,
@@ -418,8 +447,8 @@ pub struct Guard {
     qualification_baseline: bool,
     attempt_required: bool,
     last_main_mute: Option<bool>,
-    // No production caller supplies a context until wire/backend/policy and
-    // transition acceptance are complete. Tests exercise this same lifecycle.
+    // The fixed production inhibit remains until transition acceptance.
+    // Test builds exercise the same policy and lifecycle with exact output.
     pub(crate) active: bool,
     #[cfg(test)]
     activation_inhibited: bool,
@@ -437,6 +466,9 @@ impl Guard {
             epoch: 0,
             parameters: None,
             peak_limit: 0.0,
+            policy: policy::Policy::default(),
+            history: [policy::History::default(); 2],
+            short_power_veto: false,
             frames: 0,
             trip: None,
             trip_generation: 0,
@@ -485,6 +517,7 @@ impl Guard {
         self.publish();
         let parameters = admission(conf)?;
         self.peak_limit = 10.0_f64.powf(parameters.max_allowed_peak_db / 20.0) as PrcFmt;
+        self.policy = policy::Policy::new(&parameters);
         self.parameters = Some(parameters);
         self.identity = conf.protection_identity;
         self.publish();
@@ -579,6 +612,7 @@ impl Guard {
             self.activity_generation,
             self.silent_frames,
             self.last_active_end_frame,
+            self.short_power_veto as u64,
         ]);
     }
 
@@ -600,10 +634,12 @@ impl Guard {
             && chunk.channels == CHANNELS
             && chunk.waveforms.len() == CHANNELS
             && chunk.waveforms.iter().all(|w| w.len() == FRAMES);
+        let mut finite = true;
         // Assess available instantaneous evidence before a missing-channel fault.
         for (channel, waveform) in chunk.waveforms.iter().take(CHANNELS).enumerate() {
             for (offset, sample) in waveform.iter().take(FRAMES).enumerate() {
                 let reason = if !sample.is_finite() {
+                    finite = false;
                     Some(Reason::Nonfinite)
                 } else if channel < 2
                     && self.parameters.is_some()
@@ -622,6 +658,32 @@ impl Guard {
             self.latch(Reason::Coverage, None, self.frames);
         }
         self.observe_main_volume(chunk, shape_valid);
+        self.short_power_veto = false;
+        if shape_valid && finite {
+            for channel in 0..2 {
+                let result = self.policy.assess(
+                    &mut self.history[channel],
+                    &chunk.waveforms[channel],
+                    self.control.mode == Mode::Prearm,
+                    self.candidate_observable,
+                );
+                self.short_power_veto |= result.veto;
+                if let Some(reason) = result.reason {
+                    self.latch(reason, Some(channel), self.frames + FRAMES as u64);
+                }
+            }
+        } else {
+            self.break_policy_continuity();
+        }
+        if self.short_power_veto {
+            // A veto restarts a full window, including after local admission
+            // while the parent's independent checks are still qualifying.
+            self.active = false;
+            self.qualified_frames = 0;
+            self.qualification_baseline = false;
+        } else {
+            self.qualify();
+        }
         if let Some(command) = armed {
             // Current-chunk hazards and qualification precede armed receipt.
             self.apply_control(command, true);
@@ -643,7 +705,10 @@ impl Guard {
             for (rms, waveform) in rms_power.iter_mut().zip(&chunk.waveforms) {
                 *rms = waveform.iter().map(|x| x * x).sum::<PrcFmt>() as f64 / FRAMES as f64;
             }
-            if rms_power.iter().any(|power| *power > 1e-7) {
+            if rms_power
+                .iter()
+                .any(|power| *power > self.policy.silence_power)
+            {
                 self.silent_frames = 0;
                 self.last_active_end_frame = self.frames;
             } else {
@@ -698,6 +763,14 @@ impl Guard {
         self.activity_generation = bump(self.activity_generation);
         self.silent_frames = 0;
         self.last_active_end_frame = 0;
+        self.break_policy_continuity();
+    }
+
+    fn break_policy_continuity(&mut self) {
+        for history in &mut self.history {
+            history.break_continuity();
+        }
+        self.short_power_veto = false;
     }
 
     fn observe_main_volume(&mut self, chunk: &AudioChunk, shape_valid: bool) {
@@ -721,13 +794,20 @@ impl Guard {
             // An already active ordinary fade-out is still passed through.
             return;
         }
-        if self.trip.is_some() || self.attempt_required || self.control.owner.is_none() {
+    }
+
+    fn qualify(&mut self) {
+        if !self.candidate_observable
+            || self.trip.is_some()
+            || self.attempt_required
+            || self.control.owner.is_none()
+        {
             return;
         }
         if !self.active {
             if self.qualification_baseline {
                 self.qualified_frames = self.qualified_frames.checked_add(FRAMES as u64).unwrap();
-                if self.qualified_frames >= QUALIFICATION_FRAMES {
+                if self.qualified_frames >= self.policy.qualification_frames {
                     self.active = true;
                 }
             } else {
@@ -741,16 +821,30 @@ impl Guard {
 pub(crate) mod tests {
     use super::*;
 
-    fn parameters() -> Parameters {
+    pub(crate) fn parameters() -> Parameters {
         Parameters {
             output_channels: std::array::from_fn(|i| i),
             tweeter_channels: [0, 1],
             max_allowed_peak_db: -0.5,
+            dc_freeze_seconds: 2.0,
+            dc_freeze_peak_rms_tolerance_db: 0.25,
+            level_freshness_epsilon_db: 0.05,
+            max_tweeter_rms_db: None,
+            tweeter_rms_fault_seconds: 5.0,
+            max_tweeter_avg_power_db: None,
+            tweeter_avg_power_tau_seconds: 5.0,
+            max_tweeter_long_avg_power_db: None,
+            tweeter_long_avg_power_tau_seconds: 90.0,
+            tone_min_rms_db: None,
+            tone_crest_db: 4.5,
+            tone_fault_seconds: 5.0,
+            silence_threshold_db: -70.0,
         }
     }
 
     fn guard() -> Guard {
         let mut guard = Guard::new(Arc::new(Shared::default()));
+        guard.policy = policy::Policy::new(&parameters());
         guard.parameters = Some(parameters());
         guard.peak_limit = 10.0_f64.powf(-0.5 / 20.0) as PrcFmt;
         guard.active = true;
@@ -760,8 +854,18 @@ pub(crate) mod tests {
 
     pub(crate) fn chunk() -> AudioChunk {
         {
-            let mut chunk =
-                AudioChunk::new(vec![vec![0.1; FRAMES]; CHANNELS], 0.1, 0.1, FRAMES, FRAMES);
+            let mut chunk = AudioChunk::new(
+                vec![
+                    (0..FRAMES)
+                        .map(|i| if i % 2 == 0 { 0.1 } else { 0.0 })
+                        .collect();
+                    CHANNELS
+                ],
+                0.1,
+                0.0,
+                FRAMES,
+                FRAMES,
+            );
             chunk.main_volume = Some(crate::filters::basicfilters::AppliedVolume {
                 muted: false,
                 opening: false,
@@ -873,7 +977,7 @@ pub(crate) mod tests {
         let mut guard = guard();
         let mut input = chunk();
         guard.process(&mut input);
-        assert!(input.waveforms.iter().flatten().all(|s| *s == 0.1));
+        assert_eq!(input.waveforms, chunk().waveforms);
         assert!(guard.trip.is_none());
     }
 
@@ -1093,7 +1197,7 @@ pub(crate) mod tests {
                     guard.process(&mut previous);
                     params.set_mute(0, true);
                     let mut candidate = pipeline.process_chunk(chunk());
-                    assert!(candidate.waveforms[0][FRAMES - 1] > 0.0);
+                    assert!(candidate.waveforms[0][FRAMES - 2] > 0.0);
                     // Inject after processing so neither mute nor crossover can remove it.
                     candidate.waveforms[channel][offset] = value;
                     guard.process(&mut candidate);
