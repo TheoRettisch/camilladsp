@@ -541,8 +541,17 @@ fn playback_loop_bytes(
                 );
                 //trace!("PB: Avail at chunk rcvd: {:?}", avail_at_chunk_recvd);
                 chunk.update_stats(&mut chunk_stats);
+                #[cfg(any(test, feature = "protection-test-capture"))]
+                let conversion_begin = crate::protection::monotonic_ns();
                 conversion_result =
                     chunk_to_buffer_rawbytes(chunk, &mut buffer, &params.sample_format);
+                #[cfg(any(test, feature = "protection-test-capture"))]
+                protection.capture_conversion(
+                    conversion_result.1,
+                    &buffer[..conversion_result.0],
+                    conversion_begin,
+                    crate::protection::monotonic_ns(),
+                );
                 progress.converted(conversion_result.1);
 
                 let playback_res = play_buffer(

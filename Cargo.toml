@@ -21,6 +21,8 @@ bench = []
 websocket = ["tungstenite"]
 secure-websocket = ["websocket", "native-tls", "tungstenite/native-tls"]
 debug = []
+# Bounded non-authorizing instrumentation; never enables activation.
+protection-test-capture = []
 
 [lib]
 name = "camillalib"

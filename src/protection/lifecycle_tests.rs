@@ -416,3 +416,57 @@ fn bounded_mailbox_rejects_a_second_pending_command() {
     ));
     assert_eq!(shared.commands().try_recv().unwrap(), request);
 }
+
+#[test]
+fn fir_reload_with_capture_device_change_retires_epoch_and_queued_output() {
+    // Deterministic replay of the spacing experiment's device-changing FIR
+    // reload. No ALSA hardware or legacy level-call timing is exercised.
+    let (params, mut pipeline, mut guard) = setup(false, 0.0);
+    prearm(&mut guard, 1);
+    let mut candidate = pipeline.process_chunk(chunk());
+    candidate.waveforms[0][17] = 1.0;
+    guard.process(&mut candidate);
+    let queued = candidate.protection.as_ref().unwrap();
+    let trip = guard.trip();
+    let old_command = command(&guard, Operation::Reset, 1);
+    let original = configuration();
+    let original_identity = identity::prepare(&original).unwrap();
+    let mut value = serde_json::to_value(original).unwrap();
+    value["devices"]["capture"] = serde_json::json!({
+        "type": "Alsa", "channels": 24, "device": "hw:Loopback,1,0", "format": "S32_LE"});
+    value["filters"] = serde_json::json!({"fir": {
+        "type": "Conv", "parameters": {"type": "Values", "values": [1.0, 0.0, 0.0, 0.0]}}});
+    value["pipeline"].as_array_mut().unwrap().insert(
+        0,
+        serde_json::json!({"type": "Filter", "channels": [0, 1], "names": ["fir"]}),
+    );
+    let mut replacement: config::Configuration = serde_json::from_value(value).unwrap();
+    config::validate_config(&mut replacement, None).unwrap();
+    let replacement_identity = replacement.protection_identity.unwrap();
+    assert_ne!(original_identity.graph, replacement_identity.graph);
+    assert_eq!(original_identity.profile, replacement_identity.profile);
+    let mut playback = playback::Playback::new(params.protection.clone());
+    playback.retire();
+    guard.install(&replacement).unwrap();
+    assert!(!queued.is_current());
+    assert!(!queued.is_stream_current());
+    guard.control_only(old_command);
+    assert_eq!(
+        guard.control.last_command.unwrap().result,
+        ControlResult::StateMismatch
+    );
+    assert_eq!(guard.trip(), trip);
+    assert!(!guard.processing_valid);
+    assert_eq!(guard.qualified_frames, 0);
+    assert!(
+        params
+            .protection
+            .playback_snapshot()
+            .is_none_or(|s| !s.valid)
+    );
+    let mut replacement_pipeline = Pipeline::from_config(replacement, params);
+    let forwarded = process(&mut replacement_pipeline, &mut guard);
+    assert!(zero(&forwarded));
+    assert_eq!(guard.trip(), trip);
+    assert_eq!(guard.identity, Some(replacement_identity));
+}

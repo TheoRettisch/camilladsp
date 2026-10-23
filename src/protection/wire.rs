@@ -15,9 +15,9 @@ const MAX: u64 = i64::MAX as u64;
 
 #[derive(Debug)]
 pub(super) struct Host {
-    process: String,
-    boot: String,
-    namespace: u64,
+    pub(super) process: String,
+    pub(super) boot: String,
+    pub(super) namespace: u64,
 }
 
 impl Host {
@@ -235,6 +235,10 @@ impl Shared {
             .into_iter::<String>()
             .next()?
             .ok()?;
+        #[cfg(any(test, feature = "protection-test-capture"))]
+        if let Some(reply) = super::capture::reply(self, text, &key) {
+            return Some(reply);
+        }
         if ![
             "GetProtectionStatus",
             "SetProtectionContext",

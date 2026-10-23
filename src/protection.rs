@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(any(test, feature = "protection-test-capture"))]
+mod capture;
 pub mod control;
 pub mod identity;
 #[cfg(test)]
@@ -201,6 +203,8 @@ pub struct Shared {
     playback_record: AtomicRecord<43>,
     host: Option<wire::Host>,
     conversion_count: AtomicU64,
+    #[cfg(any(test, feature = "protection-test-capture"))]
+    pub(crate) capture: capture::Capture,
     backend_wakeup: crossbeam_channel::Sender<()>,
     backend_wakeup_rx: crossbeam_channel::Receiver<()>,
     commands: crossbeam_channel::Sender<Command>,
@@ -219,6 +223,8 @@ impl Default for Shared {
             playback_record: AtomicRecord::default(),
             host: wire::Host::load(),
             conversion_count: AtomicU64::new(0),
+            #[cfg(any(test, feature = "protection-test-capture"))]
+            capture: capture::Capture::default(),
             backend_wakeup,
             backend_wakeup_rx,
             commands,
@@ -390,6 +396,13 @@ pub struct Stamp {
 }
 
 impl Stamp {
+    #[cfg(any(test, feature = "protection-test-capture"))]
+    pub(crate) fn capture_conversion(&self, clipped: usize, pcm: &[u8], begin: u64, end: u64) {
+        self.shared
+            .capture
+            .converted(self, clipped, pcm, begin, end);
+    }
+
     pub fn is_stream_current(&self) -> bool {
         self.epoch == self.shared.epoch.load(Ordering::SeqCst)
             && self.backend == self.shared.backend.load(Ordering::SeqCst)
@@ -626,6 +639,8 @@ impl Guard {
         if let Some(command) = command.filter(|c| c.operation != Operation::Context(Mode::Armed)) {
             self.apply_control(command, false);
         }
+        #[cfg(any(test, feature = "protection-test-capture"))]
+        let capture = self.shared.capture.guard(chunk, self.frames);
         chunk.protection = None;
         let begin = monotonic_ns();
         let shape_valid = self.parameters.is_some()
@@ -688,6 +703,8 @@ impl Guard {
             // Current-chunk hazards and qualification precede armed receipt.
             self.apply_control(command, true);
         }
+        #[cfg(any(test, feature = "protection-test-capture"))]
+        let decision_ns = monotonic_ns();
         if self.activation_inhibited() || !self.active || self.trip.is_some() || !shape_valid {
             for waveform in &mut chunk.waveforms {
                 waveform.fill(0.0);
@@ -722,6 +739,10 @@ impl Guard {
         self.source_begin_ns = if shape_valid { begin } else { 0 };
         self.source_end_ns = if shape_valid { end } else { 0 };
         self.publish();
+        #[cfg(any(test, feature = "protection-test-capture"))]
+        if let Some(capture) = capture {
+            capture.guard(self, chunk, decision_ns, monotonic_ns());
+        }
         if shape_valid {
             chunk.protection = Some(Stamp {
                 shared: self.shared.clone(),
