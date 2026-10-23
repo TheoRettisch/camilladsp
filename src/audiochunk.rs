@@ -22,6 +22,7 @@ use crate::utils::decibels::linear_to_db;
 /// Main container of audio data
 pub struct AudioChunk {
     pub(crate) protection: Option<crate::protection::Stamp>,
+    pub(crate) main_volume: Option<crate::filters::basicfilters::AppliedVolume>,
     pub frames: usize,
     pub channels: usize,
     pub maxval: PrcFmt,
@@ -77,6 +78,7 @@ impl AudioChunk {
         let channels = waveforms.len();
         AudioChunk {
             protection: None,
+            main_volume: None,
             frames,
             channels,
             maxval,
@@ -96,6 +98,7 @@ impl AudioChunk {
         let channels = waveforms.len();
         AudioChunk {
             protection: None,
+            main_volume: None,
             frames,
             channels,
             maxval,

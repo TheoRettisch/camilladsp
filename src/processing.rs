@@ -24,6 +24,24 @@ use audio_thread_priority::{
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+// Continue servicing the sole control mailbox even if playback stops draining.
+// A reset can retire this pending chunk; the backend must check its stamp.
+fn send_output(
+    protection: &mut crate::protection::Guard,
+    shared: &crate::protection::Shared,
+    tx: &crossbeam_channel::Sender<AudioMessage>,
+    message: AudioMessage,
+) -> bool {
+    loop {
+        crossbeam_channel::select! {
+            send(tx, message) -> result => return result.is_ok(),
+            recv(shared.commands()) -> command => {
+                protection.control_only(command.expect("owned control mailbox disconnected"));
+            }
+        }
+    }
+}
+
 pub fn run_processing(
     conf_proc: config::Configuration,
     barrier_proc: Arc<Barrier>,
@@ -129,14 +147,23 @@ pub fn run_processing(
 
         barrier_proc.wait();
         debug!("Processing loop starts now!");
+        let shared = processing_params.protection.clone();
         loop {
-            match rx_cap.recv() {
+            let audio = crossbeam_channel::select! {
+                recv(rx_cap) -> audio => audio,
+                recv(shared.commands()) -> command => {
+                    protection.control_only(command.expect("owned control mailbox disconnected"));
+                    continue;
+                }
+            };
+            match audio {
                 Ok(AudioMessage::Audio(mut chunk)) => {
                     //trace!("AudioMessage::Audio received");
                     chunk = pipeline.process_chunk(chunk);
-                    protection.process(&mut chunk);
+                    let command = shared.commands().try_recv().ok();
+                    protection.process_with_command(&mut chunk, command);
                     let msg = AudioMessage::Audio(chunk);
-                    if tx_pb.send(msg).is_err() {
+                    if !send_output(&mut protection, &shared, &tx_pb, msg) {
                         info!("Playback thread has already stopped.");
                         break;
                     }
@@ -144,15 +171,16 @@ pub fn run_processing(
                 Ok(AudioMessage::EndOfStream) => {
                     trace!("AudioMessage::EndOfStream received");
                     let msg = AudioMessage::EndOfStream;
-                    if tx_pb.send(msg).is_err() {
+                    if !send_output(&mut protection, &shared, &tx_pb, msg) {
                         info!("Playback thread has already stopped.");
                     }
                     break;
                 }
                 Ok(AudioMessage::Pause) => {
                     trace!("AudioMessage::Pause received");
+                    protection.pause();
                     let msg = AudioMessage::Pause;
-                    if tx_pb.send(msg).is_err() {
+                    if !send_output(&mut protection, &shared, &tx_pb, msg) {
                         info!("Playback thread has already stopped.");
                         break;
                     }
@@ -160,7 +188,7 @@ pub fn run_processing(
                 Err(err) => {
                     error!("Message channel error: {err}");
                     let msg = AudioMessage::EndOfStream;
-                    if tx_pb.send(msg).is_err() {
+                    if !send_output(&mut protection, &shared, &tx_pb, msg) {
                         info!("Playback thread has already stopped.");
                     }
                     break;
@@ -197,6 +225,7 @@ pub fn run_processing(
                 };
             };
         }
+        protection.pause();
         processing_params.set_processing_load(0.0);
         processing_params.set_resampler_load(0.0);
         if let Some(h) = thread_handle {
@@ -217,6 +246,179 @@ mod tests {
     use super::*;
     use crate::protection::tests::{chunk, configuration};
     use std::time::Duration;
+
+    fn wait_receipt(shared: &crate::protection::Shared, id: u64) -> crate::protection::Snapshot {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(snapshot) = shared.guard_snapshot()
+                && snapshot
+                    .control
+                    .last_command
+                    .is_some_and(|r| r.command_id == id)
+            {
+                eprintln!(
+                    "local command {id} observed after {:?}; not target timing qualification",
+                    start.elapsed()
+                );
+                return snapshot;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "no terminal receipt"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn request(
+        snapshot: crate::protection::Snapshot,
+        id: u64,
+        operation: crate::protection::control::Operation,
+        qualification_id: u64,
+    ) -> crate::protection::control::Command {
+        use crate::protection::control::{Command, Expected, Operation};
+        Command {
+            id,
+            expected: Expected {
+                pipeline: snapshot.pipeline,
+                reset: snapshot.reset,
+                trip_generation: snapshot.trip_generation,
+                revision: snapshot.control.revision,
+            },
+            owner: 7,
+            parent_reset_generation: snapshot.control.parent_reset_generation
+                + u64::from(operation == Operation::Reset),
+            qualification_id,
+            operation,
+        }
+    }
+
+    #[test]
+    fn control_wakeup_while_paused_needs_no_audio_or_second_owner() {
+        use crate::protection::control::{Mode, Operation, Result as ControlResult};
+        let params = Arc::new(ProcessingParameters::new(&[0.0; 5], &[true; 5]));
+        let (tx_pb, rx_pb) = crossbeam_channel::bounded(1);
+        let (tx_cap, rx_cap) = crossbeam_channel::bounded(2);
+        let (_tx_conf, rx_conf) = crossbeam_channel::bounded(1);
+        let barrier = Arc::new(Barrier::new(2));
+        let handle = run_processing(
+            configuration(),
+            barrier.clone(),
+            tx_pb,
+            rx_cap,
+            rx_conf,
+            params.clone(),
+        );
+        barrier.wait();
+        tx_cap.send(AudioMessage::Pause).unwrap();
+        assert!(matches!(
+            rx_pb.recv_timeout(Duration::from_secs(2)).unwrap(),
+            AudioMessage::Pause
+        ));
+        let initial = params.protection.guard_snapshot().unwrap();
+        params
+            .protection
+            .submit(request(initial, 1, Operation::Context(Mode::Prearm), 1))
+            .unwrap();
+        let prearm = wait_receipt(&params.protection, 1);
+        assert_eq!(
+            prearm.control.last_command.unwrap().result,
+            ControlResult::Applied
+        );
+        params
+            .protection
+            .submit(request(prearm, 2, Operation::Context(Mode::Armed), 1))
+            .unwrap();
+        let armed = wait_receipt(&params.protection, 2);
+        assert_eq!(
+            armed.control.last_command.unwrap().result,
+            ControlResult::NotQualified
+        );
+        params
+            .protection
+            .submit(request(armed, 3, Operation::Reset, 2))
+            .unwrap();
+        // This covers reset queued immediately before a further Pause as well.
+        tx_cap.send(AudioMessage::Pause).unwrap();
+        let reset = wait_receipt(&params.protection, 3);
+        assert_eq!(
+            reset.control.last_command.unwrap().result,
+            ControlResult::Applied
+        );
+        assert_eq!(reset.reset, initial.reset + 1);
+        assert!(params.is_mute(0));
+        for snapshot in [prearm, armed, reset] {
+            assert_eq!(snapshot.frames, initial.frames);
+            assert_eq!(snapshot.qualified_frames, 0);
+            assert!(!snapshot.processing_valid);
+            assert_eq!((snapshot.source_begin_ns, snapshot.source_end_ns), (0, 0));
+        }
+        assert!(matches!(
+            rx_pb.recv_timeout(Duration::from_secs(2)).unwrap(),
+            AudioMessage::Pause
+        ));
+        tx_cap.send(AudioMessage::EndOfStream).unwrap();
+        assert!(matches!(
+            rx_pb.recv_timeout(Duration::from_secs(2)).unwrap(),
+            AudioMessage::EndOfStream
+        ));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn blocked_playback_submission_cannot_block_control_receipt() {
+        use crate::protection::control::{Mode, Operation, Result as ControlResult};
+        let params = Arc::new(ProcessingParameters::default());
+        let (tx_pb, rx_pb) = crossbeam_channel::bounded(1);
+        let (tx_cap, rx_cap) = crossbeam_channel::bounded(3);
+        let (_tx_conf, rx_conf) = crossbeam_channel::bounded(1);
+        let barrier = Arc::new(Barrier::new(2));
+        let handle = run_processing(
+            configuration(),
+            barrier.clone(),
+            tx_pb,
+            rx_cap,
+            rx_conf,
+            params.clone(),
+        );
+        barrier.wait();
+        tx_cap.send(AudioMessage::Audio(chunk())).unwrap();
+        tx_cap.send(AudioMessage::Audio(chunk())).unwrap();
+        let start = std::time::Instant::now();
+        let before = loop {
+            let snapshot = params.protection.guard_snapshot().unwrap();
+            if snapshot.frames == 512 {
+                break snapshot;
+            }
+            assert!(start.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(1));
+        };
+        params
+            .protection
+            .submit(request(before, 1, Operation::Context(Mode::Prearm), 1))
+            .unwrap();
+        let receipt = wait_receipt(&params.protection, 1);
+        assert_eq!(
+            receipt.control.last_command.unwrap().result,
+            ControlResult::Applied
+        );
+        assert_eq!(receipt.frames, before.frames);
+        assert_eq!(receipt.source_begin_ns, before.source_begin_ns);
+        assert_eq!(receipt.source_end_ns, before.source_end_ns);
+        assert_eq!(receipt.qualified_frames, 0);
+        tx_cap.send(AudioMessage::EndOfStream).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                rx_pb.recv_timeout(Duration::from_secs(2)).unwrap(),
+                AudioMessage::Audio(_)
+            ));
+        }
+        assert!(matches!(
+            rx_pb.recv_timeout(Duration::from_secs(2)).unwrap(),
+            AudioMessage::EndOfStream
+        ));
+        handle.join().unwrap();
+    }
 
     #[test]
     fn poisoned_owner_reaches_startup_barrier_and_stops_without_audio() {

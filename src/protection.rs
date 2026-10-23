@@ -9,9 +9,22 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod control;
+#[cfg(test)]
+mod lifecycle_tests;
+use control::{Command, Control, Mode, Operation, Receipt, State};
+
 pub const CHANNELS: usize = 24;
 pub const FRAMES: usize = 256;
 pub const SAMPLE_RATE: usize = 48_000;
+// Initial policy's local window. Full sustained-policy implementation remains
+// required before a production context can be supplied.
+pub const QUALIFICATION_FRAMES: u64 = 2 * SAMPLE_RATE as u64;
+
+fn bump(value: u64) -> u64 {
+    assert!(value < i64::MAX as u64, "Protection counter exhausted");
+    value + 1
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -153,17 +166,140 @@ pub struct Trip {
     pub at_ns: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Shared {
     epoch: AtomicU64,
-    // epoch, processed frames, interval begin/end, trip generation/reason/channel/frame/time
-    guard_record: AtomicRecord<9>,
+    reset: AtomicU64,
+    guard_record: AtomicRecord<29>,
+    commands: crossbeam_channel::Sender<Command>,
+    command_rx: crossbeam_channel::Receiver<Command>,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        let (commands, command_rx) = crossbeam_channel::bounded(1);
+        Self {
+            epoch: AtomicU64::new(0),
+            reset: AtomicU64::new(0),
+            guard_record: AtomicRecord::default(),
+            commands,
+            command_rx,
+        }
+    }
+}
+
+/// Internal coherent processing record. This deliberately contains no claimed
+/// backend consumption or version-1 wire identity/telemetry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    pub sequence: u64,
+    pub pipeline: u64,
+    pub reset: u64,
+    pub frame_floor: u64,
+    pub frames: u64,
+    pub processing_valid: bool,
+    pub source_begin_ns: u64,
+    pub source_end_ns: u64,
+    pub state: State,
+    pub candidate_observable: bool,
+    pub qualified_frames: u64,
+    pub attempt_required: bool,
+    pub trip_generation: u64,
+    pub trip: Option<Trip>,
+    pub control: Control,
 }
 
 impl Shared {
+    /// Internal bounded mailbox, not an externally admitted wire operation.
+    pub fn submit(&self, command: Command) -> Result<(), crossbeam_channel::TrySendError<Command>> {
+        self.commands.try_send(command)
+    }
+
+    pub(crate) fn commands(&self) -> &crossbeam_channel::Receiver<Command> {
+        &self.command_rx
+    }
+
     /// Read-only projection; publication and epoch retirement belong to Guard.
-    pub fn guard_snapshot(&self) -> Option<(u64, [u64; 9])> {
-        self.guard_record.read()
+    pub fn guard_snapshot(&self) -> Option<Snapshot> {
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        let reset = self.reset.load(Ordering::SeqCst);
+        let (sequence, v) = self.guard_record.read()?;
+        if sequence == 0
+            || v[0] != epoch
+            || v[9] != reset
+            || epoch != self.epoch.load(Ordering::SeqCst)
+            || reset != self.reset.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        let trip = match v[5] {
+            0 => None,
+            reason => Some(Trip {
+                generation: v[4],
+                reason: match reason {
+                    1 => Reason::Peak,
+                    2 => Reason::Nonfinite,
+                    3 => Reason::Coverage,
+                    _ => return None,
+                },
+                channel: v[6].checked_sub(1).map(|c| c as usize),
+                frame: v[7],
+                at_ns: v[8],
+            }),
+        };
+        let result = match v[22] {
+            0 => None,
+            1 => Some(control::Result::Applied),
+            2 => Some(control::Result::Invalid),
+            3 => Some(control::Result::StateMismatch),
+            4 => Some(control::Result::NotQualified),
+            _ => return None,
+        };
+        let owner = (u128::from(v[15]) << 64) | u128::from(v[16]);
+        Some(Snapshot {
+            sequence,
+            pipeline: v[0],
+            frames: v[1],
+            source_begin_ns: v[2],
+            source_end_ns: v[3],
+            trip_generation: v[4],
+            trip,
+            reset: v[9],
+            frame_floor: v[10],
+            state: match v[11] {
+                0 => State::Inactive,
+                1 => State::Qualifying,
+                2 => State::Active,
+                3 => State::Tripped,
+                _ => return None,
+            },
+            candidate_observable: v[12] != 0,
+            qualified_frames: v[13],
+            attempt_required: v[14] != 0,
+            processing_valid: v[28] != 0,
+            control: Control {
+                owner: (owner != 0).then_some(owner),
+                revision: v[17],
+                parent_reset_generation: v[18],
+                qualification_id: v[19],
+                mode: if v[20] == 0 {
+                    Mode::Prearm
+                } else {
+                    Mode::Armed
+                },
+                last_command: result.map(|result| Receipt {
+                    command_id: v[21],
+                    result,
+                    pipeline: v[23],
+                    reset: v[24],
+                    revision: v[25],
+                    parent_reset_generation: v[26],
+                    qualification_id: v[27],
+                }),
+                // Not exported: it is an owner-side replay fence, not status.
+                command_high_water: 0,
+            },
+        })
     }
 }
 
@@ -172,6 +308,7 @@ impl Shared {
 pub struct Stamp {
     shared: Arc<Shared>,
     epoch: u64,
+    reset: u64,
     pub frame_begin: u64,
     pub frame_end: u64,
     pub source_begin_ns: u64,
@@ -181,6 +318,7 @@ pub struct Stamp {
 impl Stamp {
     pub fn is_current(&self) -> bool {
         self.epoch == self.shared.epoch.load(Ordering::SeqCst)
+            && self.reset == self.shared.reset.load(Ordering::SeqCst)
     }
 }
 
@@ -215,7 +353,20 @@ pub struct Guard {
     peak_limit: PrcFmt,
     frames: u64,
     trip: Option<Trip>,
-    // P2's control owner will supply qualification. Incomplete integration is contained.
+    trip_generation: u64,
+    reset: u64,
+    frame_floor: u64,
+    processing_valid: bool,
+    source_begin_ns: u64,
+    source_end_ns: u64,
+    control: Control,
+    candidate_observable: bool,
+    qualified_frames: u64,
+    qualification_baseline: bool,
+    attempt_required: bool,
+    last_main_mute: Option<bool>,
+    // No production caller supplies a context until wire/backend/policy and
+    // transition acceptance are complete. Tests exercise this same lifecycle.
     pub(crate) active: bool,
 }
 
@@ -228,6 +379,18 @@ impl Guard {
             peak_limit: 0.0,
             frames: 0,
             trip: None,
+            trip_generation: 0,
+            reset: 0,
+            frame_floor: 0,
+            processing_valid: false,
+            source_begin_ns: 0,
+            source_end_ns: 0,
+            control: Control::default(),
+            candidate_observable: false,
+            qualified_frames: 0,
+            qualification_baseline: false,
+            attempt_required: true,
+            last_main_mute: None,
             active: false,
         }
     }
@@ -243,11 +406,18 @@ impl Guard {
         assert!(self.epoch <= i64::MAX as u64);
         self.parameters = None;
         self.frames = 0;
-        self.active = false;
-        self.publish(0, 0);
+        self.frame_floor = 0;
+        self.processing_valid = false;
+        self.source_begin_ns = 0;
+        self.source_end_ns = 0;
+        self.candidate_observable = false;
+        self.last_main_mute = None;
+        self.invalidate_qualification();
+        self.publish();
         let parameters = admission(conf)?;
         self.peak_limit = 10.0_f64.powf(parameters.max_allowed_peak_db / 20.0) as PrcFmt;
         self.parameters = Some(parameters);
+        self.publish();
         Ok(())
     }
 
@@ -257,19 +427,20 @@ impl Guard {
 
     fn latch(&mut self, reason: Reason, channel: Option<usize>, frame: u64) {
         if self.trip.is_none() {
+            self.trip_generation = bump(self.trip_generation);
             self.trip = Some(Trip {
-                generation: 1,
+                generation: self.trip_generation,
                 reason,
                 channel,
                 frame,
                 at_ns: monotonic_ns(),
             });
         }
-        self.active = false;
+        self.invalidate_qualification();
     }
 
-    fn publish(&self, begin: u64, end: u64) {
-        let (generation, reason, channel, frame, at_ns) = self.trip.map_or((0, 0, 0, 0, 0), |t| {
+    fn publish(&self) {
+        let (_, reason, channel, frame, at_ns) = self.trip.map_or((0, 0, 0, 0, 0), |t| {
             (
                 t.generation,
                 t.reason as u64,
@@ -278,20 +449,50 @@ impl Guard {
                 t.at_ns,
             )
         });
+        let owner = self.control.owner.unwrap_or(0);
+        let receipt = self.control.last_command;
         self.shared.guard_record.publish([
             self.epoch,
             self.frames,
-            begin,
-            end,
-            generation,
+            self.source_begin_ns,
+            self.source_end_ns,
+            self.trip_generation,
             reason,
             channel,
             frame,
             at_ns,
+            self.reset,
+            self.frame_floor,
+            self.state() as u64,
+            self.candidate_observable as u64,
+            self.qualified_frames,
+            self.attempt_required as u64,
+            (owner >> 64) as u64,
+            owner as u64,
+            self.control.revision,
+            self.control.parent_reset_generation,
+            self.control.qualification_id,
+            self.control.mode as u64,
+            receipt.map_or(0, |r| r.command_id),
+            receipt.map_or(0, |r| r.result as u64),
+            receipt.map_or(0, |r| r.pipeline),
+            receipt.map_or(0, |r| r.reset),
+            receipt.map_or(0, |r| r.revision),
+            receipt.map_or(0, |r| r.parent_reset_generation),
+            receipt.map_or(0, |r| r.qualification_id),
+            self.processing_valid as u64,
         ]);
     }
 
     pub fn process(&mut self, chunk: &mut AudioChunk) {
+        self.process_with_command(chunk, None);
+    }
+
+    pub fn process_with_command(&mut self, chunk: &mut AudioChunk, command: Option<Command>) {
+        let armed = command.filter(|c| c.operation == Operation::Context(Mode::Armed));
+        if let Some(command) = command.filter(|c| c.operation != Operation::Context(Mode::Armed)) {
+            self.apply_control(command, false);
+        }
         chunk.protection = None;
         let begin = monotonic_ns();
         let shape_valid = self.parameters.is_some()
@@ -321,6 +522,11 @@ impl Guard {
         if !shape_valid {
             self.latch(Reason::Coverage, None, self.frames);
         }
+        self.observe_main_volume(chunk, shape_valid);
+        if let Some(command) = armed {
+            // Current-chunk hazards and qualification precede armed receipt.
+            self.apply_control(command, true);
+        }
         if !self.active || self.trip.is_some() || !shape_valid {
             for waveform in &mut chunk.waveforms {
                 waveform.fill(0.0);
@@ -334,19 +540,56 @@ impl Guard {
             assert!(self.frames <= i64::MAX as u64);
         }
         let end = monotonic_ns();
-        self.publish(
-            if shape_valid { begin } else { 0 },
-            if shape_valid { end } else { 0 },
-        );
+        self.processing_valid = shape_valid;
+        self.source_begin_ns = if shape_valid { begin } else { 0 };
+        self.source_end_ns = if shape_valid { end } else { 0 };
+        self.publish();
         if shape_valid {
             chunk.protection = Some(Stamp {
                 shared: self.shared.clone(),
                 epoch: self.epoch,
+                reset: self.reset,
                 frame_begin,
                 frame_end: self.frames,
                 source_begin_ns: begin,
                 source_end_ns: end,
             });
+        }
+    }
+
+    fn observe_main_volume(&mut self, chunk: &AudioChunk, shape_valid: bool) {
+        self.candidate_observable =
+            shape_valid && chunk.main_volume.is_some_and(|v| !v.muted && !v.opening);
+        let Some(volume) = chunk.main_volume else {
+            self.invalidate_qualification();
+            return;
+        };
+        if self.last_main_mute == Some(true) && !volume.muted {
+            // Must precede forwarding the first opening sample. A new prearm
+            // attempt must be installed after this observed transition.
+            self.invalidate_qualification();
+        } else if self.last_main_mute == Some(false) && volume.muted && !self.active {
+            self.invalidate_qualification();
+        }
+        self.last_main_mute = Some(volume.muted);
+        if !self.candidate_observable {
+            self.qualified_frames = 0;
+            self.qualification_baseline = false;
+            // An already active ordinary fade-out is still passed through.
+            return;
+        }
+        if self.trip.is_some() || self.attempt_required || self.control.owner.is_none() {
+            return;
+        }
+        if !self.active {
+            if self.qualification_baseline {
+                self.qualified_frames = self.qualified_frames.checked_add(FRAMES as u64).unwrap();
+                if self.qualified_frames >= QUALIFICATION_FRAMES {
+                    self.active = true;
+                }
+            } else {
+                self.qualification_baseline = true;
+            }
         }
     }
 }
@@ -372,7 +615,15 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn chunk() -> AudioChunk {
-        AudioChunk::new(vec![vec![0.1; FRAMES]; CHANNELS], 0.1, 0.1, FRAMES, FRAMES)
+        {
+            let mut chunk =
+                AudioChunk::new(vec![vec![0.1; FRAMES]; CHANNELS], 0.1, 0.1, FRAMES, FRAMES);
+            chunk.main_volume = Some(crate::filters::basicfilters::AppliedVolume {
+                muted: false,
+                opening: false,
+            });
+            chunk
+        }
     }
 
     pub(crate) fn configuration() -> config::Configuration {
@@ -629,7 +880,6 @@ pub(crate) mod tests {
                 0,
             );
             let mut pipeline = crate::pipeline::Pipeline::from_config(conf, params.clone());
-            let mut guard = guard(); // Test-only admission; production stays inactive.
             for block in 0..420 {
                 match block {
                     10 | 60 | 160 | 340 => params.set_mute(0, true),
@@ -640,9 +890,7 @@ pub(crate) mod tests {
                 }
                 let mut expected = chunk();
                 reference.process_chunk(&mut expected);
-                let mut actual = pipeline.process_chunk(chunk());
-                guard.process(&mut actual);
-                assert!(guard.trip().is_none());
+                let actual = pipeline.process_chunk(chunk());
                 assert_eq!(
                     actual.waveforms, expected.waveforms,
                     "block {block}, initial mute {initial_mute}"

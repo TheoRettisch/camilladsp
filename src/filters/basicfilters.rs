@@ -44,6 +44,14 @@ pub struct Delay {
     biquad: Option<Biquad>,
 }
 
+/// State actually applied by the built-in main Volume to one complete chunk.
+/// A later control read cannot describe samples already processed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppliedVolume {
+    pub(crate) muted: bool,
+    pub(crate) opening: bool,
+}
+
 pub struct Volume {
     pub name: String,
     ramptime_in_chunks: usize,
@@ -51,6 +59,7 @@ pub struct Volume {
     target_volume: f32,
     target_linear_gain: PrcFmt,
     mute: bool,
+    opening: bool,
     ramp_start: PrcFmt,
     ramp_step: usize,
     samplerate: usize,
@@ -91,6 +100,7 @@ impl Volume {
             target_volume: current_volume,
             target_linear_gain,
             mute,
+            opening: false,
             ramp_step: 0,
             samplerate,
             chunksize,
@@ -154,6 +164,9 @@ impl Volume {
 
         // Volume setting changed
         if (target_volume - self.target_volume).abs() > 0.01 || self.mute != shared_mute {
+            if self.mute != shared_mute {
+                self.opening = !shared_mute && self.ramptime_in_chunks > 0;
+            }
             if self.ramptime_in_chunks > 0 {
                 trace!(
                     "starting ramp: {} -> {}, mute: {}",
@@ -184,8 +197,14 @@ impl Volume {
         }
     }
 
-    pub fn process_chunk(&mut self, chunk: &mut AudioChunk) {
+    pub fn process_chunk(&mut self, chunk: &mut AudioChunk) -> AppliedVolume {
         self.prepare_processing();
+        // Capture before processing: the last ramp chunk is still masked even
+        // though ramp_step becomes zero while processing it.
+        let applied = AppliedVolume {
+            muted: self.mute,
+            opening: self.opening,
+        };
 
         // Not in a ramp
         if self.ramp_step == 0 {
@@ -216,6 +235,10 @@ impl Volume {
         // Update shared current volume
         self.processing_params
             .set_current_volume(self.fader, self.current_volume as f32);
+        if self.ramp_step == 0 {
+            self.opening = false;
+        }
+        applied
     }
 }
 
