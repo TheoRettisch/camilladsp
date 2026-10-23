@@ -197,7 +197,7 @@ impl Shared {
                 "snapshot_at_ns": now,
                 "epoch": epoch(host, guard.pipeline, guard.backend, guard.reset),
                 "epoch_frame_floor": guard.frame_floor,
-                "identity": {"fork_revision": git_version::git_version!(args = ["--always", "--abbrev=40"], fallback = "unavailable"),
+                "identity": {"fork_revision": identity::FORK_REVISION,
                     "graph_sha256": identity::hex(guard.identity.graph), "profile_sha256": identity::hex(guard.identity.profile),
                     "backend": "alsa-hw-ring-v1", "sample_rate": super::SAMPLE_RATE, "chunk_frames": super::FRAMES,
                     "output_channels": (0..super::CHANNELS).collect::<Vec<_>>(), "tweeter_channels": [0, 1]},

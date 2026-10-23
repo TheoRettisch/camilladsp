@@ -541,6 +541,14 @@ fn main_process() -> i32 {
                 .action(ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("export-protection-profile")
+                .help("Validate and export normalized protection graph/profile JSON without opening audio")
+                .long("export-protection-profile")
+                .requires("configfile")
+                .conflicts_with("check")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("verbosity")
                 .help("Increase message verbosity")
                 .short('v')
@@ -960,6 +968,21 @@ fn main_process() -> i32 {
     debug!("Initial volume: {initial_volumes:?}");
 
     debug!("Read config file {configname:?}");
+
+    if matches.get_flag("export-protection-profile") {
+        match config::load_validate_config(configname.as_ref().unwrap())
+            .and_then(|conf| camillalib::protection::identity::export(&conf))
+        {
+            Ok(export) => {
+                println!("{export}");
+                return EXIT_OK;
+            }
+            Err(err) => {
+                eprintln!("Protection export failed: {err}");
+                return EXIT_BAD_CONFIG;
+            }
+        }
+    }
 
     if matches.get_flag("check") {
         match config::load_validate_config(&configname.unwrap()) {

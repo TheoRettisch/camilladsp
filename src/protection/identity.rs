@@ -4,6 +4,8 @@ use crate::{Res, config};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub const FORK_REVISION: &str = env!("CAMILLA_PROTECTION_BUILD_REVISION");
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Identity {
     pub graph: [u64; 4],
@@ -108,12 +110,9 @@ pub fn hex(words: [u64; 4]) -> String {
     words.iter().map(|word| format!("{word:016x}")).collect()
 }
 
-pub fn prepare(conf: &config::Configuration) -> Res<Identity> {
+pub fn profile(conf: &config::Configuration) -> Res<Value> {
     let parameters = super::admission(conf)?;
-    // GetConfig uses this same YAML serialization. Round-trip it before
-    // canonicalization so f32 config scalars have the same text semantics.
-    let graph: Value = yaml_serde::from_str(&yaml_serde::to_string(conf)?)?;
-    let profile = serde_json::json!({
+    Ok(serde_json::json!({
         "algorithm": "protection-audio-time-v1",
         "parameters": parameters,
         "qualification_frames": super::policy::Policy::new(&parameters).qualification_frames,
@@ -124,16 +123,56 @@ pub fn prepare(conf: &config::Configuration) -> Res<Identity> {
         "short_prearm_factor": 2.5,
         "qualification_rule": "candidate-baseline-max-windows-short-veto-v1",
         "activation_inhibited": true,
-    });
+    }))
+}
+
+pub fn prepare(conf: &config::Configuration) -> Res<Identity> {
+    // GetConfig uses this same YAML serialization. Round-trip it before
+    // canonicalization so f32 config scalars have the same text semantics.
+    let graph: Value = yaml_serde::from_str(&yaml_serde::to_string(conf)?)?;
+    let profile = profile(conf)?;
     Ok(Identity {
         graph: digest(&graph)?,
         profile: digest(&profile)?,
     })
 }
 
+/// Offline export of the same normalized graph and policy used by status.
+/// This does not instantiate an audio backend or read a running DSP.
+pub fn export(conf: &config::Configuration) -> Res<Value> {
+    let identity = prepare(conf)?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "protocol": 1,
+        "backend": "alsa-hw-ring-v1",
+        "fork_revision": FORK_REVISION,
+        "graph_sha256": hex(identity.graph),
+        "profile_sha256": hex(identity.profile),
+        "graph_yaml": yaml_serde::to_string(conf)?,
+        "profile": profile(conf)?,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_export_matches_status_and_round_trips_without_identity_drift() {
+        let conf = super::super::tests::configuration();
+        let exported = export(&conf).unwrap();
+        let mut round_trip: config::Configuration =
+            yaml_serde::from_str(exported["graph_yaml"].as_str().unwrap()).unwrap();
+        config::validate_config(&mut round_trip, None).unwrap();
+        let identity = round_trip.protection_identity.unwrap();
+        assert_eq!(exported["graph_sha256"], hex(identity.graph));
+        assert_eq!(exported["profile_sha256"], hex(identity.profile));
+        assert_eq!(exported["profile"]["activation_inhibited"], true);
+        assert_eq!(exported["profile"]["short_prearm_factor"], 2.5);
+        assert_eq!(exported["fork_revision"], FORK_REVISION);
+        assert_eq!(FORK_REVISION.len(), 40);
+        assert_eq!(profile(&round_trip).unwrap(), exported["profile"]);
+    }
 
     #[test]
     fn canonical_float_notation_matches_identity_contract() {
