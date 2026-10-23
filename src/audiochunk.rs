@@ -21,6 +21,7 @@ use crate::utils::decibels::linear_to_db;
 
 /// Main container of audio data
 pub struct AudioChunk {
+    pub(crate) protection: Option<crate::protection::Stamp>,
     pub frames: usize,
     pub channels: usize,
     pub maxval: PrcFmt,
@@ -75,6 +76,7 @@ impl AudioChunk {
         let timestamp = Instant::now();
         let channels = waveforms.len();
         AudioChunk {
+            protection: None,
             frames,
             channels,
             maxval,
@@ -93,6 +95,7 @@ impl AudioChunk {
         let valid_frames = chunk.valid_frames;
         let channels = waveforms.len();
         AudioChunk {
+            protection: None,
             frames,
             channels,
             maxval,

@@ -1488,6 +1488,11 @@ pub struct Mixer {
 #[serde(tag = "type")]
 #[serde(deny_unknown_fields)]
 pub enum Processor {
+    Protection {
+        #[serde(default)]
+        description: Option<String>,
+        parameters: crate::protection::Parameters,
+    },
     Compressor {
         #[serde(default)]
         description: Option<String>,

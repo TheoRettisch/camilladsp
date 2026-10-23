@@ -113,6 +113,7 @@ fn play_buffer(
     millis_per_frame: f32,
     bytes_per_frame: usize,
     buf_manager: &PlaybackBufferManager,
+    protection: &crate::protection::Stamp,
 ) -> Res<PlaybackResult> {
     let playback_state = pcmdevice.state_raw();
     xtrace!("Playback state {:?}", playback_state);
@@ -195,6 +196,9 @@ fn play_buffer(
         }
 
         //trace!("Delay BEFORE writing {} is {:?} frames",  buffer.len() / bytes_per_frame, pcmdevice.status().ok().map(|status| status.get_delay()));
+        if !protection.is_current() {
+            return Err(DeviceError::new("Retired protection stamp").into());
+        }
         match io.writei(buffer) {
             Ok(frames_written) => {
                 let cur_frames_to_write = buffer.len() / bytes_per_frame;
@@ -221,6 +225,9 @@ fn play_buffer(
                     trace!("snd_pcm_prepare");
                     pcmdevice.prepare()?;
                     buf_manager.sleep_for_target_delay(millis_per_frame);
+                    if !protection.is_current() {
+                        return Err(DeviceError::new("Retired protection stamp").into());
+                    }
                     io.writei(buffer)?;
                     break;
                 }
@@ -558,7 +565,17 @@ fn playback_loop_bytes(
             } /* waiting for a new message */
         };
         match msg {
-            Ok(AudioMessage::Audio(chunk)) => {
+            Ok(AudioMessage::Audio(mut chunk)) => {
+                let protection = match chunk.protection.take() {
+                    Some(stamp) if stamp.is_current() => stamp,
+                    _ => {
+                        let _ = pcmdevice.drop();
+                        let _ = channels.status.send(StatusMessage::PlaybackError(
+                            "Missing or retired final-protection admission".to_string(),
+                        ));
+                        break;
+                    }
+                };
                 // measure delay only on running non-stalled device
                 let avail_at_chunk_recvd = if !device_stalled
                     && pcmdevice.state_raw() == alsa_sys::SND_PCM_STATE_RUNNING as i32
@@ -583,6 +600,7 @@ fn playback_loop_bytes(
                     millis_per_frame,
                     params.bytes_per_frame,
                     buf_manager,
+                    &protection,
                 );
                 pcm_paused = false;
                 device_stalled = match playback_res {

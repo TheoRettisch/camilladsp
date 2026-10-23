@@ -58,6 +58,7 @@ pub struct Volume {
     processing_params: Arc<ProcessingParameters>,
     fader: usize,
     volume_limit: f32,
+    defer_mute: bool,
 }
 
 impl Volume {
@@ -97,6 +98,7 @@ impl Volume {
             processing_params,
             fader,
             volume_limit: limit,
+            defer_mute: false,
         }
     }
 
@@ -145,9 +147,13 @@ impl Volume {
             .collect()
     }
 
+    pub(crate) fn defer_mute_to_guard(&mut self) {
+        self.defer_mute = true;
+    }
+
     fn prepare_processing(&mut self) {
         let shared_vol = self.processing_params.target_volume(self.fader);
-        let shared_mute = self.processing_params.is_mute(self.fader);
+        let shared_mute = !self.defer_mute && self.processing_params.is_mute(self.fader);
 
         // are we above the set limit?
         let target_volume = shared_vol.min(self.volume_limit);

@@ -133,6 +133,7 @@ pub mod pipeline;
 pub mod pipewire_backend;
 pub mod processing;
 pub mod processors;
+pub mod protection;
 #[cfg(all(target_os = "linux", feature = "pulse-backend"))]
 pub mod pulse_backend;
 #[cfg(feature = "websocket")]
@@ -247,6 +248,10 @@ pub(crate) fn update_playback_signal_status(
 
 #[derive(Debug)]
 pub struct ProcessingParameters {
+    pub protection: Arc<protection::Shared>,
+    // Acquired only when transferring the single processing-owner lifetime.
+    // Status readers use atomic records and never acquire this ownership lock.
+    pub protection_owner: std::sync::Mutex<protection::Guard>,
     // Optimization: volumes are actually `f32`s, but by representing their
     // bits as a `u32` of equal size we can use atomic operations instead of a
     // mutex.
@@ -264,7 +269,10 @@ impl ProcessingParameters {
     pub const DEFAULT_MUTE: bool = false;
 
     pub fn new(initial_volumes: &[f32; 5], initial_mutes: &[bool; 5]) -> Self {
+        let protection = Arc::new(protection::Shared::default());
         Self {
+            protection_owner: std::sync::Mutex::new(protection::Guard::new(protection.clone())),
+            protection,
             target_volume: [
                 AtomicU32::new(initial_volumes[0].to_bits()),
                 AtomicU32::new(initial_volumes[1].to_bits()),

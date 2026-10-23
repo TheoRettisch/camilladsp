@@ -713,6 +713,15 @@ pub fn validate_config(conf: &mut Configuration, filename: Option<&str>) -> Res<
                             } else {
                                 let procconf = processors.get(&step.name).unwrap();
                                 match procconf {
+                                    Processor::Protection { parameters, .. } => {
+                                        parameters.validate()?;
+                                        if num_channels != crate::protection::CHANNELS {
+                                            return Err(ConfigError::new(
+                                                "Protection requires 24 candidate channels",
+                                            )
+                                            .into());
+                                        }
+                                    }
                                     Processor::Compressor { parameters, .. } => {
                                         let channels = parameters.channels;
                                         if channels != num_channels {

@@ -33,6 +33,16 @@ pub fn run_processing(
     processing_params: Arc<ProcessingParameters>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        let mut protection = processing_params
+            .protection_owner
+            .lock()
+            .expect("Protection owner poisoned");
+        if let Err(err) = protection.install(&conf_proc) {
+            error!("Protection admission rejected: {err}");
+            barrier_proc.wait();
+            let _ = tx_pb.send(AudioMessage::EndOfStream);
+            return;
+        }
         let chunksize = conf_proc.devices.chunksize;
         let samplerate = conf_proc.devices.samplerate;
         let multithreaded = conf_proc.devices.multithreaded();
@@ -117,6 +127,7 @@ pub fn run_processing(
                 Ok(AudioMessage::Audio(mut chunk)) => {
                     //trace!("AudioMessage::Audio received");
                     chunk = pipeline.process_chunk(chunk);
+                    protection.process(&mut chunk, processing_params.is_mute(0));
                     let msg = AudioMessage::Audio(chunk);
                     if tx_pb.send(msg).is_err() {
                         info!("Playback thread has already stopped.");
@@ -150,6 +161,11 @@ pub fn run_processing(
             }
             if let Ok((diff, new_config)) = rx_pipeconf.try_recv() {
                 trace!("Message received on config channel");
+                if let Err(err) = protection.install(&new_config) {
+                    error!("Replacement protection admission rejected: {err}");
+                    let _ = tx_pb.send(AudioMessage::EndOfStream);
+                    break;
+                }
                 match diff {
                     config::ConfigChange::Pipeline | config::ConfigChange::MixerParameters => {
                         debug!("Rebuilding pipeline.");
