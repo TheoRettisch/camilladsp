@@ -408,8 +408,8 @@ mod tests {
                 "between-chunk idle was treated as pause"
             );
             assert_eq!(receipt.frames, before.frames + if pause { 0 } else { 256 });
-            // Production activation is deliberately still inhibited in this
-            // integration fixture; candidate-time acceptance is tested by Guard.
+            // One chunk after prearm cannot complete qualification;
+            // candidate-time acceptance is tested by Guard.
             assert_eq!(
                 receipt.control.last_command.unwrap().result,
                 ControlResult::NotQualified

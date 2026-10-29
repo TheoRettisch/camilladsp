@@ -389,8 +389,6 @@ mod tests {
     #[test]
     fn offline_frame_to_wire_slice_for_parent_replay() {
         let (shared, mut guard, mut playback) = setup();
-        // Compile-time test-only bypass. Production constructor always inhibits.
-        guard.activation_inhibited = false;
         let mut replies = Vec::new();
         let capture = |replies: &mut Vec<Value>| {
             replies.push(
@@ -558,33 +556,46 @@ mod tests {
     }
 
     #[test]
-    fn fixed_production_inhibit_survives_real_context_and_full_qualification() {
+    fn real_guard_forwards_and_arms_only_after_full_qualification() {
         let (shared, mut guard, _playback) = setup();
         let text = request(&status(&shared), 1, false);
         assert!(shared.protection_reply(&text).unwrap().contains("queued"));
         guard.control_only(shared.commands().try_recv().unwrap());
-        for _ in 0..2 * super::super::QUALIFICATION_FRAMES / 256 {
-            let mut audio = chunk();
-            guard.process(&mut audio);
-            assert!(audio.waveforms.iter().flatten().all(|v| *v == 0.0));
-        }
-        assert!(guard.qualified_frames >= super::super::QUALIFICATION_FRAMES);
-        assert_eq!(status(&shared)["guard"]["state"], "qualifying");
-        let mut command: Value =
-            serde_json::from_str(&request(&status(&shared), 2, false)).unwrap();
-        command["SetProtectionContext"]["mode"] = json!("armed");
-        command["SetProtectionContext"]["qualification_id"] = json!(1);
-        assert!(
-            shared
-                .protection_reply(&command.to_string())
-                .unwrap()
-                .contains("queued")
-        );
-        guard.process_with_command(&mut chunk(), Some(shared.commands().try_recv().unwrap()));
+        let armed = |shared: &Shared, id| {
+            let mut command: Value =
+                serde_json::from_str(&request(&status(shared), id, false)).unwrap();
+            command["SetProtectionContext"]["mode"] = json!("armed");
+            command["SetProtectionContext"]["qualification_id"] = json!(1);
+            assert!(
+                shared
+                    .protection_reply(&command.to_string())
+                    .unwrap()
+                    .contains("queued")
+            );
+        };
+        armed(&shared, 2);
+        let mut audio = chunk();
+        guard.process_with_command(&mut audio, Some(shared.commands().try_recv().unwrap()));
+        assert!(audio.waveforms.iter().flatten().all(|v| *v == 0.0));
         assert_eq!(
             status(&shared)["control"]["last_command"]["result"],
             "not_qualified"
         );
+        for _ in 1..super::super::QUALIFICATION_FRAMES / 256 {
+            let mut audio = chunk();
+            guard.process(&mut audio);
+            assert!(audio.waveforms.iter().flatten().all(|v| *v == 0.0));
+        }
+        assert_eq!(status(&shared)["guard"]["state"], "qualifying");
+        let mut audio = chunk();
+        guard.process(&mut audio);
+        assert!(audio.waveforms.iter().flatten().any(|v| *v != 0.0));
+        assert_eq!(status(&shared)["guard"]["state"], "active");
+        armed(&shared, 3);
+        guard.process_with_command(&mut chunk(), Some(shared.commands().try_recv().unwrap()));
+        let status = status(&shared);
+        assert_eq!(status["control"]["last_command"]["result"], "applied");
+        assert_eq!(status["control"]["mode"], "armed");
     }
 
     #[test]

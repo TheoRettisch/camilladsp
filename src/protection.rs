@@ -460,11 +460,7 @@ pub struct Guard {
     qualification_baseline: bool,
     attempt_required: bool,
     last_main_mute: Option<bool>,
-    // The fixed production inhibit remains until transition acceptance.
-    // Test builds exercise the same policy and lifecycle with exact output.
     pub(crate) active: bool,
-    #[cfg(test)]
-    activation_inhibited: bool,
     identity: Option<identity::Identity>,
     activity_generation: u64,
     silent_frames: u64,
@@ -497,8 +493,6 @@ impl Guard {
             attempt_required: true,
             last_main_mute: None,
             active: false,
-            #[cfg(test)]
-            activation_inhibited: true,
             identity: None,
             activity_generation: 0,
             silent_frames: 0,
@@ -535,19 +529,6 @@ impl Guard {
         self.identity = conf.protection_identity;
         self.publish();
         Ok(())
-    }
-
-    // Fixed build-time barrier until the separately reviewed activation gate.
-    // Only the test build carries a bypass field; no production option exists.
-    fn activation_inhibited(&self) -> bool {
-        #[cfg(test)]
-        {
-            self.activation_inhibited
-        }
-        #[cfg(not(test))]
-        {
-            true
-        }
     }
 
     pub fn trip(&self) -> Option<Trip> {
@@ -705,7 +686,7 @@ impl Guard {
         }
         #[cfg(any(test, feature = "protection-test-capture"))]
         let decision_ns = monotonic_ns();
-        if self.activation_inhibited() || !self.active || self.trip.is_some() || !shape_valid {
+        if !self.active || self.trip.is_some() || !shape_valid {
             for waveform in &mut chunk.waveforms {
                 waveform.fill(0.0);
             }
@@ -869,7 +850,6 @@ pub(crate) mod tests {
         guard.parameters = Some(parameters());
         guard.peak_limit = 10.0_f64.powf(-0.5 / 20.0) as PrcFmt;
         guard.active = true;
-        guard.activation_inhibited = false;
         guard
     }
 

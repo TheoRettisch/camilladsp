@@ -23,7 +23,7 @@ struct Block {
     times: [u64; 5],
     identity: identity::Identity,
     trip: Option<super::Trip>,
-    inhibited: bool,
+    active: bool,
     shape_valid: bool,
     clipped: usize,
     candidate: Vec<u64>,
@@ -39,7 +39,7 @@ impl Default for Block {
             times: [0; 5],
             identity: identity::Identity::default(),
             trip: None,
-            inhibited: true,
+            active: false,
             shape_valid: false,
             clipped: 0,
             candidate: vec![0; SAMPLES],
@@ -108,7 +108,7 @@ impl Pending {
         block.times[3] = published_ns;
         block.identity = guard.identity.unwrap_or_default();
         block.trip = guard.trip;
-        block.inhibited = guard.activation_inhibited();
+        block.active = guard.active;
         block.shape_valid = shape(chunk);
         copy_bits(chunk, &mut block.forwarded);
         self.finish();
@@ -243,7 +243,7 @@ impl Capture {
             if block.kind == "guard" {
                 let bits = |values: &[u64]| values.iter().map(|v| format!("{v:016x}")).collect::<Vec<_>>();
                 result.extend(json!({"candidate_bits": bits(&block.candidate),
-                    "forwarded_bits": bits(&block.forwarded), "activation_inhibited": block.inhibited,
+                    "forwarded_bits": bits(&block.forwarded), "guard_active": block.active,
                     "graph_sha256": identity::hex(block.identity.graph),
                     "profile_sha256": identity::hex(block.identity.profile),
                     "trip": block.trip.map(|t| json!({"generation": t.generation, "reason": t.reason as u64,
@@ -396,7 +396,7 @@ mod tests {
                 .all(|v| v == "0000000000000000")
         );
         assert_eq!(record["trip"]["frame"], 17);
-        assert_eq!(record["activation_inhibited"], true);
+        assert_eq!(record["guard_active"], false);
         assert_eq!(value["records"][1]["clipped"], 0);
         if let Some(path) = std::env::var_os("P4_CAPTURE_FIXTURE") {
             std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();

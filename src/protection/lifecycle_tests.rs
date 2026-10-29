@@ -11,7 +11,6 @@ fn setup(muted: bool, ramp_ms: f32) -> (Arc<ProcessingParameters>, Pipeline, Gua
     conf.devices.volume_ramp_time = Some(ramp_ms);
     let pipeline = Pipeline::from_config(conf.clone(), params.clone());
     let mut guard = Guard::new(params.protection.clone());
-    guard.activation_inhibited = false; // Offline forwarding fixture only.
     guard.install(&conf).unwrap();
     (params, pipeline, guard)
 }

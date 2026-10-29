@@ -238,7 +238,6 @@ mod tests {
         crate::config::validate_config(&mut conf, None).unwrap();
         let mut guard = Guard::new(Arc::new(Shared::default()));
         guard.install(&conf).unwrap();
-        guard.activation_inhibited = false;
         context(&mut guard, Operation::Context(Mode::Prearm), 1);
         guard
     }

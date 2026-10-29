@@ -122,7 +122,6 @@ pub fn profile(conf: &config::Configuration) -> Res<Value> {
             "tone": parameters.tone_min_rms_db.is_some(), "dc_frozen": true},
         "short_prearm_factor": 2.5,
         "qualification_rule": "candidate-baseline-max-windows-short-veto-v1",
-        "activation_inhibited": true,
     }))
 }
 
@@ -167,7 +166,6 @@ mod tests {
         let identity = round_trip.protection_identity.unwrap();
         assert_eq!(exported["graph_sha256"], hex(identity.graph));
         assert_eq!(exported["profile_sha256"], hex(identity.profile));
-        assert_eq!(exported["profile"]["activation_inhibited"], true);
         assert_eq!(exported["profile"]["short_prearm_factor"], 2.5);
         assert_eq!(exported["fork_revision"], FORK_REVISION);
         assert_eq!(FORK_REVISION.len(), 40);

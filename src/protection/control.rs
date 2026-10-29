@@ -105,7 +105,7 @@ impl Guard {
     pub fn state(&self) -> State {
         if self.trip.is_some() {
             State::Tripped
-        } else if self.active && !self.activation_inhibited() {
+        } else if self.active {
             // Ordinary mute preserves an already admitted fade-out trajectory.
             // candidate_observable is false and no new armed receipt is allowed.
             State::Active
@@ -233,7 +233,6 @@ impl Guard {
                     return Result::StateMismatch;
                 }
                 if !has_candidate
-                    || self.activation_inhibited()
                     || self.short_power_veto
                     || !self.active
                     || !self.candidate_observable
