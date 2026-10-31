@@ -283,6 +283,15 @@ impl Shared {
 }
 
 #[cfg(test)]
+impl Shared {
+    /// Frame end of the last completed-write telemetry, if any was credited.
+    pub(crate) fn completed_frame_end(&self) -> Option<u64> {
+        let (_, v) = self.playback_record.read()?;
+        (v[9] != 0).then_some(v[11])
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::protection::{
