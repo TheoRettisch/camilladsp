@@ -9,7 +9,7 @@ concurrency:
 jobs:
   check_lint_test_linux_amd64:
     name: Check test and lint Linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     #container: ubuntu:20.04
     steps:
       - name: Checkout sources

@@ -9,7 +9,7 @@ on:
 jobs:
   linux_amd64:
     name: Linux amd64
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     #container: ubuntu:20.04
     steps:
       - name: Checkout sources
