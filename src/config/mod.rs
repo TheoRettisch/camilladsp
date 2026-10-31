@@ -1487,6 +1487,7 @@ pub struct Mixer {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum Processor {
     Protection {
         #[serde(default)]

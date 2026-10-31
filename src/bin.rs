@@ -100,7 +100,7 @@ fn custom_colored_logger_format(
         record.module_path().unwrap_or("*unknown module*"),
         record.file().unwrap_or("*unknown file*"),
         record.line().unwrap_or(0),
-        &record.args()
+        record.args()
     )
 }
 
@@ -118,7 +118,7 @@ pub fn custom_logger_format(
         record.module_path().unwrap_or("*unknown module*"),
         record.file().unwrap_or("*unknown file*"),
         record.line().unwrap_or(0),
-        &record.args()
+        record.args()
     )
 }
 
@@ -1203,7 +1203,7 @@ fn main_process() -> i32 {
                     thread::sleep(Duration::from_millis(1000));
                     match rx_state.recv() {
                         Ok(()) => {
-                            debug!("saving state to {}", &fname);
+                            debug!("saving state to {}", fname);
                             statefile::save_state(
                                 &fname,
                                 &active_config_path_clone,

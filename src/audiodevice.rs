@@ -84,6 +84,8 @@ impl DeviceError {
     }
 }
 
+// Boxing the chunk would allocate for every chunk.
+#[allow(clippy::large_enum_variant)]
 pub enum AudioMessage {
     //Quit,
     Audio(AudioChunk),

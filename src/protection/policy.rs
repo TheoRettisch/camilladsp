@@ -145,12 +145,8 @@ impl Policy {
         prearm: bool,
         observable: bool,
     ) -> Assessment {
-        let peak = samples.iter().fold(0.0_f64, |p, x| p.max(x.abs() as f64));
-        let q = samples
-            .iter()
-            .map(|x| (*x as f64) * (*x as f64))
-            .sum::<f64>()
-            / FRAMES as f64;
+        let peak = samples.iter().fold(0.0_f64, |p, x| p.max(x.abs()));
+        let q = samples.iter().map(|x| x * x).sum::<f64>() / FRAMES as f64;
         if !q.is_finite() {
             return Assessment {
                 reason: Some(Reason::Nonfinite),
@@ -180,10 +176,10 @@ impl Policy {
                 reason = reason.or(Some(Reason::ShortPower));
             }
         }
-        if let Some(limit) = self.long_limit {
-            if update_power(&mut h.long_power, q, self.long_alpha, observable) >= limit {
-                reason = reason.or(Some(Reason::LongPower));
-            }
+        if let Some(limit) = self.long_limit
+            && update_power(&mut h.long_power, q, self.long_alpha, observable) >= limit
+        {
+            reason = reason.or(Some(Reason::LongPower));
         }
         let peak_db = 20.0 * peak.log10();
         let rms_db = 10.0 * q.log10();

@@ -520,10 +520,10 @@ pub fn validate_config(samplerate: usize, parameters: &config::BiquadParameters)
         | config::BiquadParameters::Allpass(config::NotchWidth::Q { q, .. })
         | config::BiquadParameters::Highshelf(config::ShelfSteepness::Q { q, .. })
         | config::BiquadParameters::Lowshelf(config::ShelfSteepness::Q { q, .. })
-        | config::BiquadParameters::GeneralNotch(config::GeneralNotchParams { q_p: q, .. }) => {
-            if *q <= 0.0 {
-                return Err(config::ConfigError::new("Q must be > 0").into());
-            }
+        | config::BiquadParameters::GeneralNotch(config::GeneralNotchParams { q_p: q, .. })
+            if *q <= 0.0 =>
+        {
+            return Err(config::ConfigError::new("Q must be > 0").into());
         }
         _ => {}
     }
@@ -534,10 +534,10 @@ pub fn validate_config(samplerate: usize, parameters: &config::BiquadParameters)
         })
         | config::BiquadParameters::Notch(config::NotchWidth::Bandwidth { bandwidth, .. })
         | config::BiquadParameters::Bandpass(config::NotchWidth::Bandwidth { bandwidth, .. })
-        | config::BiquadParameters::Allpass(config::NotchWidth::Bandwidth { bandwidth, .. }) => {
-            if *bandwidth <= 0.0 {
-                return Err(config::ConfigError::new("Bandwidth must be > 0").into());
-            }
+        | config::BiquadParameters::Allpass(config::NotchWidth::Bandwidth { bandwidth, .. })
+            if *bandwidth <= 0.0 =>
+        {
+            return Err(config::ConfigError::new("Bandwidth must be > 0").into());
         }
         _ => {}
     }

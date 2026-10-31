@@ -341,7 +341,7 @@ fn replace_tokens_in_config(config: &mut Configuration) {
     let samplerate = config.devices.samplerate;
     let num_channels = config.devices.capture.channels();
     if let Some(filters) = &mut config.filters {
-        for (_name, filter) in filters.iter_mut() {
+        for filter in filters.values_mut() {
             match filter {
                 Filter::Conv {
                     parameters: ConvParameters::Raw(params),
@@ -383,7 +383,7 @@ fn replace_relative_paths_in_config(config: &mut Configuration, configname: &str
     if let Ok(config_file) = PathBuf::from(configname.to_owned()).canonicalize() {
         if let Some(config_dir) = config_file.parent() {
             if let Some(filters) = &mut config.filters {
-                for (_name, filter) in filters.iter_mut() {
+                for filter in filters.values_mut() {
                     if let Filter::Conv {
                         parameters: ConvParameters::Raw(params),
                         ..
@@ -638,14 +638,14 @@ pub fn validate_config(conf: &mut Configuration, filename: Option<&str>) -> Res<
                     if !step.is_bypassed() {
                         if let Some(mixers) = &conf.mixers {
                             if !mixers.contains_key(&step.name) {
-                                let msg = format!("Use of missing mixer '{}'", &step.name);
+                                let msg = format!("Use of missing mixer '{}'", step.name);
                                 return Err(ConfigError::new(&msg).into());
                             } else {
                                 let chan_in = mixers.get(&step.name).unwrap().channels.r#in;
                                 if chan_in != num_channels {
                                     let msg = format!(
                                         "Mixer '{}' has wrong number of input channels. Expected {}, found {}.",
-                                        &step.name, num_channels, chan_in
+                                        step.name, num_channels, chan_in
                                     );
                                     return Err(ConfigError::new(&msg).into());
                                 }
@@ -655,14 +655,14 @@ pub fn validate_config(conf: &mut Configuration, filename: Option<&str>) -> Res<
                                     Err(err) => {
                                         let msg = format!(
                                             "Invalid mixer '{}'. Reason: {}",
-                                            &step.name, err
+                                            step.name, err
                                         );
                                         return Err(ConfigError::new(&msg).into());
                                     }
                                 }
                             }
                         } else {
-                            let msg = format!("Use of missing mixer '{}'", &step.name);
+                            let msg = format!("Use of missing mixer '{}'", step.name);
                             return Err(ConfigError::new(&msg).into());
                         }
                     }
@@ -679,7 +679,7 @@ pub fn validate_config(conf: &mut Configuration, filename: Option<&str>) -> Res<
                             for idx in 1..channels.len() {
                                 if channels[idx..].contains(&channels[idx - 1]) {
                                     let msg =
-                                        format!("Use of duplicated channel {}", &channels[idx - 1]);
+                                        format!("Use of duplicated channel {}", channels[idx - 1]);
                                     return Err(ConfigError::new(&msg).into());
                                 }
                             }

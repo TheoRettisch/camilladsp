@@ -44,10 +44,10 @@ fn source_revision(root: &Path, supplied: Option<String>) -> Result<String, Stri
     } else {
         None
     };
-    if let (Some(pin), Some(head)) = (&supplied, &from_git) {
-        if pin != head {
-            return Err("CAMILLA_PROTECTION_REVISION differs from source HEAD".into());
-        }
+    if let (Some(pin), Some(head)) = (&supplied, &from_git)
+        && pin != head
+    {
+        return Err("CAMILLA_PROTECTION_REVISION differs from source HEAD".into());
     }
     let revision = supplied.or(from_git).ok_or(
         "source archives require CAMILLA_PROTECTION_REVISION from the pinned package version",
@@ -59,6 +59,13 @@ fn source_revision(root: &Path, supplied: Option<String>) -> Result<String, Stri
 }
 
 fn main() {
+    // Protection needs Linux CLOCK_MONOTONIC, 64-bit ALSA frame counts and f64 samples.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux")
+        || env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() != Ok("64")
+        || env::var_os("CARGO_FEATURE_32BIT").is_some()
+    {
+        panic!("the protection fork only builds for 64-bit Linux, without the 32bit feature");
+    }
     println!("cargo:rerun-if-env-changed=CAMILLA_PROTECTION_REVISION");
     println!("cargo:rerun-if-changed=build.rs");
     let root = env::var("CARGO_MANIFEST_DIR").expect("Cargo manifest directory");

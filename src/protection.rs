@@ -701,7 +701,7 @@ impl Guard {
         let mut rms_power = [0.0; CHANNELS];
         if shape_valid {
             for (rms, waveform) in rms_power.iter_mut().zip(&chunk.waveforms) {
-                *rms = waveform.iter().map(|x| x * x).sum::<PrcFmt>() as f64 / FRAMES as f64;
+                *rms = waveform.iter().map(|x| x * x).sum::<PrcFmt>() / FRAMES as f64;
             }
             if rms_power
                 .iter()
@@ -794,7 +794,6 @@ impl Guard {
             self.qualified_frames = 0;
             self.qualification_baseline = false;
             // An already active ordinary fade-out is still passed through.
-            return;
         }
     }
 
