@@ -23,10 +23,17 @@ use audio_thread_priority::{
 };
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::{Duration, Instant};
+
+// Leave room for command transport and status delivery inside the unchanged
+// 30 ms parent deadline. A healthy 48 kHz/256-frame candidate arrives every
+// 5.333 ms; absence beyond this wait rejects only the pending arm request.
+const ARM_CANDIDATE_WAIT: Duration = Duration::from_millis(10);
 
 struct ProcessingControl {
     paused: bool,
     armed: Option<crate::protection::control::Command>,
+    armed_deadline: Option<Instant>,
 }
 
 impl ProcessingControl {
@@ -38,17 +45,54 @@ impl ProcessingControl {
         use crate::protection::control::{Mode, Operation};
         if !self.paused && command.operation == Operation::Context(Mode::Armed) {
             // Between chunks is not a capture pause. Assess the next candidate
-            // before applying armed; the parent retains its 30 ms deadline.
+            // before applying armed, but do not wait for the capture backend
+            // to report a stall (which can take longer than the parent deadline).
             self.armed = Some(command);
+            self.armed_deadline = Some(Instant::now() + ARM_CANDIDATE_WAIT);
         } else {
             protection.control_only(command);
         }
     }
 
+    fn arm_timeout(&self) -> crossbeam_channel::Receiver<Instant> {
+        match self.armed_deadline {
+            Some(deadline) => crossbeam_channel::at(deadline),
+            None => crossbeam_channel::never(),
+        }
+    }
+
+    fn take_armed(&mut self) -> Option<crate::protection::control::Command> {
+        self.armed_deadline = None;
+        self.armed.take()
+    }
+
+    fn expire_armed(&mut self, protection: &mut crate::protection::Guard) {
+        if self
+            .armed_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+            && let Some(command) = self.take_armed()
+        {
+            // No candidate, pause, progress or qualification is fabricated.
+            protection.control_only(command);
+        }
+    }
+
+    fn candidate_command(
+        &mut self,
+        protection: &mut crate::protection::Guard,
+        shared: &crate::protection::Shared,
+    ) -> Option<crate::protection::control::Command> {
+        // A ready audio receive (or a slow pipeline) must not win a race with
+        // the original arm deadline and apply a command after its wait expired.
+        self.expire_armed(protection);
+        self.take_armed()
+            .or_else(|| shared.commands().try_recv().ok())
+    }
+
     fn pause(&mut self, protection: &mut crate::protection::Guard) {
         self.paused = true;
         protection.pause();
-        if let Some(command) = self.armed.take() {
+        if let Some(command) = self.take_armed() {
             protection.control_only(command);
         }
     }
@@ -65,6 +109,8 @@ fn send_output(
 ) -> bool {
     let no_commands = crossbeam_channel::never();
     loop {
+        control.expire_armed(protection);
+        let arm_timeout = control.arm_timeout();
         let commands = if control.armed.is_none() {
             shared.commands()
         } else {
@@ -72,6 +118,7 @@ fn send_output(
         };
         crossbeam_channel::select! {
             send(tx, message) -> result => return result.is_ok(),
+            recv(arm_timeout) -> _ => control.expire_armed(protection),
             recv(shared.backend_wakeups()) -> _ => protection.backend_wakeup(),
             recv(commands) -> command => {
                 control.service(protection, command.expect("owned control mailbox disconnected"));
@@ -189,9 +236,12 @@ pub fn run_processing(
         let mut control = ProcessingControl {
             paused: true,
             armed: None,
+            armed_deadline: None,
         };
         let no_commands = crossbeam_channel::never();
         loop {
+            control.expire_armed(&mut protection);
+            let arm_timeout = control.arm_timeout();
             let commands = if control.armed.is_none() {
                 shared.commands()
             } else {
@@ -199,6 +249,10 @@ pub fn run_processing(
             };
             let audio = crossbeam_channel::select! {
                 recv(rx_cap) -> audio => audio,
+                recv(arm_timeout) -> _ => {
+                    control.expire_armed(&mut protection);
+                    continue;
+                }
                 recv(shared.backend_wakeups()) -> _ => {
                     protection.backend_wakeup();
                     continue;
@@ -213,10 +267,7 @@ pub fn run_processing(
                     control.paused = false;
                     //trace!("AudioMessage::Audio received");
                     chunk = pipeline.process_chunk(chunk);
-                    let command = control
-                        .armed
-                        .take()
-                        .or_else(|| shared.commands().try_recv().ok());
+                    let command = control.candidate_command(&mut protection, &shared);
                     protection.process_with_command(&mut chunk, command);
                     let msg = AudioMessage::Audio(chunk);
                     if !send_output(&mut protection, &mut control, &shared, &tx_pb, msg) {
@@ -353,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn between_chunk_arm_waits_for_audio_or_explicit_pause() {
+    fn stalled_capture_rejects_arm_without_waiting_for_audio_or_pause() {
         use crate::protection::control::{Mode, Operation, Result as ControlResult};
         for pause in [false, true] {
             let params = Arc::new(ProcessingParameters::default());
@@ -386,11 +437,19 @@ mod tests {
                 .protection
                 .submit(request(before, 2, Operation::Context(Mode::Armed), 1))
                 .unwrap();
-            // Exercise the real receive loop while no chunk is in hand. This
-            // is a scheduling regression, not a target latency measurement.
-            thread::sleep(Duration::from_millis(20));
-            let waiting = params.protection.guard_snapshot().unwrap();
-            let premature_receipt = waiting.control.last_command.unwrap().command_id == 2;
+            // Neither a candidate nor a pause notification will arrive until
+            // after the receipt. The old unbounded wait fails this regression.
+            // The host wait is a deadlock guard, not target timing qualification.
+            let rejected = wait_receipt(&params.protection, 2);
+            assert_eq!(
+                rejected.control.last_command.unwrap().result,
+                ControlResult::NotQualified
+            );
+            assert_eq!(rejected.frames, before.frames);
+            assert_eq!(rejected.qualified_frames, before.qualified_frames);
+            assert_eq!(rejected.processing_valid, before.processing_valid);
+            assert_eq!(rejected.source_begin_ns, before.source_begin_ns);
+            assert_eq!(rejected.source_end_ns, before.source_end_ns);
             tx_cap
                 .send(if pause {
                     AudioMessage::Pause
@@ -399,14 +458,11 @@ mod tests {
                 })
                 .unwrap();
             rx_pb.recv_timeout(Duration::from_secs(2)).unwrap();
-            let receipt = wait_receipt(&params.protection, 2);
+            let receipt = params.protection.guard_snapshot().unwrap();
             tx_cap.send(AudioMessage::EndOfStream).unwrap();
             rx_pb.recv_timeout(Duration::from_secs(2)).unwrap();
             handle.join().unwrap();
-            assert!(
-                !premature_receipt,
-                "between-chunk idle was treated as pause"
-            );
+
             assert_eq!(receipt.frames, before.frames + if pause { 0 } else { 256 });
             // One chunk after prearm cannot complete qualification;
             // candidate-time acceptance is tested by Guard.
@@ -414,6 +470,74 @@ mod tests {
                 receipt.control.last_command.unwrap().result,
                 ControlResult::NotQualified
             );
+        }
+    }
+
+    #[test]
+    fn pending_arm_requires_a_candidate_before_its_original_deadline() {
+        use crate::protection::{
+            Guard, Shared,
+            control::{Mode, Operation, Result as ControlResult},
+        };
+        for expired in [false, true] {
+            let shared = Arc::new(Shared::default());
+            let mut guard = Guard::new(shared.clone());
+            guard.install(&configuration()).unwrap();
+            let mut control = ProcessingControl {
+                paused: false,
+                armed: None,
+                armed_deadline: None,
+            };
+            let prearm = request(
+                shared.guard_snapshot().unwrap(),
+                1,
+                Operation::Context(Mode::Prearm),
+                1,
+            );
+            control.service(&mut guard, prearm);
+            for _ in 0..=375 {
+                guard.process(&mut chunk());
+            }
+            assert_eq!(guard.state(), crate::protection::control::State::Active);
+            let before = shared.guard_snapshot().unwrap();
+            control.service(
+                &mut guard,
+                request(before, 2, Operation::Context(Mode::Armed), 1),
+            );
+            assert_eq!(
+                shared
+                    .guard_snapshot()
+                    .unwrap()
+                    .control
+                    .last_command
+                    .unwrap()
+                    .command_id,
+                1
+            );
+            // Exercise the boundary deterministically, including a candidate
+            // already ready when the deadline expires. No host timing claim.
+            control.armed_deadline = Some(if expired {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(10)
+            });
+            let command = control.candidate_command(&mut guard, &shared);
+            assert_eq!(command.is_none(), expired);
+            guard.process_with_command(&mut chunk(), command);
+            let after = shared.guard_snapshot().unwrap();
+            assert_eq!(
+                after.control.last_command.unwrap().result,
+                if expired {
+                    ControlResult::NotQualified
+                } else {
+                    ControlResult::Applied
+                }
+            );
+            assert_eq!(
+                after.control.mode,
+                if expired { Mode::Prearm } else { Mode::Armed }
+            );
+            assert!(control.armed.is_none() && control.armed_deadline.is_none());
         }
     }
 
@@ -530,6 +654,18 @@ mod tests {
         assert_eq!(receipt.source_begin_ns, before.source_begin_ns);
         assert_eq!(receipt.source_end_ns, before.source_end_ns);
         assert_eq!(receipt.qualified_frames, 0);
+        params
+            .protection
+            .submit(request(receipt, 2, Operation::Context(Mode::Armed), 1))
+            .unwrap();
+        let rejected = wait_receipt(&params.protection, 2);
+        assert_eq!(
+            rejected.control.last_command.unwrap().result,
+            ControlResult::NotQualified
+        );
+        assert_eq!(rejected.frames, receipt.frames);
+        assert_eq!(rejected.source_begin_ns, receipt.source_begin_ns);
+        assert_eq!(rejected.source_end_ns, receipt.source_end_ns);
         tx_cap.send(AudioMessage::EndOfStream).unwrap();
         for _ in 0..2 {
             assert!(matches!(
