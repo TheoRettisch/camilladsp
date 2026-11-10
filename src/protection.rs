@@ -74,7 +74,7 @@ impl Parameters {
 
 /// Validate before constructing or updating any executable graph. The declared
 /// final marker is compiled as the processing owner's final Guard operation.
-pub fn admission(conf: &config::Configuration) -> Res<Parameters> {
+fn admission(conf: &config::Configuration) -> Res<Parameters> {
     if cfg!(feature = "32bit") || cfg!(feature = "threaded-alsa") {
         return Err(config::ConfigError::new(
             "Protection requires double precision and direct ALSA",
@@ -122,6 +122,34 @@ pub fn admission(conf: &config::Configuration) -> Res<Parameters> {
     found.ok_or_else(|| {
         config::ConfigError::new("Required final Protection processor is missing").into()
     })
+}
+
+/// Compiled once during preparation, never paired with another raw graph.
+#[derive(Clone, Debug)]
+pub(crate) struct AdmittedGuard {
+    parameters: Parameters,
+    peak_limit: PrcFmt,
+    policy: policy::Policy,
+    identity: identity::Identity,
+}
+
+impl AdmittedGuard {
+    pub(crate) fn new(conf: &config::Configuration) -> Res<Self> {
+        let parameters = admission(conf)?;
+        let peak_limit = 10.0_f64.powf(parameters.max_allowed_peak_db / 20.0) as PrcFmt;
+        let policy = policy::Policy::new(&parameters);
+        let identity = identity::prepare(conf, &parameters, &policy)?;
+        Ok(Self {
+            parameters,
+            peak_limit,
+            policy,
+            identity,
+        })
+    }
+
+    pub(crate) fn identity(&self) -> identity::Identity {
+        self.identity
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -350,9 +378,10 @@ impl Guard {
         }
     }
 
-    pub fn install(&mut self, conf: &config::Configuration) -> Res<()> {
+    pub fn install(&mut self, conf: &config::PreparedConfig) {
         self.sync_backend();
-        // Retire queued stamps even when the replacement is invalid.
+        // Every admitted replacement retires queued stamps and qualification,
+        // preserving the latched trip and accumulated power history.
         self.epoch = self
             .shared
             .epoch
@@ -372,13 +401,12 @@ impl Guard {
         self.last_main_mute = None;
         self.invalidate_qualification();
         self.publish();
-        let parameters = admission(conf)?;
-        self.peak_limit = 10.0_f64.powf(parameters.max_allowed_peak_db / 20.0) as PrcFmt;
-        self.policy = policy::Policy::new(&parameters);
-        self.parameters = Some(parameters);
-        self.identity = conf.protection_identity;
+        let admitted = conf.guard();
+        self.peak_limit = admitted.peak_limit;
+        self.policy = admitted.policy.clone();
+        self.parameters = Some(admitted.parameters.clone());
+        self.identity = Some(admitted.identity);
         self.publish();
-        Ok(())
     }
 
     pub fn trip(&self) -> Option<Trip> {
@@ -701,6 +729,10 @@ pub(crate) mod tests {
         })).unwrap()
     }
 
+    pub(crate) fn prepared_configuration() -> config::PreparedConfig {
+        config::validate_config(configuration(), None).unwrap()
+    }
+
     #[test]
     fn missing_bypassed_nonfinal_and_repeated_guards_reject_admission() {
         let conf = configuration();
@@ -730,21 +762,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn invalid_replacement_retires_queue_without_clearing_trip() {
+    fn preparation_rejects_invalid_edits_and_install_retires_queue_without_clearing_trip() {
         let mut guard = Guard::new(Arc::new(Shared::default()));
-        let conf = configuration();
-        guard.install(&conf).unwrap();
+        let conf = config::validate_config(configuration(), None).unwrap();
+        guard.install(&conf);
         let mut input = chunk();
         input.waveforms[1][5] = 1.0;
         guard.process(&mut input);
         let stamp = input.protection.unwrap();
         let trip = guard.trip;
-        let mut invalid = conf.clone();
+        let mut invalid = conf.config().clone();
         invalid.pipeline = None;
-        assert!(guard.install(&invalid).is_err());
-        assert!(!stamp.is_current());
+        assert!(config::validate_config(invalid, None).is_err());
+        // Rejected edits never reach the owner; the admitted graph stays bound.
+        assert!(stamp.is_current());
         assert_eq!(guard.trip, trip);
-        guard.install(&conf).unwrap();
+        guard.install(&conf);
+        assert!(!stamp.is_current());
         assert_eq!(guard.trip, trip);
         let mut safe = chunk();
         guard.process(&mut safe);
@@ -800,7 +834,7 @@ pub(crate) mod tests {
     #[test]
     fn validate_config_enforces_complete_guard_admission() {
         let conf = configuration();
-        config::validate_config(&mut conf.clone(), None).unwrap();
+        config::validate_config(conf.clone(), None).unwrap();
         let base = serde_json::to_value(conf).unwrap();
         let mut invalid = Vec::new();
         let mut missing = base.clone();
@@ -864,8 +898,8 @@ pub(crate) mod tests {
         invalid.push(("format", wrong_format));
         let mut accepted = Vec::new();
         for (name, value) in invalid {
-            let mut conf = serde_json::from_value(value).unwrap();
-            if config::validate_config(&mut conf, None).is_ok() {
+            let conf = serde_json::from_value(value).unwrap();
+            if config::validate_config(conf, None).is_ok() {
                 accepted.push(name);
             }
         }
@@ -970,7 +1004,7 @@ pub(crate) mod tests {
         let params = Arc::new(crate::ProcessingParameters::new(&[0.0; 5], &[true; 5]));
         let mut pipeline = crate::pipeline::Pipeline::from_config(conf.clone(), params.clone());
         let mut guard = Guard::new(params.protection.clone());
-        guard.install(&conf).unwrap();
+        guard.install(&config::validate_config(conf, None).unwrap());
         for block in 0..160 {
             if block == 80 {
                 params.set_mute(0, false);

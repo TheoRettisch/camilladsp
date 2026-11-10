@@ -46,9 +46,9 @@ use crate::{ControllerMessage, config};
 
 #[derive(Debug, Clone)]
 pub struct SharedData {
-    pub active_config: Arc<Mutex<Option<config::Configuration>>>,
+    pub active_config: Arc<Mutex<Option<config::PreparedConfig>>>,
     pub active_config_path: Arc<Mutex<Option<String>>>,
-    pub previous_config: Arc<Mutex<Option<config::Configuration>>>,
+    pub previous_config: Arc<Mutex<Option<config::PreparedConfig>>>,
     pub command_sender: crossbeam_channel::Sender<ControllerMessage>,
     pub capture_status: Arc<RwLock<CaptureStatus>>,
     pub playback_status: Arc<RwLock<PlaybackStatus>>,
@@ -657,8 +657,8 @@ fn handle_command(
             let cfg_path = shared_data_inst.active_config_path.lock().clone();
             match cfg_path {
                 Some(path) => match config::load_config(path.as_str()) {
-                    Ok(mut conf) => match config::validate_config(&mut conf, Some(path.as_str())) {
-                        Ok(()) => {
+                    Ok(conf) => match config::validate_config(conf, Some(path.as_str())) {
+                        Ok(conf) => {
                             debug!("WS: Config file loaded successfully, send to controller");
                             match shared_data_inst
                                 .command_sender
@@ -868,8 +868,12 @@ fn handle_command(
             Some(WsReply::GetChannelLabels {
                 result: WsResult::Ok,
                 value: ChannelLabels {
-                    playback: config::playback_channel_labels(&optional_config),
-                    capture: config::capture_channel_labels(&optional_config),
+                    playback: config::playback_channel_labels(
+                        optional_config.as_ref().map(|c| c.config()),
+                    ),
+                    capture: config::capture_channel_labels(
+                        optional_config.as_ref().map(|c| c.config()),
+                    ),
                 },
             })
         }
@@ -1219,7 +1223,7 @@ fn handle_command(
         WsCommand::GetConfigTitle => {
             let optional_config = shared_data_inst.active_config.lock();
             let value = if let Some(config) = &*optional_config {
-                config.title.clone().unwrap_or_default()
+                config.config().title.clone().unwrap_or_default()
             } else {
                 String::new()
             };
@@ -1231,7 +1235,7 @@ fn handle_command(
         WsCommand::GetConfigDescription => {
             let optional_config = shared_data_inst.active_config.lock();
             let value = if let Some(config) = &*optional_config {
-                config.description.clone().unwrap_or_default()
+                config.config().description.clone().unwrap_or_default()
             } else {
                 String::new()
             };
@@ -1289,8 +1293,8 @@ fn handle_command(
         },
         WsCommand::SetConfig(config_yml) => {
             match yaml_serde::from_str::<config::Configuration>(&config_yml) {
-                Ok(mut conf) => match config::validate_config(&mut conf, None) {
-                    Ok(()) => {
+                Ok(conf) => match config::validate_config(conf, None) {
+                    Ok(conf) => {
                         match shared_data_inst
                             .command_sender
                             .try_send(ControllerMessage::ConfigChanged(Box::new(conf)))
@@ -1329,8 +1333,8 @@ fn handle_command(
         }
         WsCommand::SetConfigJson(config_json) => {
             match serde_json::from_str::<config::Configuration>(&config_json) {
-                Ok(mut conf) => match config::validate_config(&mut conf, None) {
-                    Ok(()) => {
+                Ok(conf) => match config::validate_config(conf, None) {
+                    Ok(conf) => {
                         match shared_data_inst
                             .command_sender
                             .try_send(ControllerMessage::ConfigChanged(Box::new(conf)))
@@ -1379,8 +1383,8 @@ fn handle_command(
             merge(&mut conf_as_value, &value);
             let updated_conf = serde_json::from_value::<config::Configuration>(conf_as_value);
             match updated_conf {
-                Ok(mut conf) => match config::validate_config(&mut conf, None) {
-                    Ok(()) => {
+                Ok(conf) => match config::validate_config(conf, None) {
+                    Ok(conf) => {
                         match shared_data_inst
                             .command_sender
                             .try_send(ControllerMessage::ConfigChanged(Box::new(conf)))
@@ -1438,8 +1442,8 @@ fn handle_command(
             }
             let updated_conf = serde_json::from_value::<config::Configuration>(conf_as_value);
             match updated_conf {
-                Ok(mut conf) => match config::validate_config(&mut conf, None) {
-                    Ok(()) => {
+                Ok(conf) => match config::validate_config(conf, None) {
+                    Ok(conf) => {
                         match shared_data_inst
                             .command_sender
                             .try_send(ControllerMessage::ConfigChanged(Box::new(conf)))
@@ -1521,8 +1525,8 @@ fn handle_command(
         },
         WsCommand::ValidateConfig(config_yml) => {
             match yaml_serde::from_str::<config::Configuration>(&config_yml) {
-                Ok(mut conf) => match config::validate_config(&mut conf, None) {
-                    Ok(()) => Some(WsReply::ValidateConfig {
+                Ok(conf) => match config::validate_config(conf, None) {
+                    Ok(conf) => Some(WsReply::ValidateConfig {
                         result: WsResult::Ok,
                         value: yaml_serde::to_string(&conf).unwrap(),
                     }),
@@ -1545,8 +1549,8 @@ fn handle_command(
         }
         WsCommand::ValidateConfigJson(config_json) => {
             match serde_json::from_str::<config::Configuration>(&config_json) {
-                Ok(mut conf) => match config::validate_config(&mut conf, None) {
-                    Ok(()) => Some(WsReply::ValidateConfigJson {
+                Ok(conf) => match config::validate_config(conf, None) {
+                    Ok(conf) => Some(WsReply::ValidateConfigJson {
                         result: WsResult::Ok,
                         value: serde_json::to_string(&conf).unwrap(),
                     }),

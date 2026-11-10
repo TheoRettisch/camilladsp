@@ -66,7 +66,7 @@ impl History {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct Policy {
     rms_limit: Option<f64>,
     short_limit: Option<f64>,
@@ -230,10 +230,9 @@ mod tests {
     fn setup(p: Parameters) -> Guard {
         let mut conf = serde_json::to_value(configuration()).unwrap();
         conf["processors"]["guard"]["parameters"] = serde_json::to_value(p).unwrap();
-        let mut conf = serde_json::from_value(conf).unwrap();
-        crate::config::validate_config(&mut conf, None).unwrap();
+        let conf = serde_json::from_value(conf).unwrap();
         let mut guard = Guard::new(Arc::new(Shared::default()));
-        guard.install(&conf).unwrap();
+        guard.install(&config::validate_config(conf, None).unwrap());
         context(&mut guard, Operation::Context(Mode::Prearm), 1);
         guard
     }
@@ -511,7 +510,7 @@ mod tests {
         g.pause();
         context(&mut g, Operation::Context(Mode::Prearm), 2);
         assert_eq!(heat, (g.history[0].short_power, g.history[0].long_power));
-        g.install(&configuration()).unwrap();
+        g.install(&config::validate_config(configuration(), None).unwrap());
         assert_eq!(heat, (g.history[0].short_power, g.history[0].long_power));
         g.shared
             .backend

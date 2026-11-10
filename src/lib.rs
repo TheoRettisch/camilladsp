@@ -170,7 +170,7 @@ pub enum ExitState {
 
 pub enum ControllerMessage {
     // Config must be boxed, to prevent "large size difference between variants" warning
-    ConfigChanged(Box<config::Configuration>),
+    ConfigChanged(Box<config::PreparedConfig>),
     Stop,
     Exit,
 }
@@ -429,8 +429,8 @@ pub struct StatusStructs {
 }
 
 pub struct SharedConfigs {
-    pub active: Arc<Mutex<Option<config::Configuration>>>,
-    pub previous: Arc<Mutex<Option<config::Configuration>>>,
+    pub active: Arc<Mutex<Option<config::PreparedConfig>>>,
+    pub previous: Arc<Mutex<Option<config::PreparedConfig>>>,
 }
 
 impl fmt::Display for ProcessingState {

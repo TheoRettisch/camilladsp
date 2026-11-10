@@ -144,8 +144,8 @@ fn run(
             return Ok(ExitState::Exit);
         }
     };
-    let (tx_pb, rx_pb) = crossbeam_channel::bounded(active_config.devices.queuelimit());
-    let (tx_cap, rx_cap) = crossbeam_channel::bounded(active_config.devices.queuelimit());
+    let (tx_pb, rx_pb) = crossbeam_channel::bounded(active_config.config().devices.queuelimit());
+    let (tx_cap, rx_cap) = crossbeam_channel::bounded(active_config.config().devices.queuelimit());
 
     let (tx_status, rx_status) = crossbeam_channel::unbounded();
     let tx_status_pb = tx_status.clone();
@@ -159,8 +159,8 @@ fn run(
     let barrier_cap = barrier.clone();
     let barrier_proc = barrier.clone();
 
-    let conf_pb = active_config.clone();
-    let conf_cap = active_config.clone();
+    let conf_pb = active_config.config().clone();
+    let conf_cap = active_config.config().clone();
     let conf_proc = active_config.clone();
 
     // Processing thread
@@ -182,7 +182,7 @@ fn run(
         .start(rx_pb, barrier_pb, tx_status_pb, status_structs.playback)
         .unwrap();
 
-    let used_channels = config::used_capture_channels(&active_config);
+    let used_channels = config::used_capture_channels(active_config.config());
     debug!("Using channels {used_channels:?}");
     {
         let mut capture_status = status_structs.capture.write();
@@ -223,7 +223,7 @@ fn run(
                         }
                         status_structs.processing.set_processing_load(0.0);
                         status_structs.processing.set_resampler_load(0.0);
-                        let comp = config::config_diff(&active_config, &new_conf);
+                        let comp = config::config_diff(active_config.config(), new_conf.config());
                         match comp {
                             config::ConfigChange::Pipeline
                             | config::ConfigChange::MixerParameters
@@ -231,7 +231,7 @@ fn run(
                                 tx_pipeconf.send((comp, *new_conf.clone())).unwrap();
                                 active_config = *new_conf;
                                 *shared_configs.active.lock() = Some(active_config.clone());
-                                let used_channels = config::used_capture_channels(&active_config);
+                                let used_channels = config::used_capture_channels(active_config.config());
                                 debug!("Using channels {used_channels:?}");
                                 status_structs.capture.write().used_channels = used_channels;
                                 debug!("Sent changes to pipeline");

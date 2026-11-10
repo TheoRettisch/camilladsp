@@ -424,10 +424,8 @@ fn check_and_replace_relative_path(path_str: &mut String, config_path: &Path) {
     }
 }
 
-pub fn load_validate_config(configname: &str) -> Res<Configuration> {
-    let mut configuration = load_config(configname)?;
-    validate_config(&mut configuration, Some(configname))?;
-    Ok(configuration)
+pub fn load_validate_config(configname: &str) -> Res<PreparedConfig> {
+    validate_config(load_config(configname)?, Some(configname))
 }
 
 pub fn config_diff(currentconf: &Configuration, newconf: &Configuration) -> ConfigChange {
@@ -502,7 +500,7 @@ pub fn config_diff(currentconf: &Configuration, newconf: &Configuration) -> Conf
 }
 
 /// Validate the loaded configuration, stop on errors and print a helpful message.
-pub fn validate_config(conf: &mut Configuration, filename: Option<&str>) -> Res<()> {
+pub(super) fn normalize_and_validate(conf: &mut Configuration, filename: Option<&str>) -> Res<()> {
     // pre-process by applying overrides and replacing tokens
     apply_overrides(conf)?;
     replace_tokens_in_config(conf);
@@ -713,8 +711,9 @@ pub fn validate_config(conf: &mut Configuration, filename: Option<&str>) -> Res<
                             } else {
                                 let procconf = processors.get(&step.name).unwrap();
                                 match procconf {
-                                    Processor::Protection { parameters, .. } => {
-                                        parameters.validate()?;
+                                    Processor::Protection { .. } => {
+                                        // Final-marker admission validates its parameters
+                                        // once, after the normalized graph is checked.
                                         if num_channels != crate::protection::CHANNELS {
                                             return Err(ConfigError::new(
                                                 "Protection requires 24 candidate channels",
@@ -800,8 +799,6 @@ pub fn validate_config(conf: &mut Configuration, filename: Option<&str>) -> Res<
         );
         return Err(ConfigError::new(&msg).into());
     }
-    crate::protection::admission(conf)?;
-    conf.protection_identity = Some(crate::protection::identity::prepare(conf)?);
     Ok(())
 }
 
@@ -822,7 +819,7 @@ pub fn used_capture_channels(conf: &Configuration) -> Vec<bool> {
     vec![true; capture_channels]
 }
 
-pub fn capture_channel_labels(config: &Option<Configuration>) -> Option<Vec<Option<String>>> {
+pub fn capture_channel_labels(config: Option<&Configuration>) -> Option<Vec<Option<String>>> {
     if let Some(conf) = config {
         conf.devices.capture.labels()
     } else {
@@ -830,7 +827,7 @@ pub fn capture_channel_labels(config: &Option<Configuration>) -> Option<Vec<Opti
     }
 }
 
-pub fn playback_channel_labels(config: &Option<Configuration>) -> Option<Vec<Option<String>>> {
+pub fn playback_channel_labels(config: Option<&Configuration>) -> Option<Vec<Option<String>>> {
     if let Some(conf) = config {
         if let Some(pipeline) = &conf.pipeline {
             for step in pipeline.iter().rev() {

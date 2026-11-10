@@ -1346,7 +1346,7 @@ impl CaptureDevice for AlsaCaptureDevice {
 mod protection_tests {
     use super::*;
     use crate::protection::playback::Playback;
-    use crate::protection::tests::{chunk, configuration};
+    use crate::protection::tests::{chunk, prepared_configuration as configuration};
     use crate::protection::{CHANNELS, FRAMES, Guard, SAMPLE_RATE, Shared, Stamp};
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -1415,12 +1415,12 @@ mod protection_tests {
     fn retired_queued_chunk_does_not_stop_playback_or_clear_trip() {
         let mut guard = Guard::new(Arc::new(Shared::default()));
         let conf = configuration();
-        guard.install(&conf).unwrap();
+        guard.install(&conf);
         let mut retired = chunk();
         retired.waveforms[0][7] = 1.0;
         guard.process(&mut retired);
         let trip = guard.trip();
-        guard.install(&conf).unwrap();
+        guard.install(&conf);
         let mut current = chunk();
         guard.process(&mut current);
         let statuses = play_chunks(vec![retired, current], guard.shared.clone(), true);
@@ -1434,7 +1434,7 @@ mod protection_tests {
     #[test]
     fn coverage_fault_does_not_stop_playback_or_clear_trip() {
         let mut guard = Guard::new(Arc::new(Shared::default()));
-        guard.install(&configuration()).unwrap();
+        guard.install(&configuration());
         let mut incomplete = chunk();
         incomplete.waveforms[1].clear();
         guard.process(&mut incomplete);
@@ -1463,11 +1463,11 @@ mod protection_tests {
     #[test]
     fn retirement_at_write_boundary_is_a_discard_not_a_device_error() {
         let mut guard = Guard::new(Arc::new(Shared::default()));
-        guard.install(&configuration()).unwrap();
+        guard.install(&configuration());
         let mut output = chunk();
         guard.process(&mut output);
         let stamp = output.protection.unwrap();
-        guard.install(&configuration()).unwrap();
+        guard.install(&configuration());
         let (pcm, manager) = null_pcm();
         let result = play_buffer(
             &mut vec![0; FRAMES * CHANNELS * 3],
@@ -1578,7 +1578,7 @@ mod protection_tests {
     /// Play one admitted chunk of a fresh backend through scripted results.
     fn play_scripted(pcm: &ScriptedPcm) -> (Res<PlaybackResult>, Guard, Stamp, Playback) {
         let mut guard = Guard::new(Arc::new(Shared::default()));
-        guard.install(&configuration()).unwrap();
+        guard.install(&configuration());
         let mut output = chunk();
         guard.process(&mut output);
         let stamp = output.protection.unwrap();

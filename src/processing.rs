@@ -104,7 +104,7 @@ impl ProcessingControl {
 
 // Selection of a configuration event is the commit boundary. An audio event
 // selected first still belongs to the old pipeline; no later candidate can.
-// Resolve pending Armed before admission/reconstruction can block this owner.
+// Resolve pending Armed before reconstruction can block this owner.
 // install() retires every old stamp, including the one pending output, which
 // must retain its original stamp and its backpressure until playback takes it.
 fn replace_pipeline(
@@ -112,14 +112,12 @@ fn replace_pipeline(
     control: &mut ProcessingControl,
     pipeline: &mut pipeline::Pipeline,
     diff: config::ConfigChange,
-    new_config: config::Configuration,
+    new_config: config::PreparedConfig,
     processing_params: &Arc<ProcessingParameters>,
 ) -> bool {
     control.reject_armed(protection);
-    if let Err(err) = protection.install(&new_config) {
-        error!("Replacement protection admission rejected: {err}");
-        return false;
-    }
+    protection.install(&new_config);
+    let new_config = new_config.into_config();
     match diff {
         config::ConfigChange::Pipeline | config::ConfigChange::MixerParameters => {
             debug!("Rebuilding pipeline.");
@@ -140,11 +138,11 @@ fn replace_pipeline(
 }
 
 pub fn run_processing(
-    conf_proc: config::Configuration,
+    conf_proc: config::PreparedConfig,
     barrier_proc: Arc<Barrier>,
     tx_pb: crossbeam_channel::Sender<AudioMessage>,
     rx_cap: crossbeam_channel::Receiver<AudioMessage>,
-    rx_pipeconf: crossbeam_channel::Receiver<(config::ConfigChange, config::Configuration)>,
+    rx_pipeconf: crossbeam_channel::Receiver<(config::ConfigChange, config::PreparedConfig)>,
     processing_params: Arc<ProcessingParameters>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -159,12 +157,8 @@ pub fn run_processing(
                 return;
             }
         };
-        if let Err(err) = protection.install(&conf_proc) {
-            error!("Protection admission rejected: {err}");
-            barrier_proc.wait();
-            let _ = tx_pb.send(AudioMessage::EndOfStream);
-            return;
-        }
+        protection.install(&conf_proc);
+        let conf_proc = conf_proc.into_config();
         let chunksize = conf_proc.devices.chunksize;
         let samplerate = conf_proc.devices.samplerate;
         let multithreaded = conf_proc.devices.multithreaded();
@@ -371,7 +365,7 @@ pub fn run_processing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protection::tests::{chunk, configuration};
+    use crate::protection::tests::{chunk, prepared_configuration as configuration};
     use std::time::Duration;
 
     fn wait_receipt(shared: &crate::protection::Shared, id: u64) -> crate::protection::GuardRecord {
@@ -441,7 +435,7 @@ mod tests {
         }
     }
 
-    fn configuration_with_gain(gain: f64) -> config::Configuration {
+    fn configuration_with_gain(gain: f64) -> config::PreparedConfig {
         let mut conf = serde_json::to_value(configuration()).unwrap();
         conf["filters"] = serde_json::json!({
             "gain": {"type": "Gain", "parameters": {"gain": gain, "scale": "linear"}}
@@ -450,7 +444,7 @@ mod tests {
             0,
             serde_json::json!({"type": "Filter", "channels": [0], "names": ["gain"]}),
         );
-        serde_json::from_value(conf).unwrap()
+        config::validate_config(serde_json::from_value(conf).unwrap(), None).unwrap()
     }
 
     #[test]
@@ -474,9 +468,12 @@ mod tests {
             );
             barrier.wait();
             let before = params.protection.guard_snapshot().unwrap().record;
-            let updated = configuration_with_gain(20.0);
+            let updated = configuration_with_gain(9.5);
             tx_conf
-                .send((config::config_diff(&initial, &updated), updated))
+                .send((
+                    config::config_diff(initial.config(), updated.config()),
+                    updated,
+                ))
                 .unwrap();
             let committed = wait_snapshot(&params.protection, |s| s.pipeline > before.pipeline);
             assert_eq!(committed.frames, 0);
@@ -541,9 +538,12 @@ mod tests {
             let before = wait_snapshot(&params.protection, |s| s.frames == 512);
             assert_eq!(rx_pb.len(), 1);
             assert_eq!(capture_queue.len(), 1);
-            let updated = configuration_with_gain(20.0);
+            let updated = configuration_with_gain(9.5);
             tx_conf
-                .send((config::config_diff(&initial, &updated), updated))
+                .send((
+                    config::config_diff(initial.config(), updated.config()),
+                    updated,
+                ))
                 .unwrap();
             let committed = wait_snapshot(&params.protection, |s| s.pipeline > before.pipeline);
             assert_eq!(committed.frames, 0);
@@ -673,7 +673,7 @@ mod tests {
         for expired in [false, true] {
             let shared = Arc::new(Shared::default());
             let mut guard = Guard::new(shared.clone());
-            guard.install(&configuration()).unwrap();
+            guard.install(&configuration());
             let mut control = ProcessingControl {
                 paused: false,
                 armed: None,
@@ -736,59 +736,52 @@ mod tests {
     #[test]
     fn configuration_commit_rejects_pending_arm_before_installation() {
         use crate::protection::control::{Mode, Operation, Result as ControlResult};
-        for valid in [true, false] {
-            let conf = configuration();
-            let params = Arc::new(ProcessingParameters::default());
-            let mut guard = params.protection_owner.lock().unwrap();
-            guard.install(&conf).unwrap();
-            let mut pipeline = pipeline::Pipeline::from_config(conf.clone(), params.clone());
-            let mut control = ProcessingControl {
-                paused: false,
-                armed: None,
-                armed_deadline: None,
-            };
-            control.service(
-                &mut guard,
-                request(
-                    params.protection.guard_snapshot().unwrap().record,
-                    1,
-                    Operation::Context(Mode::Prearm),
-                    1,
-                ),
-            );
-            let before = params.protection.guard_snapshot().unwrap().record;
-            control.service(
-                &mut guard,
-                request(before, 2, Operation::Context(Mode::Armed), 1),
-            );
-            assert!(control.armed.is_some());
-            let mut updated = conf;
-            if !valid {
-                updated.pipeline = None;
-            }
-            assert_eq!(
-                replace_pipeline(
-                    &mut guard,
-                    &mut control,
-                    &mut pipeline,
-                    config::ConfigChange::Pipeline,
-                    updated,
-                    &params,
-                ),
-                valid
-            );
-            let after = params.protection.guard_snapshot().unwrap().record;
-            let receipt = after.control.last_command.unwrap();
-            assert_eq!(receipt.command_id, 2);
-            assert_eq!(receipt.result, ControlResult::NotQualified);
-            // Rejection after install would report the replacement epoch and
-            // StateMismatch, and could be delayed by synchronous admission.
-            assert_eq!(receipt.pipeline, before.pipeline);
-            assert!(after.pipeline > before.pipeline);
-            assert_eq!(after.frames, 0);
-            assert!(!after.processing_valid);
-            assert!(control.armed.is_none() && control.armed_deadline.is_none());
-        }
+        let conf = configuration();
+        let params = Arc::new(ProcessingParameters::default());
+        let mut guard = params.protection_owner.lock().unwrap();
+        guard.install(&conf);
+        let mut pipeline =
+            pipeline::Pipeline::from_config(conf.clone().into_config(), params.clone());
+        let mut control = ProcessingControl {
+            paused: false,
+            armed: None,
+            armed_deadline: None,
+        };
+        control.service(
+            &mut guard,
+            request(
+                params.protection.guard_snapshot().unwrap().record,
+                1,
+                Operation::Context(Mode::Prearm),
+                1,
+            ),
+        );
+        let before = params.protection.guard_snapshot().unwrap().record;
+        control.service(
+            &mut guard,
+            request(before, 2, Operation::Context(Mode::Armed), 1),
+        );
+        assert!(control.armed.is_some());
+        let updated = conf;
+        assert!(replace_pipeline(
+            &mut guard,
+            &mut control,
+            &mut pipeline,
+            config::ConfigChange::Pipeline,
+            updated,
+            &params,
+        ));
+        let after = params.protection.guard_snapshot().unwrap().record;
+        let receipt = after.control.last_command.unwrap();
+        assert_eq!(receipt.command_id, 2);
+        assert_eq!(receipt.result, ControlResult::NotQualified);
+        // Rejection after install would report the replacement epoch and
+        // StateMismatch, and could be delayed by synchronous graph reconstruction.
+        assert_eq!(receipt.pipeline, before.pipeline);
+        assert!(after.pipeline > before.pipeline);
+        assert_eq!(after.frames, 0);
+        assert!(!after.processing_valid);
+        assert!(control.armed.is_none() && control.armed_deadline.is_none());
     }
 
     #[test]
@@ -1003,7 +996,7 @@ mod tests {
         use crate::protection::playback::Playback;
         let params = Arc::new(ProcessingParameters::default());
         let mut owner = params.protection_owner.lock().unwrap();
-        owner.install(&configuration()).unwrap();
+        owner.install(&configuration());
         drop(Playback::new(params.protection.clone()));
         // The live owner has not yet serviced the retirement. The reader
         // returns at once and leaves the record to that owner.
@@ -1080,10 +1073,14 @@ mod tests {
         unsafe_input.waveforms[0][7] = 1.0;
         tx_cap.send(AudioMessage::Audio(unsafe_input)).unwrap();
         let before = wait_snapshot(&params.protection, |s| s.frames == 256);
-        let mut updated = conf.clone();
+        let mut updated = conf.config().clone();
         updated.title = Some("updated title".to_string());
+        let updated = config::validate_config(updated, None).unwrap();
         tx_conf
-            .send((config::config_diff(&conf, &updated), updated))
+            .send((
+                config::config_diff(conf.config(), updated.config()),
+                updated,
+            ))
             .unwrap();
         wait_snapshot(&params.protection, |s| s.pipeline > before.pipeline);
         tx_cap.send(AudioMessage::Audio(chunk())).unwrap();

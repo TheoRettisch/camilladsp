@@ -14,6 +14,7 @@
 // Mozilla Public License along with this program. If not, see
 // <https://www.gnu.org/licenses/> and <https://www.mozilla.org/MPL/2.0/>.
 
+mod prepared;
 mod utils;
 
 use self::utils::validate_nonzero_usize;
@@ -1674,8 +1675,6 @@ impl PipelineStepProcessor {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
-    #[serde(skip)]
-    pub protection_identity: Option<crate::protection::identity::Identity>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -1704,10 +1703,10 @@ pub enum ConfigChange {
     None,
 }
 
+pub use self::prepared::{PreparedConfig, validate_config};
 pub use self::utils::capture_channel_labels;
 pub use self::utils::config_diff;
 pub use self::utils::load_config;
 pub use self::utils::load_validate_config;
 pub use self::utils::playback_channel_labels;
 pub use self::utils::used_capture_channels;
-pub use self::utils::validate_config;

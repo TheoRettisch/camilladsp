@@ -298,10 +298,9 @@ mod tests {
     use super::*;
     use crate::protection::tests::{chunk, configuration};
     fn fixture() -> Guard {
-        let mut conf = configuration();
-        conf.protection_identity = Some(identity::prepare(&conf).unwrap());
+        let conf = configuration();
         let mut guard = Guard::new(Arc::new(Shared::default()));
-        guard.install(&conf).unwrap();
+        guard.install(&crate::config::validate_config(conf, None).unwrap());
         guard
     }
     #[test]

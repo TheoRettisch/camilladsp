@@ -374,9 +374,8 @@ mod tests {
     fn setup() -> (Arc<Shared>, Guard, Playback) {
         let shared = Arc::new(Shared::default());
         let mut guard = Guard::new(shared.clone());
-        let mut conf = configuration();
-        crate::config::validate_config(&mut conf, None).unwrap();
-        guard.install(&conf).unwrap();
+        let conf = configuration();
+        guard.install(&crate::config::validate_config(conf, None).unwrap());
         let playback = Playback::new(shared.clone());
         (shared, guard, playback)
     }

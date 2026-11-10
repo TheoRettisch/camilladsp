@@ -338,7 +338,7 @@ mod tests {
     fn paused_reset_receipt_does_not_relabel_backend_progress_or_drop_pcm() {
         let shared = Arc::new(Shared::default());
         let mut guard = Guard::new(shared.clone());
-        guard.install(&configuration()).unwrap();
+        guard.install(&crate::config::validate_config(configuration(), None).unwrap());
         guard.control_only(command(&guard, 1, false));
         let mut playback = Playback::new(shared.clone());
         for at in [10, 20] {
@@ -372,7 +372,7 @@ mod tests {
     fn backend_retirement_fences_queue_and_commands_preserving_trip() {
         let shared = Arc::new(Shared::default());
         let mut guard = Guard::new(shared.clone());
-        guard.install(&configuration()).unwrap();
+        guard.install(&crate::config::validate_config(configuration(), None).unwrap());
         guard.control_only(command(&guard, 1, false));
         let mut audio = chunk();
         audio.waveforms[1][2] = 1.0;

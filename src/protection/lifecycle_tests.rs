@@ -11,7 +11,7 @@ fn setup(muted: bool, ramp_ms: f32) -> (Arc<ProcessingParameters>, Pipeline, Gua
     conf.devices.volume_ramp_time = Some(ramp_ms);
     let pipeline = Pipeline::from_config(conf.clone(), params.clone());
     let mut guard = Guard::new(params.protection.clone());
-    guard.install(&conf).unwrap();
+    guard.install(&config::validate_config(conf, None).unwrap());
     (params, pipeline, guard)
 }
 
@@ -362,7 +362,7 @@ fn replacement_and_owner_change_preserve_trip_and_reject_old_commands() {
     candidate.waveforms[0][0] = 1.0;
     guard.process(&mut candidate);
     let trip = guard.trip();
-    guard.install(&configuration()).unwrap();
+    guard.install(&config::validate_config(configuration(), None).unwrap());
     guard.control_only(old);
     assert_eq!(
         guard.control.last_command.unwrap().result,
@@ -435,7 +435,9 @@ fn fir_reload_with_capture_device_change_retires_epoch_and_queued_output() {
     let trip = guard.trip();
     let old_command = command(&guard, Operation::Reset, 1);
     let original = configuration();
-    let original_identity = identity::prepare(&original).unwrap();
+    let original_identity = config::validate_config(original.clone(), None)
+        .unwrap()
+        .identity();
     let mut value = serde_json::to_value(original).unwrap();
     value["devices"]["capture"] = serde_json::json!({
         "type": "Alsa", "channels": 24, "device": "hw:Loopback,1,0", "format": "S32_LE"});
@@ -445,14 +447,14 @@ fn fir_reload_with_capture_device_change_retires_epoch_and_queued_output() {
         0,
         serde_json::json!({"type": "Filter", "channels": [0, 1], "names": ["fir"]}),
     );
-    let mut replacement: config::Configuration = serde_json::from_value(value).unwrap();
-    config::validate_config(&mut replacement, None).unwrap();
-    let replacement_identity = replacement.protection_identity.unwrap();
+    let replacement =
+        config::validate_config(serde_json::from_value(value).unwrap(), None).unwrap();
+    let replacement_identity = replacement.identity();
     assert_ne!(original_identity.graph, replacement_identity.graph);
     assert_eq!(original_identity.profile, replacement_identity.profile);
     let mut playback = playback::Playback::new(params.protection.clone());
     playback.retire();
-    guard.install(&replacement).unwrap();
+    guard.install(&replacement);
     assert!(!queued.is_current());
     assert!(!queued.is_stream_current());
     guard.control_only(old_command);
@@ -469,7 +471,7 @@ fn fir_reload_with_capture_device_change_retires_epoch_and_queued_output() {
             .playback_snapshot()
             .is_none_or(|s| !s.valid)
     );
-    let mut replacement_pipeline = Pipeline::from_config(replacement, params);
+    let mut replacement_pipeline = Pipeline::from_config(replacement.into_config(), params);
     let forwarded = process(&mut replacement_pipeline, &mut guard);
     assert!(zero(&forwarded));
     assert_eq!(guard.trip(), trip);
