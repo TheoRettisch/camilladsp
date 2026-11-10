@@ -102,13 +102,17 @@ impl Pending {
         published_ns: u64,
     ) {
         let block = self.block.as_mut().unwrap();
-        block.epoch = [guard.epoch, guard.backend, guard.reset];
-        block.frames[1] = guard.frames;
+        block.epoch = [guard.stream.epoch, guard.stream.backend, guard.stream.reset];
+        block.frames[1] = guard.stream.frames;
         block.times[2] = decision_ns;
         block.times[3] = published_ns;
-        block.identity = guard.identity.unwrap_or_default();
-        block.trip = guard.trip;
-        block.active = guard.active;
+        block.identity = guard
+            .configuration
+            .as_ref()
+            .map(|c| c.identity)
+            .unwrap_or_default();
+        block.trip = guard.fault.trip;
+        block.active = guard.qualification.is_active();
         block.shape_valid = shape(chunk);
         copy_bits(chunk, &mut block.forwarded);
         self.finish();

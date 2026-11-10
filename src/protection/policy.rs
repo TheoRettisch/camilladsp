@@ -292,12 +292,12 @@ mod tests {
                     let q = 10.0_f64.powf(db / 10.0);
                     let mut audio = input(channel, q, true);
                     g.process(&mut audio);
-                    assert!(g.trip.is_none());
+                    assert!(g.fault.trip.is_none());
                     g.process(&mut input(channel, q, true));
                     if offset < 0.0 {
-                        assert!(g.trip.is_none());
+                        assert!(g.fault.trip.is_none());
                     } else {
-                        let trip = g.trip.unwrap();
+                        let trip = g.fault.trip.unwrap();
                         assert_eq!(trip.channel, Some(channel));
                         assert_eq!(trip.reason, if tone { Reason::Tone } else { Reason::Rms });
                         assert_eq!(trip.frame, 512);
@@ -316,14 +316,14 @@ mod tests {
         for _ in 0..5 {
             g.process(&mut input(1, 0.02, false));
             g.process(&mut input(1, 0.001, false));
-            assert!(g.trip.is_none());
+            assert!(g.fault.trip.is_none());
         }
         g.process(&mut input(1, 0.02, false));
         g.pause();
         g.process(&mut input(1, 0.02, false));
-        assert!(g.trip.is_none());
+        assert!(g.fault.trip.is_none());
         g.process(&mut input(1, 0.02, false));
-        assert_eq!(g.trip.unwrap().reason, Reason::Rms);
+        assert_eq!(g.fault.trip.unwrap().reason, Reason::Rms);
     }
 
     #[test]
@@ -370,10 +370,10 @@ mod tests {
             let mut audio = input(1, 0.02, false);
             audio.main_volume.as_mut().unwrap().muted = true;
             g.process(&mut audio);
-            assert!(!g.candidate_observable && !g.active);
+            assert!(!g.candidate.observable && !g.qualification.is_active());
             assert!(audio.waveforms.iter().flatten().all(|x| *x == 0.0));
         }
-        assert_eq!(g.trip.unwrap().reason, Reason::Rms);
+        assert_eq!(g.fault.trip.unwrap().reason, Reason::Rms);
     }
 
     #[test]
@@ -383,17 +383,17 @@ mod tests {
         let mut g = setup(p);
         for _ in 0..10 {
             g.process(&mut input(0, 0.0, true));
-            assert!(g.trip.is_none());
+            assert!(g.fault.trip.is_none());
         }
         g.process(&mut input(0, 0.01, true)); // baseline
         g.process(&mut input(0, 0.01 * 10.0_f64.powf(0.01 / 10.0), true)); // same quantized pair
-        assert!(g.trip.is_none());
+        assert!(g.fault.trip.is_none());
         g.process(&mut input(0, 0.02, true)); // changed signature
         g.process(&mut input(0, 0.02, true));
-        assert!(g.trip.is_none());
+        assert!(g.fault.trip.is_none());
         let mut last = input(0, 0.02, true);
         g.process(&mut last);
-        assert_eq!(g.trip.unwrap().reason, Reason::DcFrozen);
+        assert_eq!(g.fault.trip.unwrap().reason, Reason::DcFrozen);
         assert!(last.waveforms.iter().flatten().all(|x| *x == 0.0));
         assert_eq!((2.5_f64).round_ties_even(), 2.0);
         assert_eq!((3.5_f64).round_ties_even(), 4.0);
@@ -472,22 +472,22 @@ mod tests {
             for _ in 0..=480_000 / 256 {
                 let mut audio = input(1, q, false);
                 g.process(&mut audio);
-                assert!(!g.active && g.short_power_veto);
+                assert!(!g.qualification.is_active() && g.detector.short_power_veto);
                 assert!(audio.waveforms.iter().flatten().all(|x| *x == 0.0));
             }
             if overload == 0.01 {
-                assert!(g.trip.is_none());
-                let heat = g.history[1].short_power;
+                assert!(g.fault.trip.is_none());
+                let heat = g.detector.history[1].short_power;
                 context(&mut g, Operation::Context(Mode::Prearm), 2);
-                assert_eq!(g.history[1].short_power, heat);
+                assert_eq!(g.detector.history[1].short_power, heat);
                 for _ in 0..480_000 / 256 {
                     g.process(&mut input(1, 0.0, false));
-                    assert!(!g.active);
+                    assert!(!g.qualification.is_active());
                 }
                 g.process(&mut input(1, 0.0, false));
-                assert!(g.active);
+                assert!(g.qualification.is_active());
             } else {
-                assert_eq!(g.trip.unwrap().reason, Reason::ShortPower);
+                assert_eq!(g.fault.trip.unwrap().reason, Reason::ShortPower);
             }
         }
     }
@@ -501,7 +501,10 @@ mod tests {
         for _ in 0..10 {
             g.process(&mut input(0, 0.005, false));
         }
-        let heat = (g.history[0].short_power, g.history[0].long_power);
+        let heat = (
+            g.detector.history[0].short_power,
+            g.detector.history[0].long_power,
+        );
         for _ in 0..100 {
             let mut masked = input(0, 0.0, false);
             masked.main_volume.as_mut().unwrap().muted = true;
@@ -509,18 +512,39 @@ mod tests {
         }
         g.pause();
         context(&mut g, Operation::Context(Mode::Prearm), 2);
-        assert_eq!(heat, (g.history[0].short_power, g.history[0].long_power));
+        assert_eq!(
+            heat,
+            (
+                g.detector.history[0].short_power,
+                g.detector.history[0].long_power
+            )
+        );
         g.install(&config::validate_config(configuration(), None).unwrap());
-        assert_eq!(heat, (g.history[0].short_power, g.history[0].long_power));
+        assert_eq!(
+            heat,
+            (
+                g.detector.history[0].short_power,
+                g.detector.history[0].long_power
+            )
+        );
         g.shared
             .backend
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         g.backend_wakeup();
-        assert_eq!(heat, (g.history[0].short_power, g.history[0].long_power));
+        assert_eq!(
+            heat,
+            (
+                g.detector.history[0].short_power,
+                g.detector.history[0].long_power
+            )
+        );
         context(&mut g, Operation::Context(Mode::Prearm), 3);
         context(&mut g, Operation::Reset, 4);
         assert_eq!(
-            (g.history[0].short_power, g.history[0].long_power),
+            (
+                g.detector.history[0].short_power,
+                g.detector.history[0].long_power
+            ),
             (0.0, 0.0)
         );
     }
@@ -536,18 +560,18 @@ mod tests {
         for _ in 0..10 {
             g.process(&mut input(0, 0.01, false));
         }
-        assert!(g.active);
-        let heat = g.history[0].short_power;
+        assert!(g.qualification.is_active());
+        let heat = g.detector.history[0].short_power;
         context(&mut g, Operation::Context(Mode::Prearm), 3);
-        assert!(!g.active);
-        assert_eq!(g.qualified_frames, 0);
-        assert_eq!(g.history[0].short_power, heat);
+        assert!(!g.qualification.is_active());
+        assert_eq!(g.qualification.frames(), 0);
+        assert_eq!(g.detector.history[0].short_power, heat);
         for _ in 0..8 {
             g.process(&mut input(0, 0.001, false));
-            assert!(!g.active);
+            assert!(!g.qualification.is_active());
         }
         g.process(&mut input(0, 0.001, false));
-        assert!(g.active);
+        assert!(g.qualification.is_active());
     }
 
     #[test]
@@ -560,7 +584,7 @@ mod tests {
         for _ in 0..10 {
             g.process(&mut input(0, 0.0, false));
         }
-        assert!(g.active);
+        assert!(g.qualification.is_active());
         let armed = Command {
             id: 2,
             expected: g.expected(),
@@ -575,7 +599,7 @@ mod tests {
             g.control.last_command.unwrap().result,
             ControlResult::NotQualified
         );
-        assert!(g.short_power_veto && !g.active);
+        assert!(g.detector.short_power_veto && !g.qualification.is_active());
     }
 
     #[test]
@@ -591,7 +615,11 @@ mod tests {
         p.dc_freeze_seconds = f64::NAN;
         assert!(p.validate().is_err());
         let original = parameters();
-        let base = setup(original.clone()).identity.unwrap().profile;
+        let base = setup(original.clone())
+            .configuration
+            .unwrap()
+            .identity
+            .profile;
         let value = serde_json::to_value(&original).unwrap();
         for (key, old) in value.as_object().unwrap() {
             if key.ends_with("channels") {
@@ -607,7 +635,11 @@ mod tests {
                 changed["max_tweeter_avg_power_db"] = serde_json::json!(-20.0);
             }
             let g = setup(serde_json::from_value(changed).unwrap());
-            assert_ne!(g.identity.unwrap().profile, base, "{key}");
+            assert_ne!(
+                g.configuration.as_ref().unwrap().identity.profile,
+                base,
+                "{key}"
+            );
         }
     }
 }

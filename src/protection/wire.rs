@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(result["telemetry"]["valid"], true);
         assert_eq!(
             result["identity"]["graph_sha256"],
-            identity::hex(guard.identity.unwrap().graph)
+            identity::hex(guard.configuration.as_ref().unwrap().identity.graph)
         );
         let repeated = status(&shared);
         for key in [

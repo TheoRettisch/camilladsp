@@ -119,22 +119,24 @@ impl Default for Control {
 impl Guard {
     pub fn expected(&self) -> Expected {
         Expected {
-            pipeline: self.epoch,
-            backend: self.backend,
-            reset: self.reset,
-            trip_generation: self.trip_generation,
+            pipeline: self.stream.epoch,
+            backend: self.stream.backend,
+            reset: self.stream.reset,
+            trip_generation: self.fault.generation,
             revision: self.control.revision,
         }
     }
 
     pub fn state(&self) -> State {
-        if self.trip.is_some() {
+        if self.fault.trip.is_some() {
             State::Tripped
-        } else if self.active {
+        } else if self.qualification.is_active() {
             // Ordinary mute preserves an already admitted fade-out trajectory.
             // candidate_observable is false and no new armed receipt is allowed.
             State::Active
-        } else if self.parameters.is_none() || self.control.owner.is_none() || self.attempt_required
+        } else if self.configuration.is_none()
+            || self.control.owner.is_none()
+            || self.qualification.attempt_required()
         {
             State::Inactive
         } else {
@@ -142,20 +144,14 @@ impl Guard {
         }
     }
 
-    pub(super) fn invalidate_qualification(&mut self) {
-        self.active = false;
-        self.qualified_frames = 0;
-        self.qualification_baseline = false;
-        self.attempt_required = true;
-    }
-
     /// No candidate or invented progress. Pause/resume needs a fresh attempt.
     pub fn pause(&mut self) {
         self.sync_backend();
-        self.invalidate_activity();
-        self.invalidate_qualification();
-        self.candidate_observable = false;
-        self.processing_valid = false;
+        self.stream.pause();
+        self.activity.interrupt();
+        self.detector.break_continuity();
+        self.qualification.require_attempt();
+        self.candidate.interrupt();
         self.publish();
     }
 
@@ -171,9 +167,9 @@ impl Guard {
         self.control.last_command = Some(Receipt {
             command_id: command.id,
             result,
-            pipeline: self.epoch,
-            backend: self.backend,
-            reset: self.reset,
+            pipeline: self.stream.epoch,
+            backend: self.stream.backend,
+            reset: self.stream.reset,
             revision: self.control.revision,
             parent_reset_generation: self.control.parent_reset_generation,
             qualification_id: self.control.qualification_id,
@@ -201,7 +197,7 @@ impl Guard {
         if same_owner {
             self.control.command_high_water = command.id;
         }
-        if command.expected != self.expected() || self.parameters.is_none() {
+        if command.expected != self.expected() || self.configuration.is_none() {
             return Result::StateMismatch;
         }
         if same_owner
@@ -219,34 +215,27 @@ impl Guard {
                 {
                     return Result::StateMismatch;
                 }
-                self.reset = bump(self.reset);
+                self.stream.accepted_reset();
                 self.shared
                     .reset
-                    .store(self.reset, std::sync::atomic::Ordering::SeqCst);
-                self.frame_floor = self.frames;
-                self.invalidate_activity();
-                self.processing_valid = false;
-                self.source_begin_ns = 0;
-                self.source_end_ns = 0;
-                self.history = [super::policy::History::default(); 2];
-                self.short_power_veto = false;
-                self.trip = None; // The process-lifetime trip generation survives.
-                self.invalidate_qualification();
-                self.candidate_observable = false;
-                self.attempt_required = false;
+                    .store(self.stream.reset, std::sync::atomic::Ordering::SeqCst);
+                self.activity.interrupt();
+                self.detector.accepted_reset();
+                self.fault.accepted_reset();
+                self.qualification.begin_attempt();
+                self.candidate.interrupt();
                 self.control.mode = Mode::Prearm;
             }
             Operation::Context(Mode::Prearm) => {
                 if !fresh_attempt
-                    && (self.attempt_required
+                    && (self.qualification.attempt_required()
                         || command.parent_reset_generation != self.control.parent_reset_generation
                         || self.control.mode == Mode::Armed)
                 {
                     return Result::StateMismatch;
                 }
                 if fresh_attempt {
-                    self.invalidate_qualification();
-                    self.attempt_required = false;
+                    self.qualification.begin_attempt();
                 }
                 self.control.mode = Mode::Prearm;
             }
@@ -258,11 +247,10 @@ impl Guard {
                     return Result::StateMismatch;
                 }
                 if !has_candidate
-                    || self.short_power_veto
-                    || !self.active
-                    || !self.candidate_observable
-                    || self.attempt_required
-                    || self.trip.is_some()
+                    || self.detector.short_power_veto
+                    || !self.qualification.is_active()
+                    || !self.candidate.observable
+                    || self.fault.trip.is_some()
                 {
                     return Result::NotQualified;
                 }

@@ -52,20 +52,20 @@ fn production_without_context_never_activates_after_a_full_window() {
     for _ in 0..2 * QUALIFICATION_FRAMES / FRAMES as u64 {
         assert!(zero(&process(&mut pipeline, &mut guard)));
         assert_eq!(guard.state(), State::Inactive);
-        assert_eq!(guard.qualified_frames, 0);
+        assert_eq!(guard.qualification.frames(), 0);
     }
     assert!(guard.control.owner.is_none());
 }
 
 fn qualify(pipeline: &mut Pipeline, guard: &mut Guard) {
     assert!(zero(&process(pipeline, guard))); // Candidate baseline is not duration.
-    assert_eq!(guard.qualified_frames, 0);
+    assert_eq!(guard.qualification.frames(), 0);
     for _ in 1..QUALIFICATION_FRAMES / FRAMES as u64 {
         assert!(zero(&process(pipeline, guard)));
-        assert!(!guard.active);
+        assert!(!guard.qualification.is_active());
     }
     assert!(!zero(&process(pipeline, guard)));
-    assert_eq!(guard.qualified_frames, QUALIFICATION_FRAMES);
+    assert_eq!(guard.qualification.frames(), QUALIFICATION_FRAMES);
     assert_eq!(guard.state(), State::Active);
 }
 
@@ -75,12 +75,12 @@ fn muted_start_and_full_opening_ramp_cannot_qualify() {
     prearm(&mut guard, 1);
     for _ in 0..400 {
         assert!(zero(&process(&mut pipeline, &mut guard)));
-        assert!(!guard.candidate_observable);
-        assert_eq!(guard.qualified_frames, 0);
+        assert!(!guard.candidate.observable);
+        assert_eq!(guard.qualification.frames(), 0);
     }
     params.set_mute(0, false);
     assert!(zero(&process(&mut pipeline, &mut guard)));
-    assert!(guard.attempt_required);
+    assert!(guard.qualification.attempt_required());
     let stale = command(&guard, Operation::Context(Mode::Prearm), 1);
     guard.control_only(stale);
     assert_eq!(
@@ -90,8 +90,8 @@ fn muted_start_and_full_opening_ramp_cannot_qualify() {
     prearm(&mut guard, 2);
     for _ in 1..75 {
         assert!(zero(&process(&mut pipeline, &mut guard)));
-        assert!(!guard.candidate_observable); // Includes the final opening chunk.
-        assert_eq!(guard.qualified_frames, 0);
+        assert!(!guard.candidate.observable); // Includes the final opening chunk.
+        assert_eq!(guard.qualification.frames(), 0);
     }
     qualify(&mut pipeline, &mut guard);
     assert!(!params.is_mute(0));
@@ -133,17 +133,21 @@ fn admitted_ordinary_mute_and_volume_ramps_keep_native_samples() {
             let mut actual = pipeline.process_chunk(input);
             guard.process(&mut actual);
             assert_eq!(actual.waveforms, expected.waveforms, "block {block}");
-            assert!(guard.active);
+            assert!(guard.qualification.is_active());
             if block < 10 {
-                assert!(guard.candidate_observable);
+                assert!(guard.candidate.observable);
             } else {
-                assert!(!guard.candidate_observable);
+                assert!(!guard.candidate.observable);
+                // Masking removes reported credit, but preserves local admission.
+                let record = guard.shared.guard_snapshot().unwrap().record;
+                assert_eq!(record.state, State::Active);
+                assert_eq!(record.qualified_frames, 0);
             }
         }
         params.set_mute(0, false);
         assert!(zero(&process(&mut pipeline, &mut guard)));
-        assert!(!guard.active);
-        assert!(guard.attempt_required);
+        assert!(!guard.qualification.is_active());
+        assert!(guard.qualification.attempt_required());
     }
 }
 
@@ -154,13 +158,13 @@ fn applied_chunk_state_wins_over_later_control_flags_and_survives_mixer() {
     let mut candidate = pipeline.process_chunk(chunk());
     params.set_mute(0, true);
     guard.process(&mut candidate);
-    assert!(guard.candidate_observable);
+    assert!(guard.candidate.observable);
     let mut candidate = pipeline.process_chunk(chunk());
     params.set_mute(0, false);
     guard.process(&mut candidate);
-    assert!(!guard.candidate_observable);
+    assert!(!guard.candidate.observable);
     assert!(zero(&candidate));
-    assert_eq!(guard.qualified_frames, 0);
+    assert_eq!(guard.qualification.frames(), 0);
 
     let mut conf = serde_json::to_value(configuration()).unwrap();
     conf["mixers"] = serde_json::json!({"identity": {
@@ -198,14 +202,14 @@ fn reversing_opening_cancels_credit_and_requires_another_attempt() {
     }
     params.set_mute(0, true);
     assert!(zero(&process(&mut pipeline, &mut guard)));
-    assert!(guard.attempt_required);
+    assert!(guard.qualification.attempt_required());
     params.set_mute(0, false);
     assert!(zero(&process(&mut pipeline, &mut guard)));
     prearm(&mut guard, 3);
     params.set_target_volume(0, -6.0); // Restart opening ramp at the current gain.
     for _ in 0..75 {
         assert!(zero(&process(&mut pipeline, &mut guard)));
-        assert!(!guard.candidate_observable);
+        assert!(!guard.candidate.observable);
     }
     qualify(&mut pipeline, &mut guard);
 }
@@ -258,13 +262,13 @@ fn reset_is_exact_preserves_frames_and_mute_and_retrip_advances_generation() {
     stale.expected.trip_generation -= 1;
     guard.control_only(stale);
     assert_eq!(guard.trip(), Some(old_trip));
-    assert_eq!(guard.reset, 0);
+    assert_eq!(guard.stream.reset, 0);
     let reset = command(&guard, Operation::Reset, 2);
     guard.control_only(reset);
     assert!(params.is_mute(0));
-    assert_eq!(guard.frames, FRAMES as u64);
-    assert_eq!(guard.frame_floor, FRAMES as u64);
-    assert_eq!(guard.reset, 1);
+    assert_eq!(guard.stream.frames, FRAMES as u64);
+    assert_eq!(guard.stream.frame_floor, FRAMES as u64);
+    assert_eq!(guard.stream.reset, 1);
     assert!(!old_stamp.is_current());
     let snapshot = guard.shared.guard_snapshot().unwrap();
     assert!(!snapshot.record.processing_valid);
@@ -278,7 +282,7 @@ fn reset_is_exact_preserves_frames_and_mute_and_retrip_advances_generation() {
     assert_eq!(snapshot.record.trip_generation, old_trip.generation);
     assert!(snapshot.record.trip.is_none());
     guard.control_only(reset); // Replay cannot reset again.
-    assert_eq!(guard.reset, 1);
+    assert_eq!(guard.stream.reset, 1);
     assert_eq!(
         guard.control.last_command.unwrap().result,
         ControlResult::StateMismatch
@@ -288,7 +292,7 @@ fn reset_is_exact_preserves_frames_and_mute_and_retrip_advances_generation() {
     guard.process(&mut candidate);
     assert!(zero(&candidate));
     assert_eq!(guard.trip().unwrap().generation, old_trip.generation + 1);
-    assert_eq!(guard.frames, 2 * FRAMES as u64);
+    assert_eq!(guard.stream.frames, 2 * FRAMES as u64);
 }
 
 #[test]
@@ -317,12 +321,13 @@ fn reset_receipt_and_same_chunk_new_trip_are_coherent() {
 fn reset_hold_credit_pause_and_old_armed_receipts_cannot_qualify_next_attempt() {
     let (_, mut pipeline, mut guard) = setup(false, 0.0);
     prearm(&mut guard, 1);
+    process(&mut pipeline, &mut guard); // Give reset a nonzero frame floor.
     let reset = command(&guard, Operation::Reset, 2);
     guard.control_only(reset);
     qualify(&mut pipeline, &mut guard); // Simulated healthy audio during parent hold.
     prearm(&mut guard, 3);
-    assert!(!guard.active);
-    assert_eq!(guard.qualified_frames, 0);
+    assert!(!guard.qualification.is_active());
+    assert_eq!(guard.qualification.frames(), 0);
     qualify(&mut pipeline, &mut guard);
     let armed = command(&guard, Operation::Context(Mode::Armed), 3);
     let mut candidate = pipeline.process_chunk(chunk());
@@ -334,14 +339,22 @@ fn reset_hold_credit_pause_and_old_armed_receipts_cannot_qualify_next_attempt() 
     );
     let old_receipt = guard.control.last_command;
     let before = guard.shared.guard_snapshot().unwrap();
+    assert!(before.record.frame_floor > 0);
     guard.pause();
     let paused = guard.shared.guard_snapshot().unwrap();
     assert_eq!(paused.record.frames, before.record.frames);
+    assert_eq!(paused.record.frame_floor, before.record.frame_floor);
     assert_eq!(paused.record.source_begin_ns, before.record.source_begin_ns);
     assert_eq!(paused.record.source_end_ns, before.record.source_end_ns);
     assert_eq!(paused.record.control.last_command, old_receipt);
     assert!(!paused.record.processing_valid);
     assert_eq!(paused.record.state, State::Inactive);
+    assert_eq!(
+        paused.record.activity_generation,
+        before.record.activity_generation + 1
+    );
+    assert_eq!(paused.record.silent_frames, 0);
+    assert_eq!(paused.record.last_active_end_frame, 0);
     let request = command(&guard, Operation::Context(Mode::Armed), 3);
     guard.control_only(request);
     assert_eq!(
@@ -349,7 +362,7 @@ fn reset_hold_credit_pause_and_old_armed_receipts_cannot_qualify_next_attempt() 
         ControlResult::NotQualified
     );
     prearm(&mut guard, 4);
-    assert_eq!(guard.qualified_frames, 0);
+    assert_eq!(guard.qualification.frames(), 0);
     qualify(&mut pipeline, &mut guard);
 }
 
@@ -393,8 +406,8 @@ fn missing_chunk_observation_cannot_reuse_active_state() {
     candidate.main_volume = None;
     guard.process(&mut candidate);
     assert!(zero(&candidate));
-    assert!(!guard.candidate_observable);
-    assert!(guard.attempt_required);
+    assert!(!guard.candidate.observable);
+    assert!(guard.qualification.attempt_required());
 }
 
 #[test]
@@ -463,8 +476,8 @@ fn fir_reload_with_capture_device_change_retires_epoch_and_queued_output() {
         ControlResult::StateMismatch
     );
     assert_eq!(guard.trip(), trip);
-    assert!(!guard.processing_valid);
-    assert_eq!(guard.qualified_frames, 0);
+    assert!(!guard.stream.processing_valid);
+    assert_eq!(guard.qualification.frames(), 0);
     assert!(
         params
             .protection
@@ -475,5 +488,8 @@ fn fir_reload_with_capture_device_change_retires_epoch_and_queued_output() {
     let forwarded = process(&mut replacement_pipeline, &mut guard);
     assert!(zero(&forwarded));
     assert_eq!(guard.trip(), trip);
-    assert_eq!(guard.identity, Some(replacement_identity));
+    assert_eq!(
+        guard.configuration.as_ref().map(|c| c.identity),
+        Some(replacement_identity)
+    );
 }

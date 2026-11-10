@@ -18,10 +18,14 @@ mod lifecycle_tests;
 pub mod playback;
 mod policy;
 mod record;
+mod state;
 pub mod wire;
 use control::{Command, Control, Mode, Operation};
 use record::AtomicRecord;
 pub use record::GuardRecord;
+use state::{
+    CandidateObservation, DetectorState, FaultState, OutputActivity, Qualification, StreamState,
+};
 
 pub const CHANNELS: usize = 24;
 pub const FRAMES: usize = 256;
@@ -314,67 +318,40 @@ pub fn monotonic_ns() -> u64 {
     }
 }
 
+/// Transition preservation contract:
+/// - Install/backend change restart frames and floor; pause retains both.
+/// - All three preserve the trip and power history, break detector continuity,
+///   retire output activity and require a fresh qualification attempt.
+/// - Accepted reset retains frames, advances the floor, clears trip/power and
+///   begins a fresh prearm attempt; the lifetime trip generation survives.
 #[derive(Debug)]
 pub struct Guard {
     pub(crate) shared: Arc<Shared>,
-    epoch: u64,
-    backend: u64,
-    parameters: Option<Parameters>,
-    peak_limit: PrcFmt,
-    policy: policy::Policy,
-    history: [policy::History; 2],
-    short_power_veto: bool,
-    frames: u64,
-    trip: Option<Trip>,
-    trip_generation: u64,
-    reset: u64,
-    frame_floor: u64,
-    processing_valid: bool,
-    source_begin_ns: u64,
-    source_end_ns: u64,
+    configuration: Option<AdmittedGuard>,
+    stream: StreamState,
+    detector: DetectorState,
+    fault: FaultState,
     control: Control,
-    candidate_observable: bool,
-    qualified_frames: u64,
-    qualification_baseline: bool,
-    attempt_required: bool,
-    last_main_mute: Option<bool>,
-    pub(crate) active: bool,
-    identity: Option<identity::Identity>,
-    activity_generation: u64,
-    silent_frames: u64,
-    last_active_end_frame: u64,
+    qualification: Qualification,
+    candidate: CandidateObservation,
+    activity: OutputActivity,
 }
 
 impl Guard {
     pub fn new(shared: Arc<Shared>) -> Self {
         Self {
-            backend: shared.backend.load(Ordering::SeqCst),
+            stream: StreamState {
+                backend: shared.backend.load(Ordering::SeqCst),
+                ..StreamState::default()
+            },
             shared,
-            epoch: 0,
-            parameters: None,
-            peak_limit: 0.0,
-            policy: policy::Policy::default(),
-            history: [policy::History::default(); 2],
-            short_power_veto: false,
-            frames: 0,
-            trip: None,
-            trip_generation: 0,
-            reset: 0,
-            frame_floor: 0,
-            processing_valid: false,
-            source_begin_ns: 0,
-            source_end_ns: 0,
+            configuration: None,
+            detector: DetectorState::default(),
+            fault: FaultState::default(),
             control: Control::default(),
-            candidate_observable: false,
-            qualified_frames: 0,
-            qualification_baseline: false,
-            attempt_required: true,
-            last_main_mute: None,
-            active: false,
-            identity: None,
-            activity_generation: 0,
-            silent_frames: 0,
-            last_active_end_frame: 0,
+            qualification: Qualification::default(),
+            candidate: CandidateObservation::default(),
+            activity: OutputActivity::default(),
         }
     }
 
@@ -382,74 +359,60 @@ impl Guard {
         self.sync_backend();
         // Every admitted replacement retires queued stamps and qualification,
         // preserving the latched trip and accumulated power history.
-        self.epoch = self
+        let epoch = self
             .shared
             .epoch
             .fetch_add(1, Ordering::SeqCst)
             .checked_add(1)
             .unwrap();
-        assert!(self.epoch <= i64::MAX as u64);
-        self.parameters = None;
-        self.identity = None;
-        self.invalidate_activity();
-        self.frames = 0;
-        self.frame_floor = 0;
-        self.processing_valid = false;
-        self.source_begin_ns = 0;
-        self.source_end_ns = 0;
-        self.candidate_observable = false;
-        self.last_main_mute = None;
-        self.invalidate_qualification();
+        assert!(epoch <= i64::MAX as u64);
+        self.configuration = None;
+        self.stream.new_pipeline(epoch);
+        self.activity.interrupt();
+        self.detector.break_continuity();
+        self.candidate.new_configuration();
+        self.qualification.require_attempt();
         self.publish();
-        let admitted = conf.guard();
-        self.peak_limit = admitted.peak_limit;
-        self.policy = admitted.policy.clone();
-        self.parameters = Some(admitted.parameters.clone());
-        self.identity = Some(admitted.identity);
+        self.configuration = Some(conf.guard().clone());
         self.publish();
     }
 
     pub fn trip(&self) -> Option<Trip> {
-        self.trip
+        self.fault.trip
     }
 
     fn latch(&mut self, reason: Reason, channel: Option<usize>, frame: u64) {
-        if self.trip.is_none() {
-            self.trip_generation = bump(self.trip_generation);
-            self.trip = Some(Trip {
-                generation: self.trip_generation,
-                reason,
-                channel,
-                frame,
-                at_ns: monotonic_ns(),
-            });
-        }
-        self.invalidate_qualification();
+        self.fault.latch(reason, channel, frame);
+        self.qualification.require_attempt();
     }
 
     fn publish(&self) {
         let record = GuardRecord {
-            pipeline: self.epoch,
-            backend: self.backend,
-            reset: self.reset,
-            frame_floor: self.frame_floor,
-            frames: self.frames,
-            processing_valid: self.processing_valid,
-            source_begin_ns: self.source_begin_ns,
-            source_end_ns: self.source_end_ns,
+            pipeline: self.stream.epoch,
+            backend: self.stream.backend,
+            reset: self.stream.reset,
+            frame_floor: self.stream.frame_floor,
+            frames: self.stream.frames,
+            processing_valid: self.stream.processing_valid,
+            source_begin_ns: self.stream.source_begin_ns,
+            source_end_ns: self.stream.source_end_ns,
             state: self.state(),
-            candidate_observable: self.candidate_observable,
-            qualified_frames: self.qualified_frames,
-            short_power_veto: self.short_power_veto,
-            attempt_required: self.attempt_required,
-            trip_generation: self.trip_generation,
-            trip: self.trip,
+            candidate_observable: self.candidate.observable,
+            qualified_frames: self.qualification.frames(),
+            short_power_veto: self.detector.short_power_veto,
+            attempt_required: self.qualification.attempt_required(),
+            trip_generation: self.fault.generation,
+            trip: self.fault.trip,
             control: self.control.snapshot(),
-            identity: self.identity.unwrap_or_default(),
-            final_guard: self.parameters.is_some() && self.identity.is_some(),
-            activity_generation: self.activity_generation,
-            silent_frames: self.silent_frames,
-            last_active_end_frame: self.last_active_end_frame,
+            identity: self
+                .configuration
+                .as_ref()
+                .map(|c| c.identity)
+                .unwrap_or_default(),
+            final_guard: self.configuration.is_some(),
+            activity_generation: self.activity.generation,
+            silent_frames: self.activity.silent_frames,
+            last_active_end_frame: self.activity.last_active_end_frame,
         };
         self.shared.guard_record.publish(record.to_words());
     }
@@ -465,10 +428,10 @@ impl Guard {
             self.apply_control(command, false);
         }
         #[cfg(any(test, feature = "protection-test-capture"))]
-        let capture = self.shared.capture.guard(chunk, self.frames);
+        let capture = self.shared.capture.guard(chunk, self.stream.frames);
         chunk.protection = None;
         let begin = monotonic_ns();
-        let shape_valid = self.parameters.is_some()
+        let shape_valid = self.configuration.is_some()
             && chunk.frames == FRAMES
             && chunk.valid_frames == FRAMES
             && chunk.channels == CHANNELS
@@ -482,45 +445,45 @@ impl Guard {
                     finite = false;
                     Some(Reason::Nonfinite)
                 } else if channel < 2
-                    && self.parameters.is_some()
-                    && sample.abs() >= self.peak_limit
+                    && self
+                        .configuration
+                        .as_ref()
+                        .is_some_and(|c| sample.abs() >= c.peak_limit)
                 {
                     Some(Reason::Peak)
                 } else {
                     None
                 };
                 if let Some(reason) = reason {
-                    self.latch(reason, Some(channel), self.frames + offset as u64);
+                    self.latch(reason, Some(channel), self.stream.frames + offset as u64);
                 }
             }
         }
         if !shape_valid {
-            self.latch(Reason::Coverage, None, self.frames);
+            self.latch(Reason::Coverage, None, self.stream.frames);
         }
         self.observe_main_volume(chunk, shape_valid);
-        self.short_power_veto = false;
+        self.detector.short_power_veto = false;
         if shape_valid && finite {
             for channel in 0..2 {
-                let result = self.policy.assess(
-                    &mut self.history[channel],
+                let result = self.configuration.as_ref().unwrap().policy.assess(
+                    &mut self.detector.history[channel],
                     &chunk.waveforms[channel],
                     self.control.mode == Mode::Prearm,
-                    self.candidate_observable,
+                    self.candidate.observable,
                 );
-                self.short_power_veto |= result.veto;
+                self.detector.short_power_veto |= result.veto;
                 if let Some(reason) = result.reason {
-                    self.latch(reason, Some(channel), self.frames + FRAMES as u64);
+                    self.latch(reason, Some(channel), self.stream.frames + FRAMES as u64);
                 }
             }
         } else {
-            self.break_policy_continuity();
+            self.detector.break_continuity();
         }
-        if self.short_power_veto {
+        if self.detector.short_power_veto {
             // A veto restarts a full window, including after local admission
             // while the parent's independent checks are still qualifying.
-            self.active = false;
-            self.qualified_frames = 0;
-            self.qualification_baseline = false;
+            self.qualification.restart_window();
         } else {
             self.qualify();
         }
@@ -530,17 +493,17 @@ impl Guard {
         }
         #[cfg(any(test, feature = "protection-test-capture"))]
         let decision_ns = monotonic_ns();
-        if !self.active || self.trip.is_some() || !shape_valid {
+        if !self.qualification.is_active() || self.fault.trip.is_some() || !shape_valid {
             for waveform in &mut chunk.waveforms {
                 waveform.fill(0.0);
             }
             chunk.maxval = 0.0;
             chunk.minval = 0.0;
         }
-        let frame_begin = self.frames;
+        let frame_begin = self.stream.frames;
         if shape_valid {
-            self.frames = self.frames.checked_add(FRAMES as u64).unwrap();
-            assert!(self.frames <= i64::MAX as u64);
+            self.stream.frames = self.stream.frames.checked_add(FRAMES as u64).unwrap();
+            assert!(self.stream.frames <= i64::MAX as u64);
         }
         let mut rms_power = [0.0; CHANNELS];
         if shape_valid {
@@ -549,20 +512,25 @@ impl Guard {
             }
             if rms_power
                 .iter()
-                .any(|power| *power > self.policy.silence_power)
+                .any(|power| *power > self.configuration.as_ref().unwrap().policy.silence_power)
             {
-                self.silent_frames = 0;
-                self.last_active_end_frame = self.frames;
+                self.activity.silent_frames = 0;
+                self.activity.last_active_end_frame = self.stream.frames;
             } else {
-                self.silent_frames = self.silent_frames.checked_add(FRAMES as u64).unwrap();
+                self.activity.silent_frames = self
+                    .activity
+                    .silent_frames
+                    .checked_add(FRAMES as u64)
+                    .unwrap();
             }
         } else {
-            self.invalidate_activity();
+            self.activity.interrupt();
+            self.detector.break_continuity();
         }
         let end = monotonic_ns();
-        self.processing_valid = shape_valid;
-        self.source_begin_ns = if shape_valid { begin } else { 0 };
-        self.source_end_ns = if shape_valid { end } else { 0 };
+        self.stream.processing_valid = shape_valid;
+        self.stream.source_begin_ns = if shape_valid { begin } else { 0 };
+        self.stream.source_end_ns = if shape_valid { end } else { 0 };
         self.publish();
         #[cfg(any(test, feature = "protection-test-capture"))]
         if let Some(capture) = capture {
@@ -571,11 +539,11 @@ impl Guard {
         if shape_valid {
             chunk.protection = Some(Stamp {
                 shared: self.shared.clone(),
-                epoch: self.epoch,
-                backend: self.backend,
-                reset: self.reset,
+                epoch: self.stream.epoch,
+                backend: self.stream.backend,
+                reset: self.stream.reset,
                 frame_begin,
-                frame_end: self.frames,
+                frame_end: self.stream.frames,
                 source_begin_ns: begin,
                 source_end_ns: end,
                 rms_power,
@@ -587,16 +555,12 @@ impl Guard {
     // atomic generation before any PCM recovery; old queued stamps then fail.
     fn sync_backend(&mut self) {
         let backend = self.shared.backend.load(Ordering::SeqCst);
-        if backend != self.backend {
-            self.backend = backend;
-            self.frames = 0;
-            self.frame_floor = 0;
-            self.processing_valid = false;
-            self.source_begin_ns = 0;
-            self.source_end_ns = 0;
-            self.candidate_observable = false;
-            self.invalidate_activity();
-            self.invalidate_qualification();
+        if backend != self.stream.backend {
+            self.stream.new_backend(backend);
+            self.candidate.interrupt();
+            self.activity.interrupt();
+            self.detector.break_continuity();
+            self.qualification.require_attempt();
         }
     }
 
@@ -605,60 +569,45 @@ impl Guard {
         self.publish();
     }
 
-    fn invalidate_activity(&mut self) {
-        self.activity_generation = bump(self.activity_generation);
-        self.silent_frames = 0;
-        self.last_active_end_frame = 0;
-        self.break_policy_continuity();
-    }
-
-    fn break_policy_continuity(&mut self) {
-        for history in &mut self.history {
-            history.break_continuity();
-        }
-        self.short_power_veto = false;
-    }
-
     fn observe_main_volume(&mut self, chunk: &AudioChunk, shape_valid: bool) {
-        self.candidate_observable =
+        self.candidate.observable =
             shape_valid && chunk.main_volume.is_some_and(|v| !v.muted && !v.opening);
         let Some(volume) = chunk.main_volume else {
-            self.invalidate_qualification();
+            self.qualification.require_attempt();
             return;
         };
-        if self.last_main_mute == Some(true) && !volume.muted {
+        if self.candidate.last_main_mute == Some(true) && !volume.muted {
             // Must precede forwarding the first opening sample. A new prearm
             // attempt must be installed after this observed transition.
-            self.invalidate_qualification();
-        } else if self.last_main_mute == Some(false) && volume.muted && !self.active {
-            self.invalidate_qualification();
+            self.qualification.require_attempt();
+        } else if self.candidate.last_main_mute == Some(false)
+            && volume.muted
+            && !self.qualification.is_active()
+        {
+            self.qualification.require_attempt();
         }
-        self.last_main_mute = Some(volume.muted);
-        if !self.candidate_observable {
-            self.qualified_frames = 0;
-            self.qualification_baseline = false;
+        self.candidate.last_main_mute = Some(volume.muted);
+        if !self.candidate.observable {
             // An already active ordinary fade-out is still passed through.
+            self.qualification.masked_candidate();
         }
     }
 
     fn qualify(&mut self) {
-        if !self.candidate_observable
-            || self.trip.is_some()
-            || self.attempt_required
+        if !self.candidate.observable
+            || self.fault.trip.is_some()
+            || self.qualification.attempt_required()
             || self.control.owner.is_none()
         {
             return;
         }
-        if !self.active {
-            if self.qualification_baseline {
-                self.qualified_frames = self.qualified_frames.checked_add(FRAMES as u64).unwrap();
-                if self.qualified_frames >= self.policy.qualification_frames {
-                    self.active = true;
-                }
-            } else {
-                self.qualification_baseline = true;
-            }
-        }
+        self.qualification.observe_candidate(
+            self.configuration
+                .as_ref()
+                .unwrap()
+                .policy
+                .qualification_frames,
+        );
     }
 }
 
@@ -689,10 +638,9 @@ pub(crate) mod tests {
 
     fn guard() -> Guard {
         let mut guard = Guard::new(Arc::new(Shared::default()));
-        guard.policy = policy::Policy::new(&parameters());
-        guard.parameters = Some(parameters());
-        guard.peak_limit = 10.0_f64.powf(-0.5 / 20.0) as PrcFmt;
-        guard.active = true;
+        guard.install(&prepared_configuration());
+        // Sample-containment unit tests start from a locally admitted guard.
+        guard.qualification = Qualification::Active { frames: 0 };
         guard
     }
 
@@ -770,16 +718,16 @@ pub(crate) mod tests {
         input.waveforms[1][5] = 1.0;
         guard.process(&mut input);
         let stamp = input.protection.unwrap();
-        let trip = guard.trip;
+        let trip = guard.fault.trip;
         let mut invalid = conf.config().clone();
         invalid.pipeline = None;
         assert!(config::validate_config(invalid, None).is_err());
         // Rejected edits never reach the owner; the admitted graph stays bound.
         assert!(stamp.is_current());
-        assert_eq!(guard.trip, trip);
+        assert_eq!(guard.fault.trip, trip);
         guard.install(&conf);
         assert!(!stamp.is_current());
-        assert_eq!(guard.trip, trip);
+        assert_eq!(guard.fault.trip, trip);
         let mut safe = chunk();
         guard.process(&mut safe);
         assert!(safe.waveforms.iter().flatten().all(|s| *s == 0.0));
@@ -791,18 +739,18 @@ pub(crate) mod tests {
             for offset in [0, FRAMES - 1] {
                 let mut guard = guard();
                 let mut input = chunk();
-                input.waveforms[channel][offset] = guard.peak_limit;
+                input.waveforms[channel][offset] = guard.configuration.as_ref().unwrap().peak_limit;
                 guard.process(&mut input);
                 assert!(input.waveforms.iter().flatten().all(|s| *s == 0.0));
-                let trip = guard.trip.unwrap();
+                let trip = guard.fault.trip.unwrap();
                 assert_eq!(trip.reason, Reason::Peak);
                 assert_eq!(trip.channel, Some(channel));
                 assert_eq!(trip.frame, offset as u64);
                 let mut safe = chunk();
                 guard.process(&mut safe);
                 assert!(safe.waveforms.iter().flatten().all(|s| *s == 0.0));
-                assert_eq!(guard.trip, Some(trip));
-                assert_eq!(guard.frames, 2 * FRAMES as u64);
+                assert_eq!(guard.fault.trip, Some(trip));
+                assert_eq!(guard.stream.frames, 2 * FRAMES as u64);
                 assert!(safe.protection.unwrap().is_current());
             }
         }
@@ -816,7 +764,7 @@ pub(crate) mod tests {
                 let mut input = chunk();
                 input.waveforms[channel][FRAMES - 1] = sample;
                 guard.process(&mut input);
-                assert_eq!(guard.trip.unwrap().reason, Reason::Nonfinite);
+                assert_eq!(guard.fault.trip.unwrap().reason, Reason::Nonfinite);
                 assert!(input.waveforms.iter().flatten().all(|s| *s == 0.0));
             }
         }
@@ -828,7 +776,7 @@ pub(crate) mod tests {
         let mut input = chunk();
         guard.process(&mut input);
         assert_eq!(input.waveforms, chunk().waveforms);
-        assert!(guard.trip.is_none());
+        assert!(guard.fault.trip.is_none());
     }
 
     #[test]
@@ -912,8 +860,8 @@ pub(crate) mod tests {
         let mut input = chunk();
         input.waveforms[1].clear();
         guard.process(&mut input);
-        assert_eq!(guard.trip.unwrap().reason, Reason::Coverage);
-        assert_eq!(guard.frames, 0);
+        assert_eq!(guard.fault.trip.unwrap().reason, Reason::Coverage);
+        assert_eq!(guard.stream.frames, 0);
         assert!(input.protection.is_none());
         assert!(input.waveforms.iter().flatten().all(|s| *s == 0.0));
     }
@@ -925,7 +873,7 @@ pub(crate) mod tests {
         input.waveforms[0][2] = 1.0;
         input.waveforms[3].clear();
         guard.process(&mut input);
-        assert_eq!(guard.trip.unwrap().reason, Reason::Peak);
+        assert_eq!(guard.fault.trip.unwrap().reason, Reason::Peak);
         assert!(input.protection.is_none());
     }
 
@@ -947,7 +895,7 @@ pub(crate) mod tests {
         input.waveforms[0][0] = 1.0;
         guard.process(&mut input);
         let first = guard.shared.guard_snapshot().unwrap();
-        assert_eq!(first.record.trip, guard.trip);
+        assert_eq!(first.record.trip, guard.fault.trip);
         assert_eq!(first.record.trip.unwrap().reason, Reason::Peak);
         assert_eq!(guard.shared.guard_snapshot(), Some(first));
     }
@@ -1016,7 +964,7 @@ pub(crate) mod tests {
                 assert!(candidate.waveforms[0].iter().all(|s| *s == 0.0));
             }
             guard.process(&mut candidate);
-            assert!(!guard.active);
+            assert!(!guard.qualification.is_active());
             assert!(candidate.waveforms.iter().flatten().all(|s| *s == 0.0));
         }
         assert_eq!(guard.trip().unwrap().reason, Reason::Peak);
