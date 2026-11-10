@@ -1,7 +1,7 @@
 //! Owner-side state grouped by lifetime. Stream interruption, epoch changes and
 //! accepted reset deliberately have different preservation rules.
 
-use super::{FRAMES, Reason, Trip, bump, monotonic_ns, policy};
+use super::{FRAMES, Reason, TWEETER_CHANNELS, Trip, bump, monotonic_ns, policy};
 
 #[derive(Debug, Default)]
 pub(super) struct StreamState {
@@ -52,7 +52,7 @@ impl StreamState {
 
 #[derive(Debug, Default)]
 pub(super) struct DetectorState {
-    pub history: [policy::History; 2],
+    pub history: [policy::History; TWEETER_CHANNELS.len()],
     pub short_power_veto: bool,
 }
 

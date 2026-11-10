@@ -212,7 +212,7 @@ impl Shared {
                 "identity": {"fork_revision": identity::FORK_REVISION,
                     "graph_sha256": identity::hex(guard.identity.graph), "profile_sha256": identity::hex(guard.identity.profile),
                     "backend": "alsa-hw-ring-v1", "sample_rate": super::SAMPLE_RATE, "chunk_frames": super::FRAMES,
-                    "output_channels": (0..super::CHANNELS).collect::<Vec<_>>(), "tweeter_channels": [0, 1]},
+                    "output_channels": super::OUTPUT_CHANNELS, "tweeter_channels": super::TWEETER_CHANNELS},
                 "guard": {"state": state, "final": guard.final_guard, "coverage_valid": guard.final_guard && guard.processing_valid,
                     "candidate_observable": guard.candidate_observable, "short_power_veto": guard.short_power_veto,
                     "qualified_frames": guard.qualified_frames},

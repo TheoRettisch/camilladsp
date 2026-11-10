@@ -27,7 +27,13 @@ use state::{
     CandidateObservation, DetectorState, FaultState, OutputActivity, Qualification, StreamState,
 };
 
-pub const CHANNELS: usize = 24;
+/// Fixed protection profile. Configuration fields assert these mappings;
+/// they do not select or remap channels.
+pub const OUTPUT_CHANNELS: [usize; 24] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+];
+pub const TWEETER_CHANNELS: [usize; 2] = [0, 1];
+pub const CHANNELS: usize = OUTPUT_CHANNELS.len();
 pub const FRAMES: usize = 256;
 pub const SAMPLE_RATE: usize = 48_000;
 // Default DC window; parameter-dependent qualification is compiled in Policy.
@@ -41,8 +47,10 @@ fn bump(value: u64) -> u64 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Parameters {
+    /// Must equal OUTPUT_CHANNELS, in order; a fixed-profile assertion.
     pub output_channels: [usize; CHANNELS],
-    pub tweeter_channels: [usize; 2],
+    /// Must equal TWEETER_CHANNELS, in order; a fixed-profile assertion.
+    pub tweeter_channels: [usize; TWEETER_CHANNELS.len()],
     pub max_allowed_peak_db: f64,
     pub dc_freeze_seconds: f64,
     pub dc_freeze_peak_rms_tolerance_db: f64,
@@ -61,8 +69,8 @@ pub struct Parameters {
 
 impl Parameters {
     pub fn validate(&self) -> Res<()> {
-        if self.output_channels != std::array::from_fn(|i| i)
-            || self.tweeter_channels != [0, 1]
+        if self.output_channels != OUTPUT_CHANNELS
+            || self.tweeter_channels != TWEETER_CHANNELS
             || !self.max_allowed_peak_db.is_finite()
             || self.max_allowed_peak_db > 0.0
             || self.max_allowed_peak_db < -120.0
@@ -502,7 +510,7 @@ impl Guard {
                 let reason = if !sample.is_finite() {
                     finite = false;
                     Some(Reason::Nonfinite)
-                } else if channel < 2
+                } else if TWEETER_CHANNELS.contains(&channel)
                     && self
                         .configuration
                         .as_ref()
@@ -535,9 +543,9 @@ impl Guard {
         self.observe_main_volume(chunk, shape_valid);
         self.detector.short_power_veto = false;
         if shape_valid && finite {
-            for channel in 0..2 {
+            for (history_index, channel) in TWEETER_CHANNELS.into_iter().enumerate() {
                 let result = self.configuration.as_ref().unwrap().policy.assess(
-                    &mut self.detector.history[channel],
+                    &mut self.detector.history[history_index],
                     &chunk.waveforms[channel],
                     self.control.mode == Mode::Prearm,
                     self.candidate.observable,
@@ -663,8 +671,8 @@ pub(crate) mod tests {
 
     pub(crate) fn parameters() -> Parameters {
         Parameters {
-            output_channels: std::array::from_fn(|i| i),
-            tweeter_channels: [0, 1],
+            output_channels: OUTPUT_CHANNELS,
+            tweeter_channels: TWEETER_CHANNELS,
             max_allowed_peak_db: -0.5,
             dc_freeze_seconds: 2.0,
             dc_freeze_peak_rms_tolerance_db: 0.25,
@@ -902,6 +910,19 @@ pub(crate) mod tests {
         let mut wrong_format = base.clone();
         wrong_format["devices"]["playback"]["format"] = serde_json::json!("S16_LE");
         invalid.push(("format", wrong_format));
+        for (name, field, channels) in [
+            (
+                "reordered outputs",
+                "output_channels",
+                (0..24).rev().collect::<Vec<_>>(),
+            ),
+            ("remapped tweeters", "tweeter_channels", vec![2, 3]),
+            ("reordered tweeters", "tweeter_channels", vec![1, 0]),
+        ] {
+            let mut wrong_map = base.clone();
+            wrong_map["processors"]["guard"]["parameters"][field] = serde_json::json!(channels);
+            invalid.push((name, wrong_map));
+        }
         let mut accepted = Vec::new();
         for (name, value) in invalid {
             let conf = serde_json::from_value(value).unwrap();

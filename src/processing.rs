@@ -143,6 +143,7 @@ pub fn run_processing(
     tx_pb: crossbeam_channel::Sender<AudioMessage>,
     rx_cap: crossbeam_channel::Receiver<AudioMessage>,
     rx_pipeconf: crossbeam_channel::Receiver<(config::ConfigChange, config::PreparedConfig)>,
+    stop: crossbeam_channel::Receiver<()>,
     processing_params: Arc<ProcessingParameters>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -153,7 +154,10 @@ pub fn run_processing(
                 // supervisor/capture/playback participants in wait mode.
                 error!("Protection owner poisoned; DSP process restart required");
                 barrier_proc.wait();
-                let _ = tx_pb.send(AudioMessage::EndOfStream);
+                crossbeam_channel::select! {
+                    send(tx_pb, AudioMessage::EndOfStream) -> _ => {},
+                    recv(stop) -> _ => {},
+                }
                 return;
             }
         };
@@ -253,6 +257,11 @@ pub fn run_processing(
         let mut rx_pipeconf = rx_pipeconf;
         let mut pending = None;
         loop {
+            // Stop also interrupts idle capture and blocked playback. Dropping
+            // both audio endpoints then releases their peers before joining.
+            if !matches!(stop.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)) {
+                break;
+            }
             control.expire_armed(&mut protection);
             let arm_timeout = control.arm_timeout();
             let commands = if control.armed.is_none() {
@@ -276,6 +285,7 @@ pub fn run_processing(
             let ending = matches!(pending, Some(AudioMessage::EndOfStream));
             let configurations = if ending { &no_config } else { &rx_pipeconf };
             let audio = crossbeam_channel::select! {
+                recv(stop) -> _ => break,
                 recv(capture) -> audio => audio,
                 send(output, pending.take().expect("selected output without a pending message")) -> result => {
                     if result.is_err() {
@@ -365,6 +375,7 @@ pub fn run_processing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protection::FRAMES;
     use crate::protection::tests::{chunk, prepared_configuration as configuration};
     use std::time::Duration;
 
@@ -464,6 +475,7 @@ mod tests {
                 tx_pb,
                 rx_cap,
                 rx_conf,
+                crossbeam_channel::never(),
                 params.clone(),
             );
             barrier.wait();
@@ -529,6 +541,7 @@ mod tests {
                 tx_pb,
                 rx_cap,
                 rx_conf,
+                crossbeam_channel::never(),
                 params.clone(),
             );
             barrier.wait();
@@ -609,6 +622,7 @@ mod tests {
                 tx_pb,
                 rx_cap,
                 rx_conf,
+                crossbeam_channel::never(),
                 params.clone(),
             );
             barrier.wait();
@@ -798,6 +812,7 @@ mod tests {
             tx_pb,
             rx_cap,
             rx_conf,
+            crossbeam_channel::never(),
             params.clone(),
         );
         barrier.wait();
@@ -870,6 +885,7 @@ mod tests {
             tx_pb,
             rx_cap,
             rx_conf,
+            crossbeam_channel::never(),
             params.clone(),
         );
         barrier.wait();
@@ -942,6 +958,7 @@ mod tests {
             tx_pb,
             rx_cap,
             rx_conf,
+            crossbeam_channel::never(),
             params.clone(),
         );
         barrier.wait();
@@ -1011,6 +1028,79 @@ mod tests {
     }
 
     #[test]
+    fn stop_releases_owner_with_idle_capture_or_blocked_playback() {
+        for blocked_playback in [false, true] {
+            let params = Arc::new(ProcessingParameters::default());
+            let (tx_pb, rx_pb) = crossbeam_channel::bounded(0);
+            let (tx_cap, rx_cap) = crossbeam_channel::bounded(0);
+            let (_tx_conf, rx_conf) = crossbeam_channel::unbounded();
+            let (tx_stop, rx_stop) = crossbeam_channel::unbounded();
+            let barrier = Arc::new(Barrier::new(2));
+            let handle = run_processing(
+                configuration(),
+                barrier.clone(),
+                tx_pb,
+                rx_cap,
+                rx_conf,
+                rx_stop,
+                params.clone(),
+            );
+            barrier.wait();
+            if blocked_playback {
+                let mut input = chunk();
+                input.waveforms[1][FRAMES - 1] = 1.0;
+                tx_cap
+                    .send_timeout(AudioMessage::Audio(input), Duration::from_secs(2))
+                    .unwrap();
+                // Wait for assessment without draining the rendezvous output.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !params
+                    .protection
+                    .guard_snapshot()
+                    .is_some_and(|snapshot| snapshot.record.trip.is_some())
+                {
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+            }
+            let trip = params.protection.guard_snapshot().unwrap().record.trip;
+            tx_stop.send(()).unwrap();
+            let (tx_joined, rx_joined) = crossbeam_channel::bounded(1);
+            let joiner = thread::spawn(move || tx_joined.send(handle.join()).unwrap());
+            rx_joined
+                .recv_timeout(Duration::from_secs(2))
+                .expect("stop left processing blocked on audio")
+                .unwrap();
+            joiner.join().unwrap();
+            assert!(matches!(
+                tx_cap.try_send(AudioMessage::Pause),
+                Err(crossbeam_channel::TrySendError::Disconnected(_))
+            ));
+            assert!(matches!(
+                rx_pb.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Disconnected)
+            ));
+            let mut owner = params
+                .protection_owner
+                .try_lock()
+                .expect("owner survived join");
+            assert!(
+                !params
+                    .protection
+                    .guard_snapshot()
+                    .unwrap()
+                    .record
+                    .processing_valid
+            );
+            owner.install(&configuration());
+            assert_eq!(
+                params.protection.guard_snapshot().unwrap().record.trip,
+                trip
+            );
+        }
+    }
+
+    #[test]
     fn poisoned_owner_reaches_startup_barrier_and_stops_without_audio() {
         let params = Arc::new(ProcessingParameters::default());
         let poisoned = params.clone();
@@ -1032,6 +1122,7 @@ mod tests {
             tx_pb,
             rx_cap,
             rx_conf,
+            crossbeam_channel::never(),
             params.clone(),
         );
         let (tx_ready, rx_ready) = crossbeam_channel::bounded(1);
@@ -1066,6 +1157,7 @@ mod tests {
             tx_pb,
             rx_cap,
             rx_conf,
+            crossbeam_channel::never(),
             params.clone(),
         );
         barrier.wait();

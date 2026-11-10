@@ -31,6 +31,33 @@ continues using the installed pipeline, including normal control service. Once
 end-of-stream is pending, configuration updates are no longer accepted; control
 service continues until playback accepts the terminal message or disconnects.
 
+## Shutdown and ownership completion
+
+`cargo test --bin camilladsp supervisor_tests` exercises controller stop/exit,
+device restart, backend errors and format changes, playback completion, and
+controller/status/configuration channel disconnection with in-memory workers.
+Startup-error cases require termination requests before barrier release. A
+processing panic must be reported after all three handles have been joined.
+
+`cargo test --lib processing::tests` also exercises stopping the real processing
+owner with idle capture and with an undrained bounded playback channel. It checks
+that both audio endpoints close, the guard lock is released, processing evidence
+is invalidated, and a latched trip survives the next installation. Existing
+poisoned-owner tests still require fail-closed startup without audio.
+
+The supervisor requests capture exit and processing stop, releases the startup
+barrier if still pending, and joins processing, capture and playback before
+returning. Processing stop abandons its pending output and closes its audio
+endpoints, allowing blocked channel operations to finish. Natural end-of-stream
+still flows through processing to playback. Join errors are collected without
+skipping the remaining joins; a poisoned guard requires process restart even in
+wait mode. The persistent guard itself is retained between healthy runs.
+
+This is an ownership-completion contract, not a shutdown deadline. Device calls
+must return and startup participants must reach the existing barrier; a panic
+before a participant reaches that barrier remains outside this guarantee.
+These host tests do not qualify target timing or authorize deployment.
+
 ## Config update tests
 A set of tests for testing that changing the running configuration works correctly
 is implemeted as a Python test script.

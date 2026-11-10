@@ -2399,6 +2399,21 @@ These are special "filters" that work on several channels at the same time.
 Processors take an optional `description` property.
 This is intended for the user and is not used by CamillaDSP itself.
 
+### Protection (fixed-profile fork)
+
+This fork requires one final, enabled `Protection` processor. Its channel fields
+assert the supported profile and do not remap audio:
+
+- `output_channels` must list every output in order, `[0, 1, ..., 23]`.
+- `tweeter_channels` must be exactly `[0, 1]`, in that order.
+
+Admission rejects other mappings. The guard checks nonfinite samples on all 24
+outputs and applies peak and sustained tweeter policies to outputs 0 and 1.
+The same fixed topology appears in protection status. These fields remain in
+the serialized configuration and graph/profile identity; their schema and
+accepted values are unchanged. The declarations live in
+[`src/protection.rs`](src/protection.rs).
+
 ### Compressor
 The "Compressor" processor implements a standard dynamic range compressor.
 It is configured using the most common parameters.
