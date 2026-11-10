@@ -337,6 +337,19 @@ pub struct Guard {
     activity: OutputActivity,
 }
 
+/// Facts about the original candidate; no sample copies or retained evidence.
+#[derive(Clone, Copy)]
+struct CandidateAssessment {
+    shape_valid: bool,
+    finite: bool,
+}
+
+/// Accounting for the samples actually forwarded after whole-chunk containment.
+struct ForwardedOutput {
+    frame_begin: u64,
+    rms_power: [f64; CHANNELS],
+}
+
 impl Guard {
     pub fn new(shared: Arc<Shared>) -> Self {
         Self {
@@ -425,12 +438,57 @@ impl Guard {
         self.sync_backend();
         let armed = command.filter(|c| c.operation == Operation::Context(Mode::Armed));
         if let Some(command) = command.filter(|c| c.operation != Operation::Context(Mode::Armed)) {
+            // Reset/Prearm precede assessment; this candidate may immediately retrip.
             self.apply_control(command, false);
         }
         #[cfg(any(test, feature = "protection-test-capture"))]
         let capture = self.shared.capture.guard(chunk, self.stream.frames);
         chunk.protection = None;
         let begin = monotonic_ns();
+        let assessment = self.assess_candidate(chunk);
+        self.assess_policy_and_qualify(chunk, assessment);
+        if let Some(command) = armed {
+            // Current-chunk hazards and qualification precede armed receipt.
+            self.apply_control(command, true);
+        }
+        #[cfg(any(test, feature = "protection-test-capture"))]
+        let decision_ns = monotonic_ns();
+        if !self.qualification.is_active() || self.fault.trip.is_some() || !assessment.shape_valid {
+            for waveform in &mut chunk.waveforms {
+                waveform.fill(0.0);
+            }
+            chunk.maxval = 0.0;
+            chunk.minval = 0.0;
+        }
+        // Activity and RMS describe the forwarded chunk, after containment.
+        let forwarded = self.account_forwarded_output(chunk, assessment.shape_valid);
+        let end = monotonic_ns();
+        self.stream.processing_valid = assessment.shape_valid;
+        self.stream.source_begin_ns = if assessment.shape_valid { begin } else { 0 };
+        self.stream.source_end_ns = if assessment.shape_valid { end } else { 0 };
+        self.publish();
+        #[cfg(any(test, feature = "protection-test-capture"))]
+        if let Some(capture) = capture {
+            capture.guard(self, chunk, decision_ns, monotonic_ns());
+        }
+        if assessment.shape_valid {
+            chunk.protection = Some(Stamp {
+                shared: self.shared.clone(),
+                epoch: self.stream.epoch,
+                backend: self.stream.backend,
+                reset: self.stream.reset,
+                frame_begin: forwarded.frame_begin,
+                frame_end: self.stream.frames,
+                source_begin_ns: begin,
+                source_end_ns: end,
+                rms_power: forwarded.rms_power,
+            });
+        }
+    }
+
+    /// Inspect original candidate samples and latch at the first observed fault.
+    /// Coverage failure must not hide available peak or nonfinite evidence.
+    fn assess_candidate(&mut self, chunk: &AudioChunk) -> CandidateAssessment {
         let shape_valid = self.configuration.is_some()
             && chunk.frames == FRAMES
             && chunk.valid_frames == FRAMES
@@ -462,6 +520,18 @@ impl Guard {
         if !shape_valid {
             self.latch(Reason::Coverage, None, self.stream.frames);
         }
+        CandidateAssessment {
+            shape_valid,
+            finite,
+        }
+    }
+
+    /// Detector history and qualification use candidates, never masked output.
+    fn assess_policy_and_qualify(&mut self, chunk: &AudioChunk, assessment: CandidateAssessment) {
+        let CandidateAssessment {
+            shape_valid,
+            finite,
+        } = assessment;
         self.observe_main_volume(chunk, shape_valid);
         self.detector.short_power_veto = false;
         if shape_valid && finite {
@@ -487,19 +557,13 @@ impl Guard {
         } else {
             self.qualify();
         }
-        if let Some(command) = armed {
-            // Current-chunk hazards and qualification precede armed receipt.
-            self.apply_control(command, true);
-        }
-        #[cfg(any(test, feature = "protection-test-capture"))]
-        let decision_ns = monotonic_ns();
-        if !self.qualification.is_active() || self.fault.trip.is_some() || !shape_valid {
-            for waveform in &mut chunk.waveforms {
-                waveform.fill(0.0);
-            }
-            chunk.maxval = 0.0;
-            chunk.minval = 0.0;
-        }
+    }
+
+    fn account_forwarded_output(
+        &mut self,
+        chunk: &AudioChunk,
+        shape_valid: bool,
+    ) -> ForwardedOutput {
         let frame_begin = self.stream.frames;
         if shape_valid {
             self.stream.frames = self.stream.frames.checked_add(FRAMES as u64).unwrap();
@@ -527,27 +591,9 @@ impl Guard {
             self.activity.interrupt();
             self.detector.break_continuity();
         }
-        let end = monotonic_ns();
-        self.stream.processing_valid = shape_valid;
-        self.stream.source_begin_ns = if shape_valid { begin } else { 0 };
-        self.stream.source_end_ns = if shape_valid { end } else { 0 };
-        self.publish();
-        #[cfg(any(test, feature = "protection-test-capture"))]
-        if let Some(capture) = capture {
-            capture.guard(self, chunk, decision_ns, monotonic_ns());
-        }
-        if shape_valid {
-            chunk.protection = Some(Stamp {
-                shared: self.shared.clone(),
-                epoch: self.stream.epoch,
-                backend: self.stream.backend,
-                reset: self.stream.reset,
-                frame_begin,
-                frame_end: self.stream.frames,
-                source_begin_ns: begin,
-                source_end_ns: end,
-                rms_power,
-            });
+        ForwardedOutput {
+            frame_begin,
+            rms_power,
         }
     }
 
@@ -742,6 +788,12 @@ pub(crate) mod tests {
                 input.waveforms[channel][offset] = guard.configuration.as_ref().unwrap().peak_limit;
                 guard.process(&mut input);
                 assert!(input.waveforms.iter().flatten().all(|s| *s == 0.0));
+                // A hazardous candidate must not appear as output power/activity.
+                let stamp = input.protection.as_ref().unwrap();
+                assert_eq!(stamp.rms_power, [0.0; CHANNELS]);
+                let record = guard.shared.guard_snapshot().unwrap().record;
+                assert_eq!(record.silent_frames, FRAMES as u64);
+                assert_eq!(record.last_active_end_frame, 0);
                 let trip = guard.fault.trip.unwrap();
                 assert_eq!(trip.reason, Reason::Peak);
                 assert_eq!(trip.channel, Some(channel));
@@ -777,6 +829,12 @@ pub(crate) mod tests {
         guard.process(&mut input);
         assert_eq!(input.waveforms, chunk().waveforms);
         assert!(guard.fault.trip.is_none());
+        // Alternating 0.1/0.0 samples have mean square 0.005 on every channel.
+        let stamp = input.protection.as_ref().unwrap();
+        assert!(stamp.rms_power.iter().all(|p| (*p - 0.005).abs() < 1e-15));
+        let record = guard.shared.guard_snapshot().unwrap().record;
+        assert_eq!(record.silent_frames, 0);
+        assert_eq!(record.last_active_end_frame, stamp.frame_end);
     }
 
     #[test]

@@ -400,6 +400,28 @@ mod tests {
         );
         assert_eq!(record["trip"]["frame"], 17);
         assert_eq!(record["guard_active"], false);
+        // Preserve the capture/source brackets around assessment and publication.
+        let times: Vec<_> = record["times_ns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        let trip_at = guard.trip().unwrap().at_ns;
+        let chronology = [
+            times[0],
+            times[1],
+            stamp.source_begin_ns,
+            trip_at,
+            times[2],
+            stamp.source_end_ns,
+            times[3],
+            times[4],
+        ];
+        assert!(chronology.windows(2).all(|pair| pair[0] <= pair[1]));
+        let published = guard.shared.guard_snapshot().unwrap().record;
+        assert_eq!(published.source_begin_ns, stamp.source_begin_ns);
+        assert_eq!(published.source_end_ns, stamp.source_end_ns);
         assert_eq!(value["records"][1]["clipped"], 0);
         if let Some(path) = std::env::var_os("P4_CAPTURE_FIXTURE") {
             std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
