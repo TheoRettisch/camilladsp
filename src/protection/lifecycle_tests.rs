@@ -2,7 +2,7 @@ use super::*;
 use crate::ProcessingParameters;
 use crate::filters::basicfilters::{AppliedVolume, Volume};
 use crate::pipeline::Pipeline;
-use control::{Expected, Result as ControlResult};
+use control::{Expected, Result as ControlResult, State};
 use tests::{chunk, configuration};
 
 fn setup(muted: bool, ramp_ms: f32) -> (Arc<ProcessingParameters>, Pipeline, Guard) {
@@ -267,10 +267,16 @@ fn reset_is_exact_preserves_frames_and_mute_and_retrip_advances_generation() {
     assert_eq!(guard.reset, 1);
     assert!(!old_stamp.is_current());
     let snapshot = guard.shared.guard_snapshot().unwrap();
-    assert!(!snapshot.processing_valid);
-    assert_eq!((snapshot.source_begin_ns, snapshot.source_end_ns), (0, 0));
-    assert_eq!(snapshot.trip_generation, old_trip.generation);
-    assert!(snapshot.trip.is_none());
+    assert!(!snapshot.record.processing_valid);
+    assert_eq!(
+        (
+            snapshot.record.source_begin_ns,
+            snapshot.record.source_end_ns
+        ),
+        (0, 0)
+    );
+    assert_eq!(snapshot.record.trip_generation, old_trip.generation);
+    assert!(snapshot.record.trip.is_none());
     guard.control_only(reset); // Replay cannot reset again.
     assert_eq!(guard.reset, 1);
     assert_eq!(
@@ -298,11 +304,11 @@ fn reset_receipt_and_same_chunk_new_trip_are_coherent() {
     guard.process_with_command(&mut hazard, Some(reset));
     let snapshot = guard.shared.guard_snapshot().unwrap();
     assert_eq!(
-        snapshot.control.last_command.unwrap().result,
+        snapshot.record.control.last_command.unwrap().result,
         ControlResult::Applied
     );
-    assert_eq!(snapshot.trip.unwrap().generation, 2);
-    assert_eq!(snapshot.state, State::Tripped);
+    assert_eq!(snapshot.record.trip.unwrap().generation, 2);
+    assert_eq!(snapshot.record.state, State::Tripped);
     assert!(zero(&hazard));
     assert_eq!(guard.shared.guard_snapshot(), Some(snapshot)); // Reads do not consume.
 }
@@ -330,12 +336,12 @@ fn reset_hold_credit_pause_and_old_armed_receipts_cannot_qualify_next_attempt() 
     let before = guard.shared.guard_snapshot().unwrap();
     guard.pause();
     let paused = guard.shared.guard_snapshot().unwrap();
-    assert_eq!(paused.frames, before.frames);
-    assert_eq!(paused.source_begin_ns, before.source_begin_ns);
-    assert_eq!(paused.source_end_ns, before.source_end_ns);
-    assert_eq!(paused.control.last_command, old_receipt);
-    assert!(!paused.processing_valid);
-    assert_eq!(paused.state, State::Inactive);
+    assert_eq!(paused.record.frames, before.record.frames);
+    assert_eq!(paused.record.source_begin_ns, before.record.source_begin_ns);
+    assert_eq!(paused.record.source_end_ns, before.record.source_end_ns);
+    assert_eq!(paused.record.control.last_command, old_receipt);
+    assert!(!paused.record.processing_valid);
+    assert_eq!(paused.record.state, State::Inactive);
     let request = command(&guard, Operation::Context(Mode::Armed), 3);
     guard.control_only(request);
     assert_eq!(

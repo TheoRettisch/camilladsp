@@ -1,6 +1,6 @@
 //! Exact direct-PCM ring accounting. Submission and consumption are distinct.
 
-use super::record::{PlaybackRecord, Telemetry};
+use super::record::{GuardRecord, PlaybackRecord, Telemetry};
 use super::{Shared, Stamp, bump};
 use std::sync::{Arc, atomic::Ordering};
 
@@ -139,6 +139,7 @@ impl Playback {
         let Some(guard) = self.shared.guard_snapshot() else {
             return false;
         };
+        let guard = guard.record;
         if guard.pipeline != self.pipeline || guard.backend != self.backend {
             return false;
         }
@@ -240,7 +241,7 @@ impl Playback {
             clipped_samples: self.shared.conversion_count.load(Ordering::SeqCst),
             conversion_at_ns: self.conversion_at,
         };
-        self.shared.playback_record.publish(record.encode());
+        self.shared.playback_record.publish(record.to_words());
     }
 }
 
@@ -255,7 +256,7 @@ impl Progress {
     /// read with. A paused reset receipt stays readable: old playback source
     /// times are invalidated, never relabelled as evidence of the new reset
     /// lifetime.
-    pub(super) fn of(sequence: u64, record: &PlaybackRecord, guard: &super::Snapshot) -> Self {
+    pub(super) fn of(sequence: u64, record: &PlaybackRecord, guard: &GuardRecord) -> Self {
         let current_reset = record.reset == guard.reset;
         Self {
             sequence,
@@ -283,13 +284,13 @@ impl Progress {
 
 impl Shared {
     pub fn playback_snapshot(&self) -> Option<Progress> {
-        let guard = self.guard_snapshot()?;
+        let guard = self.guard_snapshot()?.record;
         let (sequence, words) = self.playback_record.read()?;
-        let record = PlaybackRecord::decode(&words);
+        let record = PlaybackRecord::from_words(&words)?;
         if sequence == 0 || record.pipeline != guard.pipeline || record.backend != guard.backend {
             return None;
         }
-        let current = self.guard_snapshot()?;
+        let current = self.guard_snapshot()?.record;
         if (guard.pipeline, guard.backend, guard.reset)
             != (current.pipeline, current.backend, current.reset)
         {
@@ -304,7 +305,7 @@ impl Shared {
     /// Frame end of the last completed-write telemetry, if any was credited.
     pub(crate) fn completed_frame_end(&self) -> Option<u64> {
         let (_, words) = self.playback_record.read()?;
-        let telemetry = PlaybackRecord::decode(&words).telemetry;
+        let telemetry = PlaybackRecord::from_words(&words)?.telemetry;
         telemetry.valid.then_some(telemetry.frame_end)
     }
 }
@@ -350,7 +351,7 @@ mod tests {
         let old = shared.playback_snapshot().unwrap();
         assert!(old.valid);
         guard.control_only(command(&guard, 2, true));
-        let reset = shared.guard_snapshot().unwrap();
+        let reset = shared.guard_snapshot().unwrap().record;
         let status = shared.playback_snapshot().unwrap();
         assert_eq!(
             reset.control.last_command.unwrap().result,
@@ -391,7 +392,7 @@ mod tests {
             ControlResult::StateMismatch
         );
         assert_eq!(guard.trip(), trip);
-        let guard_status = shared.guard_snapshot().unwrap();
+        let guard_status = shared.guard_snapshot().unwrap().record;
         let status = shared.playback_snapshot().unwrap();
         assert_eq!(
             (guard_status.frames, status.frames, status.submitted_frames),

@@ -374,10 +374,10 @@ mod tests {
     use crate::protection::tests::{chunk, configuration};
     use std::time::Duration;
 
-    fn wait_receipt(shared: &crate::protection::Shared, id: u64) -> crate::protection::Snapshot {
+    fn wait_receipt(shared: &crate::protection::Shared, id: u64) -> crate::protection::GuardRecord {
         let start = std::time::Instant::now();
         loop {
-            if let Some(snapshot) = shared.guard_snapshot()
+            if let Some(snapshot) = shared.guard_snapshot().map(|s| s.record)
                 && snapshot
                     .control
                     .last_command
@@ -398,7 +398,7 @@ mod tests {
     }
 
     fn request(
-        snapshot: crate::protection::Snapshot,
+        snapshot: crate::protection::GuardRecord,
         id: u64,
         operation: crate::protection::control::Operation,
         qualification_id: u64,
@@ -423,11 +423,11 @@ mod tests {
 
     fn wait_snapshot(
         shared: &crate::protection::Shared,
-        ready: impl Fn(crate::protection::Snapshot) -> bool,
-    ) -> crate::protection::Snapshot {
+        ready: impl Fn(crate::protection::GuardRecord) -> bool,
+    ) -> crate::protection::GuardRecord {
         let start = Instant::now();
         loop {
-            if let Some(snapshot) = shared.guard_snapshot()
+            if let Some(snapshot) = shared.guard_snapshot().map(|s| s.record)
                 && ready(snapshot)
             {
                 return snapshot;
@@ -473,7 +473,7 @@ mod tests {
                 params.clone(),
             );
             barrier.wait();
-            let before = params.protection.guard_snapshot().unwrap();
+            let before = params.protection.guard_snapshot().unwrap().record;
             let updated = configuration_with_gain(20.0);
             tx_conf
                 .send((config::config_diff(&initial, &updated), updated))
@@ -499,7 +499,13 @@ mod tests {
                     .flatten()
                     .all(|sample| *sample == 0.0)
             );
-            let trip = params.protection.guard_snapshot().unwrap().trip.unwrap();
+            let trip = params
+                .protection
+                .guard_snapshot()
+                .unwrap()
+                .record
+                .trip
+                .unwrap();
             assert_eq!(trip.reason, crate::protection::Reason::Peak);
             assert_eq!(trip.channel, Some(0));
             tx_cap.send(AudioMessage::EndOfStream).unwrap();
@@ -570,7 +576,13 @@ mod tests {
                     .flatten()
                     .all(|sample| *sample == 0.0)
             );
-            let trip = params.protection.guard_snapshot().unwrap().trip.unwrap();
+            let trip = params
+                .protection
+                .guard_snapshot()
+                .unwrap()
+                .record
+                .trip
+                .unwrap();
             assert_eq!(trip.reason, crate::protection::Reason::Peak);
             assert_eq!(trip.channel, Some(0));
             tx_cap.send(AudioMessage::EndOfStream).unwrap();
@@ -600,7 +612,7 @@ mod tests {
                 params.clone(),
             );
             barrier.wait();
-            let initial = params.protection.guard_snapshot().unwrap();
+            let initial = params.protection.guard_snapshot().unwrap().record;
             params
                 .protection
                 .submit(request(initial, 1, Operation::Context(Mode::Prearm), 1))
@@ -611,7 +623,7 @@ mod tests {
                 rx_pb.recv_timeout(Duration::from_secs(2)).unwrap(),
                 AudioMessage::Audio(_)
             ));
-            let before = params.protection.guard_snapshot().unwrap();
+            let before = params.protection.guard_snapshot().unwrap().record;
             params
                 .protection
                 .submit(request(before, 2, Operation::Context(Mode::Armed), 1))
@@ -637,7 +649,7 @@ mod tests {
                 })
                 .unwrap();
             rx_pb.recv_timeout(Duration::from_secs(2)).unwrap();
-            let receipt = params.protection.guard_snapshot().unwrap();
+            let receipt = params.protection.guard_snapshot().unwrap().record;
             tx_cap.send(AudioMessage::EndOfStream).unwrap();
             rx_pb.recv_timeout(Duration::from_secs(2)).unwrap();
             handle.join().unwrap();
@@ -668,7 +680,7 @@ mod tests {
                 armed_deadline: None,
             };
             let prearm = request(
-                shared.guard_snapshot().unwrap(),
+                shared.guard_snapshot().unwrap().record,
                 1,
                 Operation::Context(Mode::Prearm),
                 1,
@@ -678,7 +690,7 @@ mod tests {
                 guard.process(&mut chunk());
             }
             assert_eq!(guard.state(), crate::protection::control::State::Active);
-            let before = shared.guard_snapshot().unwrap();
+            let before = shared.guard_snapshot().unwrap().record;
             control.service(
                 &mut guard,
                 request(before, 2, Operation::Context(Mode::Armed), 1),
@@ -687,6 +699,7 @@ mod tests {
                 shared
                     .guard_snapshot()
                     .unwrap()
+                    .record
                     .control
                     .last_command
                     .unwrap()
@@ -703,7 +716,7 @@ mod tests {
             let command = control.candidate_command(&mut guard, &shared);
             assert_eq!(command.is_none(), expired);
             guard.process_with_command(&mut chunk(), command);
-            let after = shared.guard_snapshot().unwrap();
+            let after = shared.guard_snapshot().unwrap().record;
             assert_eq!(
                 after.control.last_command.unwrap().result,
                 if expired {
@@ -737,13 +750,13 @@ mod tests {
             control.service(
                 &mut guard,
                 request(
-                    params.protection.guard_snapshot().unwrap(),
+                    params.protection.guard_snapshot().unwrap().record,
                     1,
                     Operation::Context(Mode::Prearm),
                     1,
                 ),
             );
-            let before = params.protection.guard_snapshot().unwrap();
+            let before = params.protection.guard_snapshot().unwrap().record;
             control.service(
                 &mut guard,
                 request(before, 2, Operation::Context(Mode::Armed), 1),
@@ -764,7 +777,7 @@ mod tests {
                 ),
                 valid
             );
-            let after = params.protection.guard_snapshot().unwrap();
+            let after = params.protection.guard_snapshot().unwrap().record;
             let receipt = after.control.last_command.unwrap();
             assert_eq!(receipt.command_id, 2);
             assert_eq!(receipt.result, ControlResult::NotQualified);
@@ -800,7 +813,7 @@ mod tests {
             rx_pb.recv_timeout(Duration::from_secs(2)).unwrap(),
             AudioMessage::Pause
         ));
-        let initial = params.protection.guard_snapshot().unwrap();
+        let initial = params.protection.guard_snapshot().unwrap().record;
         params
             .protection
             .submit(request(initial, 1, Operation::Context(Mode::Prearm), 1))
@@ -871,7 +884,7 @@ mod tests {
         tx_cap.send(AudioMessage::Audio(chunk())).unwrap();
         let start = std::time::Instant::now();
         let before = loop {
-            let snapshot = params.protection.guard_snapshot().unwrap();
+            let snapshot = params.protection.guard_snapshot().unwrap().record;
             if snapshot.frames == 512 {
                 break snapshot;
             }
@@ -950,7 +963,7 @@ mod tests {
         // The processing owner publishes for the last time and exits before
         // the playback owner retires its backend, as on an ordinary stop.
         handle.join().unwrap();
-        let running = params.protection.guard_snapshot().unwrap();
+        let running = params.protection.guard_snapshot().unwrap().record;
         drop(playback);
         assert!(params.protection.guard_snapshot().is_none());
         assert_eq!(
@@ -979,7 +992,7 @@ mod tests {
         }
         assert_eq!(status["telemetry"]["valid"], false);
         let settled = params.protection.guard_snapshot().unwrap();
-        assert_eq!(settled.trip, running.trip);
+        assert_eq!(settled.record.trip, running.trip);
         // Nothing further retires: a repeated read publishes nothing.
         status_reply(params.protection_reply("\"GetProtectionStatus\""));
         assert_eq!(params.protection.guard_snapshot(), Some(settled));

@@ -77,6 +77,31 @@ pub struct Control {
     pub(super) command_high_water: u64,
 }
 
+/// Published control state. The owner's command replay fence is private runtime
+/// state and cannot be reconstructed from this snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlSnapshot {
+    pub owner: Option<u128>,
+    pub revision: u64,
+    pub parent_reset_generation: u64,
+    pub qualification_id: u64,
+    pub mode: Mode,
+    pub last_command: Option<Receipt>,
+}
+
+impl Control {
+    pub(super) fn snapshot(&self) -> ControlSnapshot {
+        ControlSnapshot {
+            owner: self.owner,
+            revision: self.revision,
+            parent_reset_generation: self.parent_reset_generation,
+            qualification_id: self.qualification_id,
+            mode: self.mode,
+            last_command: self.last_command,
+        }
+    }
+}
+
 impl Default for Control {
     fn default() -> Self {
         Self {

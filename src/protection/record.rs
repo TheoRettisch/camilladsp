@@ -3,8 +3,8 @@
 //! Each record type encodes and decodes its fields through one cursor, in one
 //! order, in this file. No other module indexes a published word.
 
-use super::control::{self, Control, Mode, Receipt, State};
-use super::{CHANNELS, Reason, Snapshot, Trip, identity};
+use super::control::{self, ControlSnapshot, Mode, Receipt, State};
+use super::{CHANNELS, Reason, Trip, identity};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) const GUARD_WORDS: usize = 45;
@@ -108,8 +108,12 @@ impl<'a> Decoder<'a> {
             .expect("Protection record layout overruns")
     }
 
-    fn flag(&mut self) -> bool {
-        self.take() != 0
+    fn flag(&mut self) -> Option<bool> {
+        match self.take() {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
     }
 
     fn finish(self) {
@@ -137,10 +141,35 @@ variants!(State: Inactive, Qualifying, Active, Tripped);
 variants!(Mode: Prearm, Armed);
 variants!(control::Result: Applied, Invalid, StateMismatch, NotQualified);
 
-impl Snapshot {
-    /// `sequence` belongs to the seqlock and `command_high_water` to the
-    /// owner; neither is part of the published record.
-    pub(super) fn encode(&self) -> [u64; GUARD_WORDS] {
+/// Processing-owner payload, excluding the acquisition sequence and private
+/// control replay fence. Playback consumption has a separate writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuardRecord {
+    pub pipeline: u64,
+    pub backend: u64,
+    pub reset: u64,
+    pub frame_floor: u64,
+    pub frames: u64,
+    pub processing_valid: bool,
+    pub source_begin_ns: u64,
+    pub source_end_ns: u64,
+    pub state: State,
+    pub candidate_observable: bool,
+    pub qualified_frames: u64,
+    pub short_power_veto: bool,
+    pub attempt_required: bool,
+    pub trip_generation: u64,
+    pub trip: Option<Trip>,
+    pub control: ControlSnapshot,
+    pub identity: identity::Identity,
+    pub final_guard: bool,
+    pub activity_generation: u64,
+    pub silent_frames: u64,
+    pub last_active_end_frame: u64,
+}
+
+impl GuardRecord {
+    pub(super) fn to_words(self) -> [u64; GUARD_WORDS] {
         let mut e = Encoder::new();
         e.put(self.pipeline);
         e.put(self.backend);
@@ -196,21 +225,21 @@ impl Snapshot {
 
     /// None for a word that no owner publishes; the caller reports it as an
     /// incoherent read, never as a default state.
-    pub(super) fn decode(sequence: u64, words: &[u64; GUARD_WORDS]) -> Option<Self> {
+    pub(super) fn from_words(words: &[u64; GUARD_WORDS]) -> Option<Self> {
         let mut d = Decoder::new(words);
         let pipeline = d.take();
         let backend = d.take();
         let reset = d.take();
         let frame_floor = d.take();
         let frames = d.take();
-        let processing_valid = d.flag();
+        let processing_valid = d.flag()?;
         let source_begin_ns = d.take();
         let source_end_ns = d.take();
         let state = State::decode(d.take())?;
-        let candidate_observable = d.flag();
+        let candidate_observable = d.flag()?;
         let qualified_frames = d.take();
-        let short_power_veto = d.flag();
-        let attempt_required = d.flag();
+        let short_power_veto = d.flag()?;
+        let attempt_required = d.flag()?;
         let trip_generation = d.take();
         let reason = d.take();
         let (generation, channel, frame, at_ns) = (d.take(), d.take(), d.take(), d.take());
@@ -219,7 +248,10 @@ impl Snapshot {
             reason => Some(Trip {
                 generation,
                 reason: Reason::decode(reason)?,
-                channel: channel.checked_sub(1).map(|c| c as usize),
+                channel: match channel.checked_sub(1) {
+                    Some(channel) => Some(usize::try_from(channel).ok()?),
+                    None => None,
+                },
                 frame,
                 at_ns,
             }),
@@ -248,13 +280,12 @@ impl Snapshot {
             graph: std::array::from_fn(|_| d.take()),
             profile: std::array::from_fn(|_| d.take()),
         };
-        let final_guard = d.flag();
+        let final_guard = d.flag()?;
         let activity_generation = d.take();
         let silent_frames = d.take();
         let last_active_end_frame = d.take();
         d.finish();
         Some(Self {
-            sequence,
             pipeline,
             backend,
             reset,
@@ -270,15 +301,13 @@ impl Snapshot {
             attempt_required,
             trip_generation,
             trip,
-            control: Control {
+            control: ControlSnapshot {
                 owner: (owner != 0).then_some(owner),
                 revision,
                 parent_reset_generation,
                 qualification_id,
                 mode,
                 last_command,
-                // Not exported: it is an owner-side replay fence, not status.
-                command_high_water: 0,
             },
             identity,
             final_guard,
@@ -322,7 +351,7 @@ pub(super) struct PlaybackRecord {
 }
 
 impl PlaybackRecord {
-    pub(super) fn encode(&self) -> [u64; PLAYBACK_WORDS] {
+    pub(super) fn to_words(self) -> [u64; PLAYBACK_WORDS] {
         let mut e = Encoder::new();
         e.put(self.pipeline);
         e.put(self.backend);
@@ -349,7 +378,9 @@ impl PlaybackRecord {
         e.finish()
     }
 
-    pub(super) fn decode(words: &[u64; PLAYBACK_WORDS]) -> Self {
+    /// Reject invalid field representations. Source/epoch validity and power
+    /// sanitization remain projections after coherent acquisition.
+    pub(super) fn from_words(words: &[u64; PLAYBACK_WORDS]) -> Option<Self> {
         let mut d = Decoder::new(words);
         let record = Self {
             pipeline: d.take(),
@@ -358,11 +389,11 @@ impl PlaybackRecord {
             floor: d.take(),
             submitted_frames: d.take(),
             consumed_frames: d.take(),
-            consumption_valid: d.flag(),
+            consumption_valid: d.flag()?,
             source_begin_ns: d.take(),
             source_end_ns: d.take(),
             telemetry: Telemetry {
-                valid: d.flag(),
+                valid: d.flag()?,
                 frame_begin: d.take(),
                 frame_end: d.take(),
                 source_begin_ns: d.take(),
@@ -371,12 +402,12 @@ impl PlaybackRecord {
                 write_end_ns: d.take(),
                 rms_power: std::array::from_fn(|_| f64::from_bits(d.take())),
             },
-            conversion_valid: d.flag(),
+            conversion_valid: d.flag()?,
             clipped_samples: d.take(),
             conversion_at_ns: d.take(),
         };
         d.finish();
-        record
+        Some(record)
     }
 }
 
@@ -384,11 +415,10 @@ impl PlaybackRecord {
 mod tests {
     use super::*;
 
-    /// Every field differs from every other, so a swapped or shifted word
-    /// cannot round-trip.
-    fn snapshot() -> Snapshot {
-        Snapshot {
-            sequence: 2,
+    /// Distinct counters, owner halves and hash words expose mismatched field
+    /// order; single-flag cases below distinguish the boolean positions.
+    fn guard_record() -> GuardRecord {
+        GuardRecord {
             pipeline: 101,
             backend: 102,
             reset: 103,
@@ -410,7 +440,7 @@ mod tests {
                 frame: 111,
                 at_ns: 112,
             }),
-            control: Control {
+            control: ControlSnapshot {
                 owner: Some((113 << 64) | 114),
                 revision: 115,
                 parent_reset_generation: 116,
@@ -426,7 +456,6 @@ mod tests {
                     parent_reset_generation: 123,
                     qualification_id: 124,
                 }),
-                command_high_water: 0,
             },
             identity: identity::Identity {
                 graph: [125, 126, 127, 128],
@@ -441,9 +470,9 @@ mod tests {
 
     #[test]
     fn guard_record_round_trips_every_field_and_each_flag_alone() {
-        let full = snapshot();
-        assert_eq!(Snapshot::decode(2, &full.encode()), Some(full));
-        let flags: [fn(&mut Snapshot) -> &mut bool; 5] = [
+        let full = guard_record();
+        assert_eq!(GuardRecord::from_words(&full.to_words()), Some(full));
+        let flags: [fn(&mut GuardRecord) -> &mut bool; 5] = [
             |s| &mut s.processing_valid,
             |s| &mut s.candidate_observable,
             |s| &mut s.short_power_veto,
@@ -451,26 +480,26 @@ mod tests {
             |s| &mut s.final_guard,
         ];
         for flag in flags {
-            let mut one = snapshot();
+            let mut one = guard_record();
             for other in flags {
                 *other(&mut one) = false;
             }
             *flag(&mut one) = true;
-            assert_eq!(Snapshot::decode(2, &one.encode()), Some(one));
+            assert_eq!(GuardRecord::from_words(&one.to_words()), Some(one));
         }
     }
 
     #[test]
     fn guard_record_round_trips_absent_and_every_enumerated_value() {
-        let mut empty = snapshot();
+        let mut empty = guard_record();
         empty.trip = None;
         empty.control.owner = None;
         empty.control.last_command = None;
-        assert_eq!(Snapshot::decode(2, &empty.encode()), Some(empty));
-        let mut unattributed = snapshot();
+        assert_eq!(GuardRecord::from_words(&empty.to_words()), Some(empty));
+        let mut unattributed = guard_record();
         unattributed.trip.as_mut().unwrap().channel = None;
         assert_eq!(
-            Snapshot::decode(2, &unattributed.encode()),
+            GuardRecord::from_words(&unattributed.to_words()),
             Some(unattributed)
         );
         for reason in [
@@ -483,9 +512,9 @@ mod tests {
             Reason::Tone,
             Reason::DcFrozen,
         ] {
-            let mut value = snapshot();
+            let mut value = guard_record();
             value.trip.as_mut().unwrap().reason = reason;
-            assert_eq!(Snapshot::decode(2, &value.encode()), Some(value));
+            assert_eq!(GuardRecord::from_words(&value.to_words()), Some(value));
         }
         for state in [
             State::Inactive,
@@ -494,10 +523,10 @@ mod tests {
             State::Tripped,
         ] {
             for mode in [Mode::Prearm, Mode::Armed] {
-                let mut value = snapshot();
+                let mut value = guard_record();
                 value.state = state;
                 value.control.mode = mode;
-                assert_eq!(Snapshot::decode(2, &value.encode()), Some(value));
+                assert_eq!(GuardRecord::from_words(&value.to_words()), Some(value));
             }
         }
         for result in [
@@ -506,29 +535,29 @@ mod tests {
             control::Result::StateMismatch,
             control::Result::NotQualified,
         ] {
-            let mut value = snapshot();
+            let mut value = guard_record();
             value.control.last_command.as_mut().unwrap().result = result;
-            assert_eq!(Snapshot::decode(2, &value.encode()), Some(value));
+            assert_eq!(GuardRecord::from_words(&value.to_words()), Some(value));
         }
     }
 
     #[test]
-    fn unpublished_enumeration_words_are_rejected_not_defaulted() {
-        let words = snapshot().encode();
+    fn unpublished_guard_enum_and_flag_words_are_rejected_not_defaulted() {
+        let words = guard_record().to_words();
         let mut rejected = 0;
         for index in 0..GUARD_WORDS {
             let mut corrupt = words;
             corrupt[index] = u64::MAX;
-            if Snapshot::decode(2, &corrupt).is_none() {
+            if GuardRecord::from_words(&corrupt).is_none() {
                 rejected += 1;
             }
         }
-        // State, trip reason, control mode and receipt result.
-        assert_eq!(rejected, 4);
+        // State, trip reason, control mode, receipt result and five flags.
+        assert_eq!(rejected, 9);
     }
 
     #[test]
-    fn playback_record_round_trips_every_field() {
+    fn playback_record_round_trips_every_field_and_each_flag_alone() {
         let record = PlaybackRecord {
             pipeline: 201,
             backend: 202,
@@ -553,19 +582,36 @@ mod tests {
             clipped_samples: 215,
             conversion_at_ns: 216,
         };
-        assert_eq!(PlaybackRecord::decode(&record.encode()), record);
-        let only_conversion = PlaybackRecord {
-            conversion_valid: true,
-            ..Default::default()
-        };
+        assert_eq!(PlaybackRecord::from_words(&record.to_words()), Some(record));
+        let flags: [fn(&mut PlaybackRecord) -> &mut bool; 3] = [
+            |p| &mut p.consumption_valid,
+            |p| &mut p.telemetry.valid,
+            |p| &mut p.conversion_valid,
+        ];
+        for flag in flags {
+            let mut one = record;
+            for other in flags {
+                *other(&mut one) = false;
+            }
+            *flag(&mut one) = true;
+            assert_eq!(PlaybackRecord::from_words(&one.to_words()), Some(one));
+        }
         assert_eq!(
-            PlaybackRecord::decode(&only_conversion.encode()),
-            only_conversion
+            PlaybackRecord::from_words(&[0; PLAYBACK_WORDS]),
+            Some(PlaybackRecord::default())
         );
-        assert_eq!(
-            PlaybackRecord::decode(&[0; PLAYBACK_WORDS]),
-            PlaybackRecord::default()
-        );
+        let words = record.to_words();
+        let mut rejected = 0;
+        for index in 0..PLAYBACK_WORDS {
+            let mut corrupt = words;
+            corrupt[index] = u64::MAX;
+            if PlaybackRecord::from_words(&corrupt).is_none() {
+                rejected += 1;
+            }
+        }
+        // Only the three flags have a restricted word representation. Powers
+        // remain raw f64 bits, including nonfinite values sanitized by status.
+        assert_eq!(rejected, flags.len());
     }
 
     #[test]

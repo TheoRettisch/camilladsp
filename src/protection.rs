@@ -19,8 +19,9 @@ pub mod playback;
 mod policy;
 mod record;
 pub mod wire;
-use control::{Command, Control, Mode, Operation, State};
+use control::{Command, Control, Mode, Operation};
 use record::AtomicRecord;
+pub use record::GuardRecord;
 
 pub const CHANNELS: usize = 24;
 pub const FRAMES: usize = 256;
@@ -184,31 +185,12 @@ impl Default for Shared {
     }
 }
 
-/// Coherent processing-owner record. Playback consumption has a separate writer.
+/// Coherent processing-owner payload with its acquisition sequence. The
+/// sequence is transport metadata, never a field encoded by the owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub sequence: u64,
-    pub pipeline: u64,
-    pub backend: u64,
-    pub reset: u64,
-    pub frame_floor: u64,
-    pub frames: u64,
-    pub processing_valid: bool,
-    pub source_begin_ns: u64,
-    pub source_end_ns: u64,
-    pub state: State,
-    pub candidate_observable: bool,
-    pub qualified_frames: u64,
-    pub short_power_veto: bool,
-    pub attempt_required: bool,
-    pub trip_generation: u64,
-    pub trip: Option<Trip>,
-    pub control: Control,
-    pub identity: identity::Identity,
-    pub final_guard: bool,
-    pub activity_generation: u64,
-    pub silent_frames: u64,
-    pub last_active_end_frame: u64,
+    pub record: GuardRecord,
 }
 
 impl Shared {
@@ -238,14 +220,14 @@ impl Shared {
         if sequence == 0 {
             return None;
         }
-        let snapshot = Snapshot::decode(sequence, &words)?;
-        (snapshot.pipeline == epoch
-            && snapshot.reset == reset
-            && snapshot.backend == backend
+        let record = GuardRecord::from_words(&words)?;
+        (record.pipeline == epoch
+            && record.reset == reset
+            && record.backend == backend
             && epoch == self.epoch.load(Ordering::SeqCst)
             && reset == self.reset.load(Ordering::SeqCst)
             && backend == self.backend.load(Ordering::SeqCst))
-        .then_some(snapshot)
+        .then_some(Snapshot { sequence, record })
     }
 }
 
@@ -418,8 +400,7 @@ impl Guard {
     }
 
     fn publish(&self) {
-        let record = Snapshot {
-            sequence: 0, // Assigned by the record, not by its owner.
+        let record = GuardRecord {
             pipeline: self.epoch,
             backend: self.backend,
             reset: self.reset,
@@ -435,14 +416,14 @@ impl Guard {
             attempt_required: self.attempt_required,
             trip_generation: self.trip_generation,
             trip: self.trip,
-            control: self.control,
+            control: self.control.snapshot(),
             identity: self.identity.unwrap_or_default(),
             final_guard: self.parameters.is_some() && self.identity.is_some(),
             activity_generation: self.activity_generation,
             silent_frames: self.silent_frames,
             last_active_end_frame: self.last_active_end_frame,
         };
-        self.shared.guard_record.publish(record.encode());
+        self.shared.guard_record.publish(record.to_words());
     }
 
     pub fn process(&mut self, chunk: &mut AudioChunk) {
@@ -932,8 +913,8 @@ pub(crate) mod tests {
         input.waveforms[0][0] = 1.0;
         guard.process(&mut input);
         let first = guard.shared.guard_snapshot().unwrap();
-        assert_eq!(first.trip, guard.trip);
-        assert_eq!(first.trip.unwrap().reason, Reason::Peak);
+        assert_eq!(first.record.trip, guard.trip);
+        assert_eq!(first.record.trip.unwrap().reason, Reason::Peak);
         assert_eq!(guard.shared.guard_snapshot(), Some(first));
     }
 

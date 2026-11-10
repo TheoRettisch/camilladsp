@@ -143,17 +143,23 @@ impl Shared {
     fn status_value(&self) -> Result<Value, &'static str> {
         let host = self.host.as_ref().ok_or("unavailable")?;
         for _ in 0..3 {
-            let Some(guard) = self.guard_snapshot_once() else {
+            let Some(super::Snapshot {
+                sequence: guard_sequence,
+                record: guard,
+            }) = self.guard_snapshot_once()
+            else {
                 continue;
             };
             let Some((sequence, words)) = self.playback_record.read_once() else {
                 continue;
             };
-            let p = PlaybackRecord::decode(&words);
+            let Some(p) = PlaybackRecord::from_words(&words) else {
+                continue;
+            };
             if sequence == 0
                 || p.pipeline != guard.pipeline
                 || p.backend != guard.backend
-                || self.guard_record.sequence() != guard.sequence
+                || self.guard_record.sequence() != guard_sequence
                 || self.playback_record.sequence() != sequence
                 || self.epoch.load(Ordering::SeqCst) != guard.pipeline
                 || self.backend.load(Ordering::SeqCst) != guard.backend
@@ -215,7 +221,7 @@ impl Shared {
                 "control": {"owner": guard.control.owner.map(uuid_text), "revision": guard.control.revision,
                     "parent_reset_generation": guard.control.parent_reset_generation, "qualification_id": guard.control.qualification_id,
                     "mode": if guard.control.mode == Mode::Armed {"armed"} else {"prearm"}, "last_command": receipt},
-                "processing": {"valid": guard.processing_valid, "sequence": guard.sequence, "frames": guard.frames,
+                "processing": {"valid": guard.processing_valid, "sequence": guard_sequence, "frames": guard.frames,
                     "source_begin_ns": if guard.processing_valid { guard.source_begin_ns } else {0},
                     "source_end_ns": if guard.processing_valid { guard.source_end_ns } else {0}},
                 "playback": {"valid": playback.valid, "sequence": playback.sequence,
