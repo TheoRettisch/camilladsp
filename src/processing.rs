@@ -917,6 +917,93 @@ mod tests {
         handle.join().unwrap();
     }
 
+    fn status_reply(reply: Option<String>) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(&reply.unwrap()).unwrap()["GetProtectionStatus"]
+            .clone()
+    }
+
+    #[test]
+    fn stopped_dsp_still_reports_its_latched_trip_after_playback_retires() {
+        use crate::protection::playback::Playback;
+        let params = Arc::new(ProcessingParameters::default());
+        let (tx_pb, rx_pb) = crossbeam_channel::unbounded();
+        let (tx_cap, rx_cap) = crossbeam_channel::unbounded();
+        let (_tx_conf, rx_conf) = crossbeam_channel::unbounded();
+        let barrier = Arc::new(Barrier::new(2));
+        let handle = run_processing(
+            configuration(),
+            barrier.clone(),
+            tx_pb,
+            rx_cap,
+            rx_conf,
+            params.clone(),
+        );
+        barrier.wait();
+        let playback = Playback::new(params.protection.clone());
+        let mut unsafe_input = chunk();
+        unsafe_input.waveforms[1][9] = 1.0;
+        tx_cap.send(AudioMessage::Audio(unsafe_input)).unwrap();
+        tx_cap.send(AudioMessage::EndOfStream).unwrap();
+        for _ in 0..2 {
+            rx_pb.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        // The processing owner publishes for the last time and exits before
+        // the playback owner retires its backend, as on an ordinary stop.
+        handle.join().unwrap();
+        let running = params.protection.guard_snapshot().unwrap();
+        drop(playback);
+        assert!(params.protection.guard_snapshot().is_none());
+        assert_eq!(
+            status_reply(
+                params
+                    .protection
+                    .protection_reply("\"GetProtectionStatus\"")
+            )["code"],
+            "incoherent"
+        );
+
+        let reply = status_reply(params.protection_reply("\"GetProtectionStatus\""));
+        assert_eq!(reply["result"], "Ok", "{reply}");
+        let status = &reply["value"];
+        assert_eq!(status["trip"]["latched"], true);
+        assert_eq!(status["trip"]["reason"], "peak");
+        assert_eq!(status["trip"]["channel"], 1);
+        assert_eq!(status["trip"]["frame"], 9);
+        assert_eq!(status["guard"]["state"], "tripped");
+        // The retired backend's frames and evidence are gone, not relabelled.
+        assert_eq!(status["epoch"]["backend"], running.backend + 1);
+        assert_eq!(status["epoch"]["pipeline"], running.pipeline);
+        for owner in ["processing", "playback"] {
+            assert_eq!(status[owner]["valid"], false);
+            assert_eq!(status[owner]["frames"], 0);
+        }
+        assert_eq!(status["telemetry"]["valid"], false);
+        let settled = params.protection.guard_snapshot().unwrap();
+        assert_eq!(settled.trip, running.trip);
+        // Nothing further retires: a repeated read publishes nothing.
+        status_reply(params.protection_reply("\"GetProtectionStatus\""));
+        assert_eq!(params.protection.guard_snapshot(), Some(settled));
+    }
+
+    #[test]
+    fn status_read_never_waits_for_or_writes_beside_a_live_owner() {
+        use crate::protection::playback::Playback;
+        let params = Arc::new(ProcessingParameters::default());
+        let mut owner = params.protection_owner.lock().unwrap();
+        owner.install(&configuration()).unwrap();
+        drop(Playback::new(params.protection.clone()));
+        // The live owner has not yet serviced the retirement. The reader
+        // returns at once and leaves the record to that owner.
+        let reader = params.clone();
+        let reply = thread::spawn(move || reader.protection_reply("\"GetProtectionStatus\""))
+            .join()
+            .unwrap();
+        assert_eq!(status_reply(reply)["code"], "incoherent");
+        assert!(params.protection.guard_snapshot().is_none());
+        owner.backend_wakeup();
+        assert!(params.protection.guard_snapshot().is_some());
+    }
+
     #[test]
     fn poisoned_owner_reaches_startup_barrier_and_stops_without_audio() {
         let params = Arc::new(ProcessingParameters::default());

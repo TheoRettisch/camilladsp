@@ -5,6 +5,8 @@ use super::{
     Shared,
     control::{self, Command, Expected, Mode, Operation},
     identity,
+    playback::Progress,
+    record::PlaybackRecord,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -144,14 +146,15 @@ impl Shared {
             let Some(guard) = self.guard_snapshot_once() else {
                 continue;
             };
-            let Some((sequence, p)) = self.playback_record.read_once() else {
+            let Some((sequence, words)) = self.playback_record.read_once() else {
                 continue;
             };
+            let p = PlaybackRecord::decode(&words);
             if sequence == 0
-                || p[0] != guard.pipeline
-                || p[1] != guard.backend
-                || self.guard_record.sequence.load(Ordering::SeqCst) != guard.sequence
-                || self.playback_record.sequence.load(Ordering::SeqCst) != sequence
+                || p.pipeline != guard.pipeline
+                || p.backend != guard.backend
+                || self.guard_record.sequence() != guard.sequence
+                || self.playback_record.sequence() != sequence
                 || self.epoch.load(Ordering::SeqCst) != guard.pipeline
                 || self.backend.load(Ordering::SeqCst) != guard.backend
                 || self.reset.load(Ordering::SeqCst) != guard.reset
@@ -159,8 +162,11 @@ impl Shared {
                 continue;
             }
             let now = super::monotonic_ns();
-            let current_reset = p[2] == guard.reset;
-            let mut telemetry_valid = current_reset && p[9] != 0 && p[10] >= guard.frame_floor;
+            let playback = Progress::of(sequence, &p, &guard);
+            let telemetry = p.telemetry;
+            let mut telemetry_valid = p.reset == guard.reset
+                && telemetry.valid
+                && telemetry.frame_begin >= guard.frame_floor;
             let receipt = guard.control.last_command.map(|r| json!({
                 "command_id": r.command_id, "result": receipt_result(r.result),
                 "applied_epoch": epoch(host, r.pipeline, r.backend, r.reset),
@@ -183,7 +189,7 @@ impl Shared {
                 control::State::Active => "active",
                 control::State::Tripped => "tripped",
             };
-            let mut powers: Vec<f64> = p[16..40].iter().map(|bits| f64::from_bits(*bits)).collect();
+            let mut powers = telemetry.rms_power.to_vec();
             if powers
                 .iter()
                 .any(|power| !power.is_finite() || *power < 0.0)
@@ -212,15 +218,17 @@ impl Shared {
                 "processing": {"valid": guard.processing_valid, "sequence": guard.sequence, "frames": guard.frames,
                     "source_begin_ns": if guard.processing_valid { guard.source_begin_ns } else {0},
                     "source_end_ns": if guard.processing_valid { guard.source_end_ns } else {0}},
-                "playback": {"valid": current_reset && p[5] != 0 && p[4] > guard.frame_floor, "sequence": sequence,
-                    "frames": p[4], "submitted_frames": p[3], "source_begin_ns": if current_reset {p[6]} else {0},
-                    "source_end_ns": if current_reset {p[7]} else {0}},
-                "telemetry": {"valid": telemetry_valid, "frame_begin": p[10], "frame_end": p[11],
-                    "source_begin_ns": p[12], "source_end_ns": p[13], "write_begin_ns": p[14], "write_end_ns": p[15],
+                "playback": {"valid": playback.valid, "sequence": playback.sequence,
+                    "frames": playback.frames, "submitted_frames": playback.submitted_frames,
+                    "source_begin_ns": playback.source_begin_ns, "source_end_ns": playback.source_end_ns},
+                "telemetry": {"valid": telemetry_valid, "frame_begin": telemetry.frame_begin, "frame_end": telemetry.frame_end,
+                    "source_begin_ns": telemetry.source_begin_ns, "source_end_ns": telemetry.source_end_ns,
+                    "write_begin_ns": telemetry.write_begin_ns, "write_end_ns": telemetry.write_end_ns,
                     "present": if telemetry_valid {(0..super::CHANNELS).collect::<Vec<_>>()} else {Vec::new()}, "rms_power": powers},
                 "activity": {"valid": guard.processing_valid, "generation": guard.activity_generation,
                     "through_frame": guard.frames, "silent_frames": guard.silent_frames, "last_active_end_frame": guard.last_active_end_frame},
-                "conversion": {"valid": p[40] != 0, "clipped_samples": p[41], "checked_at_ns": p[42]},
+                "conversion": {"valid": p.conversion_valid, "clipped_samples": p.clipped_samples,
+                    "checked_at_ns": p.conversion_at_ns},
             }));
         }
         Err("incoherent")

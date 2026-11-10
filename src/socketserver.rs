@@ -583,10 +583,8 @@ macro_rules! make_handler {
                     match msg_res {
                         Ok(msg) => {
                             if let Message::Text(text) = &msg
-                                && let Some(reply) = shared_data_inst
-                                    .processing_params
-                                    .protection
-                                    .protection_reply(text)
+                                && let Some(reply) =
+                                    shared_data_inst.processing_params.protection_reply(text)
                             {
                                 if websocket.send(Message::text(reply)).is_err() {
                                     break;

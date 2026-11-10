@@ -17,8 +17,10 @@ pub mod identity;
 mod lifecycle_tests;
 pub mod playback;
 mod policy;
+mod record;
 pub mod wire;
-use control::{Command, Control, Mode, Operation, Receipt, State};
+use control::{Command, Control, Mode, Operation, State};
+use record::AtomicRecord;
 
 pub const CHANNELS: usize = 24;
 pub const FRAMES: usize = 256;
@@ -121,57 +123,6 @@ pub fn admission(conf: &config::Configuration) -> Res<Parameters> {
     })
 }
 
-/// Every element is atomic; the sequence counter does not excuse non-atomic
-/// seqlock reads. SeqCst gives a simple auditable ordering for this small record.
-#[derive(Debug)]
-struct AtomicRecord<const N: usize> {
-    sequence: AtomicU64,
-    values: [AtomicU64; N],
-}
-
-impl<const N: usize> Default for AtomicRecord<N> {
-    fn default() -> Self {
-        Self {
-            sequence: AtomicU64::new(0),
-            values: std::array::from_fn(|_| AtomicU64::new(0)),
-        }
-    }
-}
-
-impl<const N: usize> AtomicRecord<N> {
-    // There is exactly one audio owner per record. Readers never write or wait.
-    fn publish(&self, values: [u64; N]) {
-        let sequence = self.sequence.load(Ordering::SeqCst);
-        assert!(
-            sequence < i64::MAX as u64 - 2,
-            "Protection sequence exhausted"
-        );
-        self.sequence.store(sequence + 1, Ordering::SeqCst);
-        for (target, value) in self.values.iter().zip(values) {
-            target.store(value, Ordering::SeqCst);
-        }
-        self.sequence.store(sequence + 2, Ordering::SeqCst);
-    }
-
-    fn read(&self) -> Option<(u64, [u64; N])> {
-        for _ in 0..3 {
-            if let Some(record) = self.read_once() {
-                return Some(record);
-            }
-        }
-        None
-    }
-
-    fn read_once(&self) -> Option<(u64, [u64; N])> {
-        let before = self.sequence.load(Ordering::SeqCst);
-        if before & 1 != 0 {
-            return None;
-        }
-        let values = std::array::from_fn(|i| self.values[i].load(Ordering::SeqCst));
-        (before == self.sequence.load(Ordering::SeqCst)).then_some((before, values))
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
 pub enum Reason {
@@ -199,8 +150,8 @@ pub struct Shared {
     epoch: AtomicU64,
     backend: AtomicU64,
     reset: AtomicU64,
-    guard_record: AtomicRecord<44>,
-    playback_record: AtomicRecord<43>,
+    guard_record: AtomicRecord<{ record::GUARD_WORDS }>,
+    playback_record: AtomicRecord<{ record::PLAYBACK_WORDS }>,
     host: Option<wire::Host>,
     conversion_count: AtomicU64,
     #[cfg(any(test, feature = "protection-test-capture"))]
@@ -283,101 +234,18 @@ impl Shared {
         let epoch = self.epoch.load(Ordering::SeqCst);
         let backend = self.backend.load(Ordering::SeqCst);
         let reset = self.reset.load(Ordering::SeqCst);
-        let (sequence, v) = self.guard_record.read_once()?;
-        if sequence == 0
-            || v[0] != epoch
-            || v[9] != reset
-            || v[29] != backend
-            || epoch != self.epoch.load(Ordering::SeqCst)
-            || reset != self.reset.load(Ordering::SeqCst)
-            || backend != self.backend.load(Ordering::SeqCst)
-        {
+        let (sequence, words) = self.guard_record.read_once()?;
+        if sequence == 0 {
             return None;
         }
-        let trip = match v[5] {
-            0 => None,
-            reason => Some(Trip {
-                generation: v[4],
-                reason: match reason {
-                    1 => Reason::Peak,
-                    2 => Reason::Nonfinite,
-                    3 => Reason::Coverage,
-                    4 => Reason::Rms,
-                    5 => Reason::ShortPower,
-                    6 => Reason::LongPower,
-                    7 => Reason::Tone,
-                    8 => Reason::DcFrozen,
-                    _ => return None,
-                },
-                channel: v[6].checked_sub(1).map(|c| c as usize),
-                frame: v[7],
-                at_ns: v[8],
-            }),
-        };
-        let result = match v[22] {
-            0 => None,
-            1 => Some(control::Result::Applied),
-            2 => Some(control::Result::Invalid),
-            3 => Some(control::Result::StateMismatch),
-            4 => Some(control::Result::NotQualified),
-            _ => return None,
-        };
-        let owner = (u128::from(v[15]) << 64) | u128::from(v[16]);
-        Some(Snapshot {
-            sequence,
-            pipeline: v[0],
-            backend: v[29],
-            frames: v[1],
-            source_begin_ns: v[2],
-            source_end_ns: v[3],
-            trip_generation: v[4],
-            trip,
-            reset: v[9],
-            frame_floor: v[10],
-            state: match v[11] {
-                0 => State::Inactive,
-                1 => State::Qualifying,
-                2 => State::Active,
-                3 => State::Tripped,
-                _ => return None,
-            },
-            candidate_observable: v[12] != 0,
-            qualified_frames: v[13],
-            short_power_veto: v[43] != 0,
-            attempt_required: v[14] != 0,
-            processing_valid: v[28] != 0,
-            control: Control {
-                owner: (owner != 0).then_some(owner),
-                revision: v[17],
-                parent_reset_generation: v[18],
-                qualification_id: v[19],
-                mode: if v[20] == 0 {
-                    Mode::Prearm
-                } else {
-                    Mode::Armed
-                },
-                last_command: result.map(|result| Receipt {
-                    command_id: v[21],
-                    result,
-                    pipeline: v[23],
-                    backend: v[30],
-                    reset: v[24],
-                    revision: v[25],
-                    parent_reset_generation: v[26],
-                    qualification_id: v[27],
-                }),
-                // Not exported: it is an owner-side replay fence, not status.
-                command_high_water: 0,
-            },
-            identity: identity::Identity {
-                graph: v[31..35].try_into().unwrap(),
-                profile: v[35..39].try_into().unwrap(),
-            },
-            final_guard: v[39] != 0,
-            activity_generation: v[40],
-            silent_frames: v[41],
-            last_active_end_frame: v[42],
-        })
+        let snapshot = Snapshot::decode(sequence, &words)?;
+        (snapshot.pipeline == epoch
+            && snapshot.reset == reset
+            && snapshot.backend == backend
+            && epoch == self.epoch.load(Ordering::SeqCst)
+            && reset == self.reset.load(Ordering::SeqCst)
+            && backend == self.backend.load(Ordering::SeqCst))
+        .then_some(snapshot)
     }
 }
 
@@ -550,64 +418,31 @@ impl Guard {
     }
 
     fn publish(&self) {
-        let (_, reason, channel, frame, at_ns) = self.trip.map_or((0, 0, 0, 0, 0), |t| {
-            (
-                t.generation,
-                t.reason as u64,
-                t.channel.map_or(0, |c| c as u64 + 1),
-                t.frame,
-                t.at_ns,
-            )
-        });
-        let owner = self.control.owner.unwrap_or(0);
-        let receipt = self.control.last_command;
-        let identity = self.identity.unwrap_or_default();
-        self.shared.guard_record.publish([
-            self.epoch,
-            self.frames,
-            self.source_begin_ns,
-            self.source_end_ns,
-            self.trip_generation,
-            reason,
-            channel,
-            frame,
-            at_ns,
-            self.reset,
-            self.frame_floor,
-            self.state() as u64,
-            self.candidate_observable as u64,
-            self.qualified_frames,
-            self.attempt_required as u64,
-            (owner >> 64) as u64,
-            owner as u64,
-            self.control.revision,
-            self.control.parent_reset_generation,
-            self.control.qualification_id,
-            self.control.mode as u64,
-            receipt.map_or(0, |r| r.command_id),
-            receipt.map_or(0, |r| r.result as u64),
-            receipt.map_or(0, |r| r.pipeline),
-            receipt.map_or(0, |r| r.reset),
-            receipt.map_or(0, |r| r.revision),
-            receipt.map_or(0, |r| r.parent_reset_generation),
-            receipt.map_or(0, |r| r.qualification_id),
-            self.processing_valid as u64,
-            self.backend,
-            receipt.map_or(0, |r| r.backend),
-            identity.graph[0],
-            identity.graph[1],
-            identity.graph[2],
-            identity.graph[3],
-            identity.profile[0],
-            identity.profile[1],
-            identity.profile[2],
-            identity.profile[3],
-            (self.parameters.is_some() && self.identity.is_some()) as u64,
-            self.activity_generation,
-            self.silent_frames,
-            self.last_active_end_frame,
-            self.short_power_veto as u64,
-        ]);
+        let record = Snapshot {
+            sequence: 0, // Assigned by the record, not by its owner.
+            pipeline: self.epoch,
+            backend: self.backend,
+            reset: self.reset,
+            frame_floor: self.frame_floor,
+            frames: self.frames,
+            processing_valid: self.processing_valid,
+            source_begin_ns: self.source_begin_ns,
+            source_end_ns: self.source_end_ns,
+            state: self.state(),
+            candidate_observable: self.candidate_observable,
+            qualified_frames: self.qualified_frames,
+            short_power_veto: self.short_power_veto,
+            attempt_required: self.attempt_required,
+            trip_generation: self.trip_generation,
+            trip: self.trip,
+            control: self.control,
+            identity: self.identity.unwrap_or_default(),
+            final_guard: self.parameters.is_some() && self.identity.is_some(),
+            activity_generation: self.activity_generation,
+            silent_frames: self.silent_frames,
+            last_active_end_frame: self.last_active_end_frame,
+        };
+        self.shared.guard_record.publish(record.encode());
     }
 
     pub fn process(&mut self, chunk: &mut AudioChunk) {
@@ -1091,21 +926,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn atomic_publication_is_bounded_and_does_not_consume_trip() {
+    fn reading_the_published_record_does_not_consume_the_trip() {
         let mut guard = guard();
         let mut input = chunk();
         input.waveforms[0][0] = 1.0;
         guard.process(&mut input);
-        let first = guard.shared.guard_record.read().unwrap();
-        assert_eq!(first.1[5], Reason::Peak as u64);
-        assert_eq!(guard.shared.guard_record.read(), Some(first));
-        guard
-            .shared
-            .guard_record
-            .sequence
-            .store(first.0 + 1, Ordering::SeqCst);
-        assert!(guard.shared.guard_record.read().is_none());
+        let first = guard.shared.guard_snapshot().unwrap();
+        assert_eq!(first.trip, guard.trip);
+        assert_eq!(first.trip.unwrap().reason, Reason::Peak);
+        assert_eq!(guard.shared.guard_snapshot(), Some(first));
     }
+
     #[test]
     fn ordinary_mute_ramps_and_interruptions_match_original_volume() {
         use crate::filters::basicfilters::Volume;

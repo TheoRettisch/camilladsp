@@ -1,5 +1,6 @@
 //! Exact direct-PCM ring accounting. Submission and consumption are distinct.
 
+use super::record::{PlaybackRecord, Telemetry};
 use super::{Shared, Stamp, bump};
 use std::sync::{Arc, atomic::Ordering};
 
@@ -93,7 +94,7 @@ pub struct Playback {
     reset: u64,
     floor: u64,
     ring: Ring,
-    telemetry: [u64; 31],
+    telemetry: Telemetry,
     conversion_valid: bool,
     conversion_at: u64,
 }
@@ -107,7 +108,7 @@ impl Playback {
             shared,
             floor: 0,
             ring: Ring::default(),
-            telemetry: [0; 31],
+            telemetry: Telemetry::default(),
             conversion_valid: false,
             conversion_at: 0,
         };
@@ -122,7 +123,7 @@ impl Playback {
         self.reset = self.shared.reset.load(Ordering::SeqCst);
         self.floor = 0;
         self.ring = Ring::default();
-        self.telemetry = [0; 31];
+        self.telemetry = Telemetry::default();
         self.conversion_valid = false;
         self.conversion_at = 0;
         self.publish();
@@ -145,7 +146,7 @@ impl Playback {
             self.reset = guard.reset;
             self.floor = guard.frame_floor;
             self.ring.reset_evidence();
-            self.telemetry = [0; 31];
+            self.telemetry = Telemetry::default();
             self.publish();
         }
         true
@@ -184,18 +185,16 @@ impl Playback {
         {
             return;
         }
-        self.telemetry[..7].copy_from_slice(&[
-            1,
-            stamp.frame_begin,
-            stamp.frame_end,
-            stamp.source_begin_ns,
-            stamp.source_end_ns,
-            begin,
-            end,
-        ]);
-        for (slot, power) in self.telemetry[7..].iter_mut().zip(stamp.rms_power) {
-            *slot = power.to_bits();
-        }
+        self.telemetry = Telemetry {
+            valid: true,
+            frame_begin: stamp.frame_begin,
+            frame_end: stamp.frame_end,
+            source_begin_ns: stamp.source_begin_ns,
+            source_end_ns: stamp.source_end_ns,
+            write_begin_ns: begin,
+            write_end_ns: end,
+            rms_power: stamp.rms_power,
+        };
         self.publish();
     }
 
@@ -226,23 +225,22 @@ impl Playback {
     }
 
     fn publish(&self) {
-        let mut record = [0; 43];
-        record[..9].copy_from_slice(&[
-            self.pipeline,
-            self.backend,
-            self.reset,
-            self.ring.submitted,
-            self.ring.consumed,
-            self.ring.valid as u64,
-            self.ring.source_begin,
-            self.ring.source_end,
-            self.floor,
-        ]);
-        record[9..40].copy_from_slice(&self.telemetry);
-        record[40] = self.conversion_valid as u64;
-        record[41] = self.shared.conversion_count.load(Ordering::SeqCst);
-        record[42] = self.conversion_at;
-        self.shared.playback_record.publish(record);
+        let record = PlaybackRecord {
+            pipeline: self.pipeline,
+            backend: self.backend,
+            reset: self.reset,
+            floor: self.floor,
+            submitted_frames: self.ring.submitted,
+            consumed_frames: self.ring.consumed,
+            consumption_valid: self.ring.valid,
+            source_begin_ns: self.ring.source_begin,
+            source_end_ns: self.ring.source_end,
+            telemetry: self.telemetry,
+            conversion_valid: self.conversion_valid,
+            clipped_samples: self.shared.conversion_count.load(Ordering::SeqCst),
+            conversion_at_ns: self.conversion_at,
+        };
+        self.shared.playback_record.publish(record.encode());
     }
 }
 
@@ -252,33 +250,52 @@ impl Drop for Playback {
     }
 }
 
+impl Progress {
+    /// The one reading of a playback record against the guard record it was
+    /// read with. A paused reset receipt stays readable: old playback source
+    /// times are invalidated, never relabelled as evidence of the new reset
+    /// lifetime.
+    pub(super) fn of(sequence: u64, record: &PlaybackRecord, guard: &super::Snapshot) -> Self {
+        let current_reset = record.reset == guard.reset;
+        Self {
+            sequence,
+            pipeline: record.pipeline,
+            backend: record.backend,
+            reset: guard.reset,
+            submitted_frames: record.submitted_frames,
+            frames: record.consumed_frames,
+            valid: current_reset
+                && record.consumption_valid
+                && record.consumed_frames > guard.frame_floor,
+            source_begin_ns: if current_reset {
+                record.source_begin_ns
+            } else {
+                0
+            },
+            source_end_ns: if current_reset {
+                record.source_end_ns
+            } else {
+                0
+            },
+        }
+    }
+}
+
 impl Shared {
     pub fn playback_snapshot(&self) -> Option<Progress> {
         let guard = self.guard_snapshot()?;
-        let (sequence, v) = self.playback_record.read()?;
-        if sequence == 0 || v[0] != guard.pipeline || v[1] != guard.backend {
+        let (sequence, words) = self.playback_record.read()?;
+        let record = PlaybackRecord::decode(&words);
+        if sequence == 0 || record.pipeline != guard.pipeline || record.backend != guard.backend {
             return None;
         }
-        let current_reset = v[2] == guard.reset;
-        // A paused reset receipt stays readable. Old playback source times are
-        // invalidated, never relabelled as evidence of the new reset lifetime.
         let current = self.guard_snapshot()?;
         if (guard.pipeline, guard.backend, guard.reset)
             != (current.pipeline, current.backend, current.reset)
         {
             return None;
         }
-        Some(Progress {
-            sequence,
-            pipeline: v[0],
-            backend: v[1],
-            reset: guard.reset,
-            submitted_frames: v[3],
-            frames: v[4],
-            valid: current_reset && v[5] != 0 && v[4] > guard.frame_floor,
-            source_begin_ns: if current_reset { v[6] } else { 0 },
-            source_end_ns: if current_reset { v[7] } else { 0 },
-        })
+        Some(Progress::of(sequence, &record, &guard))
     }
 }
 
@@ -286,8 +303,9 @@ impl Shared {
 impl Shared {
     /// Frame end of the last completed-write telemetry, if any was credited.
     pub(crate) fn completed_frame_end(&self) -> Option<u64> {
-        let (_, v) = self.playback_record.read()?;
-        (v[9] != 0).then_some(v[11])
+        let (_, words) = self.playback_record.read()?;
+        let telemetry = PlaybackRecord::decode(&words).telemetry;
+        telemetry.valid.then_some(telemetry.frame_end)
     }
 }
 

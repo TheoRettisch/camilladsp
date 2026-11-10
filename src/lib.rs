@@ -249,8 +249,9 @@ pub(crate) fn update_playback_signal_status(
 #[derive(Debug)]
 pub struct ProcessingParameters {
     pub protection: Arc<protection::Shared>,
-    // Acquired only when transferring the single processing-owner lifetime.
-    // Status readers use atomic records and never acquire this ownership lock.
+    // Held by the processing thread for its whole lifetime: the single owner.
+    // Status readers copy atomic records and never wait for this lock; they
+    // only try it, to service an owner that no thread currently is.
     pub protection_owner: std::sync::Mutex<protection::Guard>,
     // Optimization: volumes are actually `f32`s, but by representing their
     // bits as a `u32` of equal size we can use atomic operations instead of a
@@ -267,6 +268,23 @@ impl ProcessingParameters {
 
     pub const DEFAULT_VOLUME: f32 = 0.0;
     pub const DEFAULT_MUTE: bool = false;
+
+    /// Protection operations for one socket message; None for any other.
+    ///
+    /// Playback retires its backend when it stops, usually after the
+    /// processing thread has published for the last time and exited. With no
+    /// owner left to rebase onto the new backend generation, every status
+    /// read would stay incoherent, hiding a latched trip, until the next run.
+    /// An unowned guard is therefore synchronized here first. A live owner
+    /// holds the lock and is never waited for.
+    pub fn protection_reply(&self, text: &str) -> Option<String> {
+        if self.protection.guard_snapshot().is_none()
+            && let Ok(mut idle) = self.protection_owner.try_lock()
+        {
+            idle.backend_wakeup();
+        }
+        self.protection.protection_reply(text)
+    }
 
     pub fn new(initial_volumes: &[f32; 5], initial_mutes: &[bool; 5]) -> Self {
         let protection = Arc::new(protection::Shared::default());
