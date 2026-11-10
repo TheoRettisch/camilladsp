@@ -7,6 +7,30 @@ These tests are run via cargo:
 cargo test
 ```
 
+## Processing configuration wakeups
+
+Run the in-memory processing regressions with `cargo test --lib processing::tests`.
+They exercise configuration updates with idle capture and with a full bounded
+playback queue, for both pipeline rebuilds and parameter updates. They also
+check old-output retirement, preserved backpressure, and the first candidate's
+use of the replacement pipeline. These tests do not access audio hardware or
+qualify target timing.
+
+The processing thread commits an update when it selects the configuration event.
+An audio event selected first may still use the old pipeline; enqueueing a
+configuration or reporting it as active in the supervisor is not a processing
+commit acknowledgement. At commit, any pending Armed request is rejected without
+a candidate before admission and reconstruction. Installation retires old output
+stamps and qualification. The one pending output retains its original stamp and
+must be handed to playback before another capture chunk is consumed; playback
+rejects the retired stamp. Pipeline construction and parameter updates remain
+synchronous and have no new completion-time bound.
+
+If the configuration channel disconnects, processing disables that receive and
+continues using the installed pipeline, including normal control service. Once
+end-of-stream is pending, configuration updates are no longer accepted; control
+service continues until playback accepts the terminal message or disconnects.
+
 ## Config update tests
 A set of tests for testing that changing the running configuration works correctly
 is implemeted as a Python test script.

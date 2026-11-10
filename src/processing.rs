@@ -92,39 +92,51 @@ impl ProcessingControl {
     fn pause(&mut self, protection: &mut crate::protection::Guard) {
         self.paused = true;
         protection.pause();
+        self.reject_armed(protection);
+    }
+
+    fn reject_armed(&mut self, protection: &mut crate::protection::Guard) {
         if let Some(command) = self.take_armed() {
             protection.control_only(command);
         }
     }
 }
 
-// Continue servicing the sole control mailbox even if playback stops draining.
-// A reset can retire this pending chunk; the backend must check its stamp.
-fn send_output(
+// Selection of a configuration event is the commit boundary. An audio event
+// selected first still belongs to the old pipeline; no later candidate can.
+// Resolve pending Armed before admission/reconstruction can block this owner.
+// install() retires every old stamp, including the one pending output, which
+// must retain its original stamp and its backpressure until playback takes it.
+fn replace_pipeline(
     protection: &mut crate::protection::Guard,
     control: &mut ProcessingControl,
-    shared: &crate::protection::Shared,
-    tx: &crossbeam_channel::Sender<AudioMessage>,
-    message: AudioMessage,
+    pipeline: &mut pipeline::Pipeline,
+    diff: config::ConfigChange,
+    new_config: config::Configuration,
+    processing_params: &Arc<ProcessingParameters>,
 ) -> bool {
-    let no_commands = crossbeam_channel::never();
-    loop {
-        control.expire_armed(protection);
-        let arm_timeout = control.arm_timeout();
-        let commands = if control.armed.is_none() {
-            shared.commands()
-        } else {
-            &no_commands
-        };
-        crossbeam_channel::select! {
-            send(tx, message) -> result => return result.is_ok(),
-            recv(arm_timeout) -> _ => control.expire_armed(protection),
-            recv(shared.backend_wakeups()) -> _ => protection.backend_wakeup(),
-            recv(commands) -> command => {
-                control.service(protection, command.expect("owned control mailbox disconnected"));
-            }
-        }
+    control.reject_armed(protection);
+    if let Err(err) = protection.install(&new_config) {
+        error!("Replacement protection admission rejected: {err}");
+        return false;
     }
+    match diff {
+        config::ConfigChange::Pipeline | config::ConfigChange::MixerParameters => {
+            debug!("Rebuilding pipeline.");
+            *pipeline = pipeline::Pipeline::from_config(new_config, processing_params.clone());
+        }
+        config::ConfigChange::FilterParameters {
+            filters,
+            mixers,
+            processors,
+        } => {
+            debug!("Updating parameters of filters: {filters:?}, mixers: {mixers:?}.");
+            pipeline.update_parameters(new_config, &filters, &mixers, &processors);
+        }
+        config::ConfigChange::Devices => return false,
+        config::ConfigChange::None => {}
+    }
+    true
 }
 
 pub fn run_processing(
@@ -239,6 +251,13 @@ pub fn run_processing(
             armed_deadline: None,
         };
         let no_commands = crossbeam_channel::never();
+        let no_capture = crossbeam_channel::never();
+        let no_config = crossbeam_channel::never();
+        // A rendezvous channel with a live, unread receiver disables send.
+        // Keeping these channels outside the pump avoids per-chunk allocation.
+        let (no_output, _no_output_rx) = crossbeam_channel::bounded(0);
+        let mut rx_pipeconf = rx_pipeconf;
+        let mut pending = None;
         loop {
             control.expire_armed(&mut protection);
             let arm_timeout = control.arm_timeout();
@@ -247,8 +266,53 @@ pub fn run_processing(
             } else {
                 &no_commands
             };
+            // Exactly two phases: receive input, or send one pending output.
+            // Both service the same control/configuration events. Never consume
+            // more capture while playback is applying backpressure.
+            let capture = if pending.is_none() {
+                &rx_cap
+            } else {
+                &no_capture
+            };
+            let output = if pending.is_some() {
+                &tx_pb
+            } else {
+                &no_output
+            };
+            let ending = matches!(pending, Some(AudioMessage::EndOfStream));
+            let configurations = if ending { &no_config } else { &rx_pipeconf };
             let audio = crossbeam_channel::select! {
-                recv(rx_cap) -> audio => audio,
+                recv(capture) -> audio => audio,
+                send(output, pending.take().expect("selected output without a pending message")) -> result => {
+                    if result.is_err() {
+                        info!("Playback thread has already stopped.");
+                        break;
+                    }
+                    if ending {
+                        break;
+                    }
+                    continue;
+                }
+                recv(configurations) -> update => {
+                    match update {
+                        Ok((diff, new_config)) => {
+                            trace!("Message received on config channel");
+                            if !replace_pipeline(
+                                &mut protection, &mut control, &mut pipeline,
+                                diff, new_config, &processing_params,
+                            ) {
+                                control.pause(&mut protection);
+                                pending = Some(AudioMessage::EndOfStream);
+                            }
+                        }
+                        Err(_) => {
+                            // No further updates are possible. Retain the
+                            // installed pipeline without selecting EOF forever.
+                            rx_pipeconf = crossbeam_channel::never();
+                        }
+                    }
+                    continue;
+                }
                 recv(arm_timeout) -> _ => {
                     control.expire_armed(&mut protection);
                     continue;
@@ -269,70 +333,24 @@ pub fn run_processing(
                     chunk = pipeline.process_chunk(chunk);
                     let command = control.candidate_command(&mut protection, &shared);
                     protection.process_with_command(&mut chunk, command);
-                    let msg = AudioMessage::Audio(chunk);
-                    if !send_output(&mut protection, &mut control, &shared, &tx_pb, msg) {
-                        info!("Playback thread has already stopped.");
-                        break;
-                    }
+                    pending = Some(AudioMessage::Audio(chunk));
                 }
                 Ok(AudioMessage::EndOfStream) => {
                     trace!("AudioMessage::EndOfStream received");
-                    let msg = AudioMessage::EndOfStream;
                     control.pause(&mut protection);
-                    if !send_output(&mut protection, &mut control, &shared, &tx_pb, msg) {
-                        info!("Playback thread has already stopped.");
-                    }
-                    break;
+                    pending = Some(AudioMessage::EndOfStream);
                 }
                 Ok(AudioMessage::Pause) => {
                     trace!("AudioMessage::Pause received");
                     control.pause(&mut protection);
-                    let msg = AudioMessage::Pause;
-                    if !send_output(&mut protection, &mut control, &shared, &tx_pb, msg) {
-                        info!("Playback thread has already stopped.");
-                        break;
-                    }
+                    pending = Some(AudioMessage::Pause);
                 }
                 Err(err) => {
                     error!("Message channel error: {err}");
-                    let msg = AudioMessage::EndOfStream;
                     control.pause(&mut protection);
-                    if !send_output(&mut protection, &mut control, &shared, &tx_pb, msg) {
-                        info!("Playback thread has already stopped.");
-                    }
-                    break;
+                    pending = Some(AudioMessage::EndOfStream);
                 }
             }
-            if let Ok((diff, new_config)) = rx_pipeconf.try_recv() {
-                trace!("Message received on config channel");
-                if let Err(err) = protection.install(&new_config) {
-                    error!("Replacement protection admission rejected: {err}");
-                    let _ = tx_pb.send(AudioMessage::EndOfStream);
-                    break;
-                }
-                match diff {
-                    config::ConfigChange::Pipeline | config::ConfigChange::MixerParameters => {
-                        debug!("Rebuilding pipeline.");
-                        let new_pipeline =
-                            pipeline::Pipeline::from_config(new_config, processing_params.clone());
-                        pipeline = new_pipeline;
-                    }
-                    config::ConfigChange::FilterParameters {
-                        filters,
-                        mixers,
-                        processors,
-                    } => {
-                        debug!("Updating parameters of filters: {filters:?}, mixers: {mixers:?}.");
-                        pipeline.update_parameters(new_config, &filters, &mixers, &processors);
-                    }
-                    config::ConfigChange::Devices => {
-                        let msg = AudioMessage::EndOfStream;
-                        tx_pb.send(msg).unwrap();
-                        break;
-                    }
-                    _ => {}
-                };
-            };
         }
         control.pause(&mut protection);
         processing_params.set_processing_load(0.0);
@@ -400,6 +418,167 @@ mod tests {
                 + u64::from(operation == Operation::Reset),
             qualification_id,
             operation,
+        }
+    }
+
+    fn wait_snapshot(
+        shared: &crate::protection::Shared,
+        ready: impl Fn(crate::protection::Snapshot) -> bool,
+    ) -> crate::protection::Snapshot {
+        let start = Instant::now();
+        loop {
+            if let Some(snapshot) = shared.guard_snapshot()
+                && ready(snapshot)
+            {
+                return snapshot;
+            }
+            // Host deadlock guard only, not target timing qualification.
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "processing stalled"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn configuration_with_gain(gain: f64) -> config::Configuration {
+        let mut conf = serde_json::to_value(configuration()).unwrap();
+        conf["filters"] = serde_json::json!({
+            "gain": {"type": "Gain", "parameters": {"gain": gain, "scale": "linear"}}
+        });
+        conf["pipeline"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({"type": "Filter", "channels": [0], "names": ["gain"]}),
+        );
+        serde_json::from_value(conf).unwrap()
+    }
+
+    #[test]
+    fn configuration_wakes_idle_capture_before_the_next_candidate() {
+        // Cover both graph construction and in-place parameter changes. The
+        // changed gain makes the next candidate unsafe, proving installation
+        // of the actual pipeline rather than just publication of a new epoch.
+        for initial in [configuration(), configuration_with_gain(1.0)] {
+            let params = Arc::new(ProcessingParameters::default());
+            let (tx_pb, rx_pb) = crossbeam_channel::bounded(1);
+            let (tx_cap, rx_cap) = crossbeam_channel::bounded(1);
+            let (tx_conf, rx_conf) = crossbeam_channel::bounded(1);
+            let barrier = Arc::new(Barrier::new(2));
+            let handle = run_processing(
+                initial.clone(),
+                barrier.clone(),
+                tx_pb,
+                rx_cap,
+                rx_conf,
+                params.clone(),
+            );
+            barrier.wait();
+            let before = params.protection.guard_snapshot().unwrap();
+            let updated = configuration_with_gain(20.0);
+            tx_conf
+                .send((config::config_diff(&initial, &updated), updated))
+                .unwrap();
+            let committed = wait_snapshot(&params.protection, |s| s.pipeline > before.pipeline);
+            assert_eq!(committed.frames, 0);
+            assert!(!committed.processing_valid);
+            assert!(committed.attempt_required);
+            assert!(rx_pb.is_empty());
+            // A closed config source must be disabled, while audio and control
+            // remain serviceable. It must not make the pump spin or exit.
+            drop(tx_conf);
+            tx_cap.send(AudioMessage::Audio(chunk())).unwrap();
+            let AudioMessage::Audio(output) = rx_pb.recv_timeout(Duration::from_secs(2)).unwrap()
+            else {
+                panic!("missing updated output")
+            };
+            assert!(output.protection.unwrap().is_current());
+            assert!(
+                output
+                    .waveforms
+                    .iter()
+                    .flatten()
+                    .all(|sample| *sample == 0.0)
+            );
+            let trip = params.protection.guard_snapshot().unwrap().trip.unwrap();
+            assert_eq!(trip.reason, crate::protection::Reason::Peak);
+            assert_eq!(trip.channel, Some(0));
+            tx_cap.send(AudioMessage::EndOfStream).unwrap();
+            assert!(matches!(
+                rx_pb.recv_timeout(Duration::from_secs(2)).unwrap(),
+                AudioMessage::EndOfStream
+            ));
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn configuration_wakes_blocked_playback_without_consuming_more_capture() {
+        for initial in [configuration(), configuration_with_gain(1.0)] {
+            let params = Arc::new(ProcessingParameters::default());
+            let (tx_pb, rx_pb) = crossbeam_channel::bounded(1);
+            let (tx_cap, rx_cap) = crossbeam_channel::bounded(3);
+            let capture_queue = rx_cap.clone();
+            let (tx_conf, rx_conf) = crossbeam_channel::bounded(1);
+            let barrier = Arc::new(Barrier::new(2));
+            let handle = run_processing(
+                initial.clone(),
+                barrier.clone(),
+                tx_pb,
+                rx_cap,
+                rx_conf,
+                params.clone(),
+            );
+            barrier.wait();
+            for _ in 0..3 {
+                tx_cap.send(AudioMessage::Audio(chunk())).unwrap();
+            }
+            let before = wait_snapshot(&params.protection, |s| s.frames == 512);
+            assert_eq!(rx_pb.len(), 1);
+            assert_eq!(capture_queue.len(), 1);
+            let updated = configuration_with_gain(20.0);
+            tx_conf
+                .send((config::config_diff(&initial, &updated), updated))
+                .unwrap();
+            let committed = wait_snapshot(&params.protection, |s| s.pipeline > before.pipeline);
+            assert_eq!(committed.frames, 0);
+            assert!(!committed.processing_valid);
+            assert!(committed.attempt_required);
+            assert_eq!(
+                capture_queue.len(),
+                1,
+                "reload bypassed output backpressure"
+            );
+            // Both the queued and the one pending chunk retain their original
+            // stamps. Neither may be relabelled with the replacement epoch.
+            for _ in 0..2 {
+                let AudioMessage::Audio(retired) =
+                    rx_pb.recv_timeout(Duration::from_secs(2)).unwrap()
+                else {
+                    panic!("missing retired output")
+                };
+                assert!(!retired.protection.unwrap().is_current());
+            }
+            let AudioMessage::Audio(current) = rx_pb.recv_timeout(Duration::from_secs(2)).unwrap()
+            else {
+                panic!("missing updated output")
+            };
+            assert!(current.protection.unwrap().is_current());
+            assert!(
+                current
+                    .waveforms
+                    .iter()
+                    .flatten()
+                    .all(|sample| *sample == 0.0)
+            );
+            let trip = params.protection.guard_snapshot().unwrap().trip.unwrap();
+            assert_eq!(trip.reason, crate::protection::Reason::Peak);
+            assert_eq!(trip.channel, Some(0));
+            tx_cap.send(AudioMessage::EndOfStream).unwrap();
+            assert!(matches!(
+                rx_pb.recv_timeout(Duration::from_secs(2)).unwrap(),
+                AudioMessage::EndOfStream
+            ));
+            handle.join().unwrap();
         }
     }
 
@@ -537,6 +716,64 @@ mod tests {
                 after.control.mode,
                 if expired { Mode::Prearm } else { Mode::Armed }
             );
+            assert!(control.armed.is_none() && control.armed_deadline.is_none());
+        }
+    }
+
+    #[test]
+    fn configuration_commit_rejects_pending_arm_before_installation() {
+        use crate::protection::control::{Mode, Operation, Result as ControlResult};
+        for valid in [true, false] {
+            let conf = configuration();
+            let params = Arc::new(ProcessingParameters::default());
+            let mut guard = params.protection_owner.lock().unwrap();
+            guard.install(&conf).unwrap();
+            let mut pipeline = pipeline::Pipeline::from_config(conf.clone(), params.clone());
+            let mut control = ProcessingControl {
+                paused: false,
+                armed: None,
+                armed_deadline: None,
+            };
+            control.service(
+                &mut guard,
+                request(
+                    params.protection.guard_snapshot().unwrap(),
+                    1,
+                    Operation::Context(Mode::Prearm),
+                    1,
+                ),
+            );
+            let before = params.protection.guard_snapshot().unwrap();
+            control.service(
+                &mut guard,
+                request(before, 2, Operation::Context(Mode::Armed), 1),
+            );
+            assert!(control.armed.is_some());
+            let mut updated = conf;
+            if !valid {
+                updated.pipeline = None;
+            }
+            assert_eq!(
+                replace_pipeline(
+                    &mut guard,
+                    &mut control,
+                    &mut pipeline,
+                    config::ConfigChange::Pipeline,
+                    updated,
+                    &params,
+                ),
+                valid
+            );
+            let after = params.protection.guard_snapshot().unwrap();
+            let receipt = after.control.last_command.unwrap();
+            assert_eq!(receipt.command_id, 2);
+            assert_eq!(receipt.result, ControlResult::NotQualified);
+            // Rejection after install would report the replacement epoch and
+            // StateMismatch, and could be delayed by synchronous admission.
+            assert_eq!(receipt.pipeline, before.pipeline);
+            assert!(after.pipeline > before.pipeline);
+            assert_eq!(after.frames, 0);
+            assert!(!after.processing_valid);
             assert!(control.armed.is_none() && control.armed_deadline.is_none());
         }
     }
@@ -739,14 +976,16 @@ mod tests {
             params.clone(),
         );
         barrier.wait();
+        let mut unsafe_input = chunk();
+        unsafe_input.waveforms[0][7] = 1.0;
+        tx_cap.send(AudioMessage::Audio(unsafe_input)).unwrap();
+        let before = wait_snapshot(&params.protection, |s| s.frames == 256);
         let mut updated = conf.clone();
         updated.title = Some("updated title".to_string());
         tx_conf
             .send((config::config_diff(&conf, &updated), updated))
             .unwrap();
-        let mut unsafe_input = chunk();
-        unsafe_input.waveforms[0][7] = 1.0;
-        tx_cap.send(AudioMessage::Audio(unsafe_input)).unwrap();
+        wait_snapshot(&params.protection, |s| s.pipeline > before.pipeline);
         tx_cap.send(AudioMessage::Audio(chunk())).unwrap();
         tx_cap.send(AudioMessage::EndOfStream).unwrap();
         let AudioMessage::Audio(retired) = rx_pb.recv_timeout(Duration::from_secs(2)).unwrap()
