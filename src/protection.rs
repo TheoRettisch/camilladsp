@@ -199,6 +199,8 @@ pub struct Shared {
     pub(crate) capture: capture::Capture,
     backend_wakeup: crossbeam_channel::Sender<()>,
     backend_wakeup_rx: crossbeam_channel::Receiver<()>,
+    pipeline_wakeup: crossbeam_channel::Sender<()>,
+    pipeline_wakeup_rx: crossbeam_channel::Receiver<()>,
     commands: crossbeam_channel::Sender<Command>,
     command_rx: crossbeam_channel::Receiver<Command>,
 }
@@ -207,6 +209,7 @@ impl Default for Shared {
     fn default() -> Self {
         let (commands, command_rx) = crossbeam_channel::bounded(1);
         let (backend_wakeup, backend_wakeup_rx) = crossbeam_channel::bounded(1);
+        let (pipeline_wakeup, pipeline_wakeup_rx) = crossbeam_channel::bounded(1);
         Self {
             epoch: AtomicU64::new(0),
             backend: AtomicU64::new(1),
@@ -219,6 +222,8 @@ impl Default for Shared {
             capture: capture::Capture::default(),
             backend_wakeup,
             backend_wakeup_rx,
+            pipeline_wakeup,
+            pipeline_wakeup_rx,
             commands,
             command_rx,
         }
@@ -245,6 +250,10 @@ impl Shared {
 
     pub(crate) fn backend_wakeups(&self) -> &crossbeam_channel::Receiver<()> {
         &self.backend_wakeup_rx
+    }
+
+    pub(crate) fn pipeline_wakeups(&self) -> &crossbeam_channel::Receiver<()> {
+        &self.pipeline_wakeup_rx
     }
 
     /// Read-only projection; publication and epoch retirement belong to Guard.
@@ -396,6 +405,9 @@ impl Guard {
         self.publish();
         self.configuration = Some(conf.guard().clone());
         self.publish();
+        // Playback must retire the old PCM generation even when capture sends
+        // no more audio or Pause messages. Coalesce without blocking this owner.
+        let _ = self.shared.pipeline_wakeup.try_send(());
     }
 
     pub fn trip(&self) -> Option<Trip> {

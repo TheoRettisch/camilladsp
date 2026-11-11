@@ -475,7 +475,12 @@ fn supervise_run(
     })();
     let cleanup = threads.shutdown();
     status_structs.capture.write().state = ProcessingState::Inactive;
-    cleanup.and(result)
+    match (result, cleanup) {
+        // shutdown() reports the panics. Keep the explicit process-exit decision
+        // as well as a failing exit code, even when --wait permits other retries.
+        (Ok(ExitState::Exit), Err(_)) => Ok(ExitState::ExitWithError),
+        (result, cleanup) => cleanup.and(result),
+    }
 }
 
 fn main_process() -> i32 {
@@ -1302,6 +1307,9 @@ fn main_process() -> i32 {
             Ok(ExitState::Exit) => {
                 debug!("Exiting");
                 return EXIT_OK;
+            }
+            Ok(ExitState::ExitWithError) => {
+                return EXIT_PROCESSING_ERROR;
             }
             Ok(ExitState::Restart) => {
                 debug!("Restarting with new config");

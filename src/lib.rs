@@ -166,6 +166,8 @@ pub enum CommandMessage {
 pub enum ExitState {
     Restart,
     Exit,
+    /// Exit was requested, but joining the run reported a failure.
+    ExitWithError,
 }
 
 pub enum ControllerMessage {

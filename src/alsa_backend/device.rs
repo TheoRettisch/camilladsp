@@ -565,7 +565,10 @@ fn playback_loop_bytes(
         }
     };
     loop {
-        let msg = channels.audio.recv();
+        let msg = crossbeam_channel::select! {
+            recv(channels.audio) -> msg => Some(msg),
+            recv(params.protection.pipeline_wakeups()) -> _ => None,
+        };
         if progress.pipeline_changed() {
             progress.retire();
             if !flush_protected_playback(&protected_pcm, &channels) {
@@ -576,6 +579,9 @@ fn playback_loop_bytes(
             timer.restart();
             buffer_avg.restart();
         }
+        let Some(msg) = msg else {
+            continue;
+        };
         let rejected_chunk = matches!(&msg, Ok(AudioMessage::Audio(chunk))
             if chunk.protection.as_ref().is_none_or(|stamp| !stamp.is_stream_current()));
         if rejected_chunk {
@@ -746,7 +752,9 @@ fn playback_loop_bytes(
             }
             Err(err) => {
                 progress.retire();
-                error!("PB: Message channel error: {err}");
+                // Processing also closes this channel on intentional shutdown.
+                // A live supervisor reports the PlaybackError below as a fault.
+                debug!("PB: Processing channel disconnected: {err}");
                 channels
                     .status
                     .send(StatusMessage::PlaybackError(err.to_string()))
@@ -1409,6 +1417,109 @@ mod protection_tests {
         assert_eq!(observed, expect_meter.then(|| vec![0.0; CHANNELS]));
         assert_eq!(status.read().clipped_samples, 0);
         rx_status.try_iter().collect()
+    }
+
+    #[test]
+    fn idle_configuration_becomes_readable_without_more_capture_messages() {
+        use std::time::Duration;
+
+        let params = Arc::new(ProcessingParameters::default());
+        let (tx_audio, rx_audio) = crossbeam_channel::bounded(1);
+        let (_tx_capture, rx_capture) = crossbeam_channel::bounded(1);
+        let (tx_config, rx_config) = crossbeam_channel::bounded(1);
+        let (tx_stop, rx_stop) = crossbeam_channel::bounded(1);
+        let (tx_status, _rx_status) = crossbeam_channel::unbounded();
+        let barrier = Arc::new(Barrier::new(2));
+        let initial = configuration();
+        let processing = crate::processing::run_processing(
+            initial.clone(),
+            barrier.clone(),
+            tx_audio,
+            rx_capture,
+            rx_config,
+            rx_stop,
+            params.clone(),
+        );
+        barrier.wait();
+        let shared = params.protection.clone();
+        let playback = thread::spawn(move || {
+            let (pcm, manager) = null_pcm();
+            playback_loop_bytes(
+                PlaybackChannels {
+                    audio: rx_audio,
+                    status: tx_status,
+                },
+                &pcm,
+                PlaybackParams {
+                    protection: shared,
+                    channels: CHANNELS,
+                    target_level: 0,
+                    adjust_period: 0.0,
+                    adjust_enabled: false,
+                    sample_format: crate::config::BinarySampleFormat::S24_3_LE,
+                    playback_status: Arc::new(RwLock::new(PlaybackStatus {
+                        update_interval: 100,
+                        clipped_samples: 0,
+                        buffer_level: 0,
+                        signal_rms: countertimer::ValueHistory::new(10, CHANNELS),
+                        signal_peak: countertimer::ValueHistory::new(10, CHANNELS),
+                    })),
+                    bytes_per_frame: CHANNELS * 3,
+                    samplerate: SAMPLE_RATE,
+                    chunksize: FRAMES,
+                },
+                &manager,
+            );
+        });
+        let wait_status = |after: u64| {
+            let start = Instant::now();
+            loop {
+                let reply: serde_json::Value = serde_json::from_str(
+                    &params.protection_reply("\"GetProtectionStatus\"").unwrap(),
+                )
+                .unwrap();
+                let reply = &reply["GetProtectionStatus"];
+                if reply["result"] == "Ok"
+                    && reply["value"]["epoch"]["pipeline"].as_u64().unwrap() > after
+                {
+                    return reply["value"].clone();
+                }
+                // Host deadlock guard, not target timing qualification.
+                assert!(start.elapsed() < Duration::from_secs(2), "{reply}");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let before = wait_status(0);
+        let mut updated = initial.config().clone();
+        let crate::config::Processor::Protection { parameters, .. } = updated
+            .processors
+            .as_mut()
+            .unwrap()
+            .get_mut("guard")
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        parameters.max_allowed_peak_db -= 0.5;
+        let updated = crate::config::validate_config(updated, None).unwrap();
+        tx_config
+            .send((
+                crate::config::config_diff(initial.config(), updated.config()),
+                updated,
+            ))
+            .unwrap();
+        let after = wait_status(before["epoch"]["pipeline"].as_u64().unwrap());
+        assert!(
+            after["epoch"]["backend"].as_u64().unwrap()
+                > before["epoch"]["backend"].as_u64().unwrap()
+        );
+        assert_ne!(after["identity"], before["identity"]);
+        for owner in ["processing", "playback"] {
+            assert_eq!(after[owner]["valid"], false);
+        }
+        tx_stop.send(()).unwrap();
+        processing.join().unwrap();
+        playback.join().unwrap();
     }
 
     #[test]

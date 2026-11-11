@@ -611,8 +611,9 @@ impl CaptureDevice for CpalCaptureDevice {
                                 Ok(CommandMessage::Exit) => {
                                     debug!("Exit message received, sending EndOfStream");
                                     let msg = AudioMessage::EndOfStream;
-                                    channel.send(msg).unwrap();
-                                    status_channel.send(StatusMessage::CaptureDone).unwrap();
+                                    // Processing may already have stopped during shutdown.
+                                    channel.send(msg).unwrap_or(());
+                                    status_channel.send(StatusMessage::CaptureDone).unwrap_or(());
                                     break;
                                 }
                                 Ok(CommandMessage::SetSpeed { speed }) => {

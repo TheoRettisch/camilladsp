@@ -67,7 +67,7 @@ impl Drop for Finished {
     }
 }
 
-fn exercise(trigger: Trigger, starting: bool, panic_processing: bool) {
+fn exercise(trigger: Trigger, starting: bool, panic_processing: bool, panic_capture: bool) {
     let (tx_result, rx_result) = crossbeam_channel::bounded(1);
     let supervisor = thread::spawn(move || {
         let conf = configuration();
@@ -101,6 +101,7 @@ fn exercise(trigger: Trigger, starting: bool, panic_processing: bool) {
         });
         let cap_barrier = barrier.clone();
         let cap_finished = Finished(finished.clone());
+        let capture_processed = rx_processed.clone();
         let capture = thread::spawn(move || {
             let _finished = cap_finished;
             if starting {
@@ -110,6 +111,10 @@ fn exercise(trigger: Trigger, starting: bool, panic_processing: bool) {
                 rx_cap_command.recv().unwrap(),
                 CommandMessage::Exit
             ));
+            // Exercise cleanup failure after processing has closed its channels,
+            // without poisoning the guard or depending on thread scheduling.
+            assert!(capture_processed.recv().is_err());
+            assert!(!panic_capture, "simulated capture cleanup panic");
         });
         let pb_barrier = barrier.clone();
         let pb_finished = Finished(finished.clone());
@@ -130,9 +135,9 @@ fn exercise(trigger: Trigger, starting: bool, panic_processing: bool) {
             capture,
             playback,
         };
-        let expect_error = panic_processing
-            || matches!(trigger, Trigger::ControllerClosed | Trigger::ConfigClosed);
         let expect_exit = matches!(trigger, Trigger::Exit);
+        let expect_error = ((panic_processing || panic_capture) && !expect_exit)
+            || matches!(trigger, Trigger::ControllerClosed | Trigger::ConfigClosed);
         let clears_active = matches!(trigger, Trigger::Stop | Trigger::Backend(_));
         let mut tx_ctrl = Some(tx_ctrl);
         let mut tx_status = Some(tx_status);
@@ -177,7 +182,14 @@ fn exercise(trigger: Trigger, starting: bool, panic_processing: bool) {
         );
         assert_eq!(result.is_err(), expect_error, "{result:?}");
         if let Ok(exit) = result {
-            assert_eq!(matches!(exit, ExitState::Exit), expect_exit);
+            assert_eq!(
+                matches!(exit, ExitState::ExitWithError),
+                expect_exit && (panic_processing || panic_capture)
+            );
+            assert_eq!(
+                matches!(exit, ExitState::Exit | ExitState::ExitWithError),
+                expect_exit
+            );
         }
         assert_eq!(
             finished.load(Ordering::SeqCst),
@@ -222,7 +234,7 @@ fn every_exit_stops_and_joins_all_owners() {
         Trigger::StatusClosed,
         Trigger::ConfigClosed,
     ] {
-        exercise(trigger, false, false);
+        exercise(trigger, false, false, false);
     }
 }
 
@@ -232,11 +244,17 @@ fn startup_errors_release_waiters_before_joining() {
         StatusMessage::PlaybackError("open failed".into()),
         StatusMessage::CaptureError("open failed".into()),
     ] {
-        exercise(Trigger::Backend(message), true, false);
+        exercise(Trigger::Backend(message), true, false, false);
     }
 }
 
 #[test]
 fn processing_panic_is_reported_after_other_threads_join_and_poison_survives() {
-    exercise(Trigger::Exit, false, true);
+    exercise(Trigger::Stop, false, true, false);
+}
+
+#[test]
+fn explicit_exit_survives_cleanup_panics() {
+    exercise(Trigger::Exit, false, false, true);
+    exercise(Trigger::Exit, false, true, false);
 }
