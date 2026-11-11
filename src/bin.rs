@@ -148,6 +148,24 @@ impl RunThreads {
         self.starting = false;
     }
 
+    fn publish_startup(
+        &mut self,
+        config: &config::PreparedConfig,
+        shared: &SharedConfigs,
+        statuses: &StatusStructs,
+    ) -> Res<()> {
+        // Processing reaches this barrier only after installing the guard and
+        // constructing its pipeline. A poisoned owner also releases waiters,
+        // but must never acknowledge installation.
+        self.release_startup();
+        if statuses.processing.protection_owner.is_poisoned() {
+            return Err(std::io::Error::other("Protection owner poisoned during startup").into());
+        }
+        *shared.active.lock() = Some(config.clone());
+        statuses.status.write().stop_reason = StopReason::None;
+        Ok(())
+    }
+
     fn shutdown(mut self) -> Res<()> {
         // Request termination before releasing startup waiters or joining.
         // Processing drops its audio endpoints even under backpressure; capture
@@ -184,17 +202,11 @@ impl RunThreads {
 }
 
 fn run(
+    active_config: config::PreparedConfig,
     shared_configs: SharedConfigs,
     status_structs: StatusStructs,
     rx_ctrl: crossbeam_channel::Receiver<ControllerMessage>,
 ) -> Res<ExitState> {
-    let active_config = match shared_configs.active.lock().clone() {
-        Some(cfg) => cfg,
-        None => {
-            error!("Tried to start without config!");
-            return Ok(ExitState::Exit);
-        }
-    };
     let (tx_pb, rx_pb) = crossbeam_channel::bounded(active_config.config().devices.queuelimit());
     let (tx_cap, rx_cap) = crossbeam_channel::bounded(active_config.config().devices.queuelimit());
 
@@ -331,17 +343,12 @@ fn supervise_run(
                         },
                         Ok(ControllerMessage::Stop) => {
                             debug!("Stop requested...");
-                            {
-                                let mut active_cfg_shared = shared_configs.active.lock();
-                                let mut prev_cfg_shared = shared_configs.previous.lock();
-                                *active_cfg_shared = None;
-                                *prev_cfg_shared = Some(active_config);
-                            }
+                            retire_configuration(&shared_configs);
                             return Ok(ExitState::Restart);
                         },
                         Ok(ControllerMessage::Exit) => {
                             debug!("Exit requested...");
-                            *shared_configs.previous.lock() = Some(active_config);
+                            retire_configuration(&shared_configs);
                             return Ok(ExitState::Exit);
                         },
                         Err(err) => {
@@ -362,23 +369,22 @@ fn supervise_run(
                             })?;
                             requested_config = *new_conf;
                             debug!("Sent changes to pipeline");
-                            false
+                            None
                         }
                         config::ConfigChange::Devices => {
                             debug!("Devices changed, restart required.");
-                            *shared_configs.active.lock() = Some(*new_conf);
-                            true
+                            Some(new_conf)
                         }
                         config::ConfigChange::None => {
                             debug!("No changes in config.");
-                            false
+                            None
                         }
                     };
                     if let Some(reply) = reply {
                         let _ = reply.send(Ok(()));
                     }
-                    if restart {
-                        return Ok(ExitState::Restart);
+                    if let Some(next_config) = restart {
+                        return Ok(ExitState::RestartWithConfig(next_config));
                     }
                 },
                 recv(rx_status) -> msg => {
@@ -389,7 +395,7 @@ fn supervise_run(
                                 pb_ready = true;
                                 if cap_ready {
                                     debug!("Both capture and playback ready, release barrier");
-                                    threads.release_startup();
+                                    threads.publish_startup(&active_config, &shared_configs, status_structs)?;
                                     debug!("Supervisor loop starts now!");
                                 }
                             }
@@ -398,55 +404,34 @@ fn supervise_run(
                                 cap_ready = true;
                                 if pb_ready {
                                     debug!("Both capture and playback ready, release barrier");
-                                    threads.release_startup();
+                                    threads.publish_startup(&active_config, &shared_configs, status_structs)?;
                                     debug!("Supervisor loop starts now!");
-                                    status_structs.status.write().stop_reason = StopReason::None;
                                 }
                             }
                             StatusMessage::PlaybackError(message) => {
                                 error!("Playback error: {message}");
                                 status_structs.status.write().stop_reason = StopReason::PlaybackError(message);
-                                {
-                                    let mut active_cfg_shared = shared_configs.active.lock();
-                                    let mut prev_cfg_shared = shared_configs.previous.lock();
-                                    *active_cfg_shared = None;
-                                    *prev_cfg_shared = Some(active_config);
-                                }
+                                retire_configuration(&shared_configs);
                                 return Ok(ExitState::Restart);
                             }
                             StatusMessage::CaptureError(message) => {
                                 error!("Capture error: {message}");
                                 status_structs.status.write().stop_reason = StopReason::CaptureError(message);
-                                {
-                                    let mut active_cfg_shared = shared_configs.active.lock();
-                                    let mut prev_cfg_shared = shared_configs.previous.lock();
-                                    *active_cfg_shared = None;
-                                    *prev_cfg_shared = Some(active_config);
-                                }
+                                retire_configuration(&shared_configs);
                                 return Ok(ExitState::Restart);
                             }
                             StatusMessage::PlaybackFormatChange(rate) => {
                                 error!("Playback stopped due to external format change");
                                 status_structs.status.write().stop_reason =
                                     StopReason::PlaybackFormatChange(rate);
-                                {
-                                    let mut active_cfg_shared = shared_configs.active.lock();
-                                    let mut prev_cfg_shared = shared_configs.previous.lock();
-                                    *active_cfg_shared = None;
-                                    *prev_cfg_shared = Some(active_config);
-                                }
+                                retire_configuration(&shared_configs);
                                 return Ok(ExitState::Restart);
                             }
                             StatusMessage::CaptureFormatChange(rate) => {
                                 error!("Capture stopped due to external format change");
                                 status_structs.status.write().stop_reason =
                                     StopReason::CaptureFormatChange(rate);
-                                {
-                                    let mut active_cfg_shared = shared_configs.active.lock();
-                                    let mut prev_cfg_shared = shared_configs.previous.lock();
-                                    *active_cfg_shared = None;
-                                    *prev_cfg_shared = Some(active_config);
-                                }
+                                retire_configuration(&shared_configs);
                                 return Ok(ExitState::Restart);
                             }
                             StatusMessage::PlaybackDone => {
@@ -457,12 +442,7 @@ fn supervise_run(
                                         RwLockUpgradableReadGuard::upgrade(stat).stop_reason = StopReason::Done;
                                     }
                                 }
-                                {
-                                    let mut active_cfg_shared = shared_configs.active.lock();
-                                    let mut prev_cfg_shared = shared_configs.previous.lock();
-                                    *active_cfg_shared = None;
-                                    *prev_cfg_shared = Some(active_config);
-                                }
+                                retire_configuration(&shared_configs);
                                 return Ok(ExitState::Restart);
                             }
                             StatusMessage::CaptureDone => {
@@ -491,7 +471,9 @@ fn supervise_run(
                             status_structs.status.write().stop_reason = StopReason::UnknownError(
                                 "Backend status channel disconnected".to_string(),
                             );
-                            return Ok(ExitState::Restart);
+                            // Preserve the same-config retry, carrying it privately
+                            // until the replacement run acknowledges installation.
+                            return Ok(ExitState::RestartWithConfig(Box::new(active_config)));
                         }
                     }
                 }
@@ -499,12 +481,48 @@ fn supervise_run(
         }
     })();
     let cleanup = threads.shutdown();
+    // Nothing is installed once the run has retired. In particular, do not use
+    // the public slot to carry a device-change request into the next run.
+    retire_configuration(&shared_configs);
     status_structs.capture.write().state = ProcessingState::Inactive;
     match (result, cleanup) {
         // shutdown() reports the panics. Keep the explicit process-exit decision
         // as well as a failing exit code, even when --wait permits other retries.
         (Ok(ExitState::Exit), Err(_)) => Ok(ExitState::ExitWithError),
         (result, cleanup) => cleanup.and(result),
+    }
+}
+
+fn retire_configuration(shared: &SharedConfigs) {
+    if let Some(installed) = shared.active.lock().take() {
+        *shared.previous.lock() = Some(installed);
+    }
+}
+
+fn next_configuration(
+    rx_command: &crossbeam_channel::Receiver<ControllerMessage>,
+    mut requested: Option<config::PreparedConfig>,
+    wait: bool,
+) -> Option<config::PreparedConfig> {
+    loop {
+        if rx_command.is_empty() && (requested.is_some() || !wait) {
+            return requested;
+        }
+        match rx_command.recv() {
+            Ok(ControllerMessage::ConfigChanged(config)) => requested = Some(*config),
+            Ok(ControllerMessage::MutateConfig { mutation, reply }) => {
+                let result = mutation.apply(requested.as_ref()).map(|config| {
+                    requested = Some(config);
+                });
+                let _ = reply.send(result);
+            }
+            Ok(ControllerMessage::Stop) => requested = None,
+            Ok(ControllerMessage::Exit) => return None,
+            Err(error) => {
+                warn!("Error recv from cmd queue {error}");
+                return None;
+            }
+        }
     }
 }
 
@@ -1273,52 +1291,11 @@ fn main_process() -> i32 {
         }
     }
 
+    let mut requested_config = None;
     loop {
-        debug!("Wait for config");
-        loop {
-            let has_config = (*active_config.lock()).is_some();
-            let has_commands = !rx_command.is_empty();
-            if has_config && !has_commands {
-                debug!("New config is available and there are no queued commands, continuing");
-                break;
-            }
-            if !wait && !has_commands {
-                if !has_config {
-                    debug!(
-                        "Wait mode is disabled, there are no queued commands, and no new config. Exiting."
-                    );
-                    return EXIT_OK;
-                }
-                debug!("Wait mode is disabled and there are no queued commands, continuing");
-                break;
-            }
-            debug!("Waiting to receive a command");
-            match rx_command.recv() {
-                Ok(ControllerMessage::ConfigChanged(new_conf)) => {
-                    debug!("Config change command received");
-                    *active_config.lock() = Some(*new_conf);
-                }
-                Ok(ControllerMessage::MutateConfig { mutation, reply }) => {
-                    let mut active = active_config.lock();
-                    let result = mutation.apply(active.as_ref()).map(|conf| {
-                        *active = Some(conf);
-                    });
-                    let _ = reply.send(result);
-                }
-                Ok(ControllerMessage::Stop) => {
-                    debug!("Stop command received");
-                    *active_config.lock() = None;
-                }
-                Ok(ControllerMessage::Exit) => {
-                    debug!("Exit command received");
-                    return EXIT_OK;
-                }
-                Err(e) => {
-                    warn!("Error recv from cmd queue {e}");
-                    return EXIT_OK;
-                }
-            }
-        }
+        let Some(config) = next_configuration(&rx_command, requested_config.take(), wait) else {
+            return EXIT_OK;
+        };
 
         let shared_configs = SharedConfigs {
             active: active_config.clone(),
@@ -1326,7 +1303,12 @@ fn main_process() -> i32 {
         };
 
         debug!("Config ready, start processing");
-        let exitstatus = run(shared_configs, status_structs.clone(), rx_command.clone());
+        let exitstatus = run(
+            config,
+            shared_configs,
+            status_structs.clone(),
+            rx_command.clone(),
+        );
         debug!("Processing ended with status {exitstatus:?}");
 
         match exitstatus {
@@ -1344,7 +1326,11 @@ fn main_process() -> i32 {
                 return EXIT_PROCESSING_ERROR;
             }
             Ok(ExitState::Restart) => {
-                debug!("Restarting with new config");
+                debug!("Waiting for a new config");
+            }
+            Ok(ExitState::RestartWithConfig(config)) => {
+                requested_config = Some(*config);
+                debug!("Restarting with requested config");
             }
         };
     }

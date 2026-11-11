@@ -169,6 +169,8 @@ pub enum CommandMessage {
 #[derive(Debug)]
 pub enum ExitState {
     Restart,
+    /// A private request for the next run, not an installed configuration.
+    RestartWithConfig(Box<config::PreparedConfig>),
     Exit,
     /// Exit was requested, but joining the run reported a failure.
     ExitWithError,

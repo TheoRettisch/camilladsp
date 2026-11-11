@@ -282,7 +282,7 @@ fn exercise(trigger: Trigger, starting: bool, panic_processing: bool, panic_capt
     let supervisor = thread::spawn(move || {
         let conf = configuration();
         let statuses = status_structs();
-        let active = Arc::new(Mutex::new(Some(conf.clone())));
+        let active = Arc::new(Mutex::new(if starting { None } else { Some(conf.clone()) }));
         let previous = Arc::new(Mutex::new(None));
         let shared = SharedConfigs {
             active: active.clone(),
@@ -346,9 +346,10 @@ fn exercise(trigger: Trigger, starting: bool, panic_processing: bool, panic_capt
             playback,
         };
         let expect_exit = matches!(trigger, Trigger::Exit);
+        let expect_restart_config = matches!(trigger, Trigger::Devices | Trigger::StatusClosed);
         let expect_error = ((panic_processing || panic_capture) && !expect_exit)
             || matches!(trigger, Trigger::ControllerClosed | Trigger::ConfigClosed);
-        let clears_active = matches!(trigger, Trigger::Stop | Trigger::Backend(_));
+        let had_active = !starting;
         let mut tx_ctrl = Some(tx_ctrl);
         let mut tx_status = Some(tx_status);
         let mut rx_conf = Some(rx_conf);
@@ -393,6 +394,10 @@ fn exercise(trigger: Trigger, starting: bool, panic_processing: bool, panic_capt
         assert_eq!(result.is_err(), expect_error, "{result:?}");
         if let Ok(exit) = result {
             assert_eq!(
+                matches!(exit, ExitState::RestartWithConfig(_)),
+                expect_restart_config
+            );
+            assert_eq!(
                 matches!(exit, ExitState::ExitWithError),
                 expect_exit && (panic_processing || panic_capture)
             );
@@ -417,10 +422,15 @@ fn exercise(trigger: Trigger, starting: bool, panic_processing: bool, panic_capt
             statuses.capture.read().state,
             ProcessingState::Inactive
         ));
-        if clears_active {
-            assert!(active.lock().is_none());
-            assert!(previous.lock().is_some());
-        }
+        assert!(
+            active.lock().is_none(),
+            "retired run still advertised active"
+        );
+        assert_eq!(
+            previous.lock().is_some(),
+            had_active,
+            "failed startup must not publish an uninstalled previous config"
+        );
         tx_result.send(()).unwrap();
     });
     rx_result
@@ -467,4 +477,179 @@ fn processing_panic_is_reported_after_other_threads_join_and_poison_survives() {
 fn explicit_exit_survives_cleanup_panics() {
     exercise(Trigger::Exit, false, false, true);
     exercise(Trigger::Exit, false, true, false);
+}
+
+#[test]
+fn startup_publication_waits_for_installation_and_rejects_poisoned_owner() {
+    for poisoned in [false, true] {
+        let config = configuration();
+        let active = Arc::new(Mutex::new(None));
+        let shared = SharedConfigs {
+            active: active.clone(),
+            previous: Arc::new(Mutex::new(None)),
+        };
+        let statuses = status_structs();
+        if poisoned {
+            let params = statuses.processing.clone();
+            assert!(
+                thread::spawn(move || {
+                    let _owner = params.protection_owner.lock().unwrap();
+                    panic!("failed prior processing owner");
+                })
+                .join()
+                .is_err()
+            );
+        }
+        let (capture_command, capture_commands) = crossbeam_channel::unbounded();
+        let (processing_stop, processing_stops) = crossbeam_channel::unbounded();
+        let barrier = Arc::new(Barrier::new(2));
+        let processing_barrier = barrier.clone();
+        let (install, installation) = crossbeam_channel::bounded(1);
+        let (ready, readiness) = crossbeam_channel::bounded(1);
+        let processing_active = active.clone();
+        let (before_install, before_installation) = crossbeam_channel::bounded(1);
+        let threads = RunThreads {
+            capture_command,
+            processing_stop,
+            barrier,
+            starting: true,
+            processing: thread::spawn(move || {
+                // Model delayed installation, then acknowledge through the
+                // actual production startup barrier. No audio is required.
+                installation.recv().unwrap();
+                before_install
+                    .send(processing_active.lock().is_none())
+                    .unwrap();
+                processing_barrier.wait();
+                processing_stops.recv().unwrap();
+            }),
+            capture: thread::spawn(move || {
+                capture_commands.recv().unwrap();
+            }),
+            playback: thread::spawn(|| {}),
+        };
+        let (finish, finished) = crossbeam_channel::bounded(1);
+        let expected = config.config().clone();
+        let supervisor = thread::spawn(move || {
+            let mut threads = threads;
+            let result = threads.publish_startup(&config, &shared, &statuses);
+            ready.send(result.is_ok()).unwrap();
+            finished.recv().unwrap();
+            threads.shutdown().unwrap();
+        });
+        assert!(active.lock().is_none());
+        install.send(()).unwrap();
+        assert_eq!(
+            readiness.recv_timeout(Duration::from_secs(2)).unwrap(),
+            !poisoned
+        );
+        let observed = active.lock().as_ref().map(|c| c.config().clone());
+        finish.send(()).unwrap();
+        supervisor.join().unwrap();
+        assert!(
+            before_installation.recv().unwrap(),
+            "configuration published before installation"
+        );
+        assert_eq!(observed, if poisoned { None } else { Some(expected) });
+    }
+}
+
+#[test]
+fn device_reload_must_not_publish_active_before_old_workers_exit() {
+    let initial = configuration();
+    let mut raw = initial.config().clone();
+    raw.devices.queuelimit = Some(raw.devices.queuelimit() + 1);
+    let replacement = config::validate_config(raw, None).unwrap();
+    assert!(matches!(
+        config::config_diff(initial.config(), replacement.config()),
+        config::ConfigChange::Devices
+    ));
+    let active = Arc::new(Mutex::new(Some(initial.clone())));
+    let shared = SharedConfigs {
+        active: active.clone(),
+        previous: Arc::new(Mutex::new(None)),
+    };
+    let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+    let rx_pending = rx_ctrl.clone();
+    let (_tx_status, rx_status) = crossbeam_channel::unbounded();
+    let (tx_conf, _rx_conf) = crossbeam_channel::unbounded();
+    let (tx_stop, rx_stop) = crossbeam_channel::unbounded();
+    let (tx_capture, rx_capture) = crossbeam_channel::unbounded();
+    let (tx_stopping, rx_stopping) = crossbeam_channel::bounded(1);
+    let (tx_finish, rx_finish) = crossbeam_channel::bounded(1);
+    let threads = RunThreads {
+        capture_command: tx_capture,
+        processing_stop: tx_stop,
+        barrier: Arc::new(Barrier::new(1)),
+        starting: false,
+        processing: thread::spawn(move || {
+            rx_stop.recv().unwrap();
+            tx_stopping.send(()).unwrap();
+            // Deliberately hold the old run before join completes. No new
+            // processing owner or installation acknowledgement can exist.
+            rx_finish.recv_timeout(Duration::from_secs(2)).unwrap();
+        }),
+        capture: thread::spawn(move || {
+            rx_capture.recv().unwrap();
+        }),
+        playback: thread::spawn(|| {}),
+    };
+    let expected_old = initial.config().clone();
+    let expected_new = replacement.config().clone();
+    let supervisor = thread::spawn(move || {
+        supervise_run(
+            initial,
+            shared,
+            &status_structs(),
+            rx_ctrl,
+            rx_status,
+            tx_conf,
+            threads,
+        )
+        .unwrap()
+    });
+    tx_ctrl
+        .send(ControllerMessage::ConfigChanged(Box::new(replacement)))
+        .unwrap();
+    rx_stopping.recv_timeout(Duration::from_secs(2)).unwrap();
+    let observed = active.lock().as_ref().map(|c| c.config().clone());
+    // A partial request queued while the old run joins must compose on the
+    // replacement, even though there is no public active config yet.
+    let (reply, response) = crossbeam_channel::bounded(1);
+    tx_ctrl
+        .send(ControllerMessage::MutateConfig {
+            mutation: config::ConfigMutation::Patch(
+                serde_json::json!({"title": "queued after device change"}),
+            ),
+            reply,
+        })
+        .unwrap();
+    // Always finish and join, including when the qualification assertion fails.
+    tx_finish.send(()).unwrap();
+    let ExitState::RestartWithConfig(next) = supervisor.join().unwrap() else {
+        panic!("device request was lost during shutdown");
+    };
+    assert_eq!(next.config(), &expected_new);
+    assert!(
+        active.lock().is_none(),
+        "retired configuration is still public"
+    );
+    let selected = next_configuration(&rx_pending, Some(*next), false).unwrap();
+    assert!(response.recv().unwrap().is_ok());
+    assert_eq!(
+        selected.config().devices.queuelimit(),
+        expected_new.devices.queuelimit()
+    );
+    assert_eq!(
+        selected.config().title.as_deref(),
+        Some("queued after device change")
+    );
+    assert!(
+        active.lock().is_none(),
+        "pending partial edit was published"
+    );
+    assert!(
+        observed.is_none() || observed.as_ref() == Some(&expected_old),
+        "replacement advertised active while the old run is still shutting down"
+    );
 }
