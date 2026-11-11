@@ -205,6 +205,10 @@ impl FftConv {
         for (segment, segment_f) in coeffs_padded.iter_mut().zip(coeffs_f.iter_mut()) {
             fft.process_with_scratch(segment, segment_f, &mut scratch_fw)
                 .unwrap();
+            // Setup can inherit SCHED_FIFO from the service. Long FIRs must
+            // let equal-priority status/control threads run between partitions.
+            // This is coefficient preparation, never the audio processing loop.
+            std::thread::yield_now();
         }
 
         FftConv {
@@ -358,6 +362,8 @@ impl Filter for FftConv {
                 self.fft
                     .process_with_scratch(segment, segment_f, &mut self.scratch_fw)
                     .unwrap();
+                // Parameter reload has the same scheduling obligation as setup.
+                std::thread::yield_now();
             }
             self.coeffs_f = coeffs_f;
         } else {
