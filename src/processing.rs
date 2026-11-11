@@ -30,6 +30,14 @@ use std::time::{Duration, Instant};
 // 5.333 ms; absence beyond this wait rejects only the pending arm request.
 const ARM_CANDIDATE_WAIT: Duration = Duration::from_millis(10);
 
+pub struct PipelineUpdate {
+    pub diff: config::ConfigChange,
+    pub config: config::PreparedConfig,
+    // The supervisor owns an unbounded acknowledgement channel for this run.
+    // Publication follows installation; queueing alone never changes GetConfig.
+    pub installed: crossbeam_channel::Sender<config::PreparedConfig>,
+}
+
 struct ProcessingControl {
     paused: bool,
     armed: Option<crate::protection::control::Command>,
@@ -112,12 +120,12 @@ fn replace_pipeline(
     control: &mut ProcessingControl,
     pipeline: &mut pipeline::Pipeline,
     diff: config::ConfigChange,
-    new_config: config::PreparedConfig,
+    new_config: &config::PreparedConfig,
     processing_params: &Arc<ProcessingParameters>,
 ) -> bool {
     control.reject_armed(protection);
-    protection.install(&new_config);
-    let new_config = new_config.into_config();
+    protection.install(new_config);
+    let new_config = new_config.config().clone();
     match diff {
         config::ConfigChange::Pipeline | config::ConfigChange::MixerParameters => {
             debug!("Rebuilding pipeline.");
@@ -142,7 +150,7 @@ pub fn run_processing(
     barrier_proc: Arc<Barrier>,
     tx_pb: crossbeam_channel::Sender<AudioMessage>,
     rx_cap: crossbeam_channel::Receiver<AudioMessage>,
-    rx_pipeconf: crossbeam_channel::Receiver<(config::ConfigChange, config::PreparedConfig)>,
+    rx_pipeconf: crossbeam_channel::Receiver<PipelineUpdate>,
     stop: crossbeam_channel::Receiver<()>,
     processing_params: Arc<ProcessingParameters>,
 ) -> thread::JoinHandle<()> {
@@ -299,14 +307,17 @@ pub fn run_processing(
                 }
                 recv(configurations) -> update => {
                     match update {
-                        Ok((diff, new_config)) => {
+                        Ok(update) => {
                             trace!("Message received on config channel");
                             if !replace_pipeline(
                                 &mut protection, &mut control, &mut pipeline,
-                                diff, new_config, &processing_params,
+                                update.diff, &update.config, &processing_params,
                             ) {
                                 control.pause(&mut protection);
                                 pending = Some(AudioMessage::EndOfStream);
+                            } else if update.installed.send(update.config).is_err() {
+                                // The supervisor has ended this run.
+                                break;
                             }
                         }
                         Err(_) => {
@@ -481,12 +492,21 @@ mod tests {
             barrier.wait();
             let before = params.protection.guard_snapshot().unwrap().record;
             let updated = configuration_with_gain(9.5);
+            let (installed, receipt) = crossbeam_channel::unbounded();
             tx_conf
-                .send((
-                    config::config_diff(initial.config(), updated.config()),
-                    updated,
-                ))
+                .send(PipelineUpdate {
+                    diff: config::config_diff(initial.config(), updated.config()),
+                    config: updated.clone(),
+                    installed,
+                })
                 .unwrap();
+            assert_eq!(
+                receipt
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .config(),
+                updated.config()
+            );
             let committed = wait_snapshot(&params.protection, |s| s.pipeline > before.pipeline);
             assert_eq!(committed.frames, 0);
             assert!(!committed.processing_valid);
@@ -552,12 +572,21 @@ mod tests {
             assert_eq!(rx_pb.len(), 1);
             assert_eq!(capture_queue.len(), 1);
             let updated = configuration_with_gain(9.5);
+            let (installed, receipt) = crossbeam_channel::unbounded();
             tx_conf
-                .send((
-                    config::config_diff(initial.config(), updated.config()),
-                    updated,
-                ))
+                .send(PipelineUpdate {
+                    diff: config::config_diff(initial.config(), updated.config()),
+                    config: updated.clone(),
+                    installed,
+                })
                 .unwrap();
+            assert_eq!(
+                receipt
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .config(),
+                updated.config()
+            );
             let committed = wait_snapshot(&params.protection, |s| s.pipeline > before.pipeline);
             assert_eq!(committed.frames, 0);
             assert!(!committed.processing_valid);
@@ -782,7 +811,7 @@ mod tests {
             &mut control,
             &mut pipeline,
             config::ConfigChange::Pipeline,
-            updated,
+            &updated,
             &params,
         ));
         let after = params.protection.guard_snapshot().unwrap().record;
@@ -1168,12 +1197,21 @@ mod tests {
         let mut updated = conf.config().clone();
         updated.title = Some("updated title".to_string());
         let updated = config::validate_config(updated, None).unwrap();
+        let (installed, receipt) = crossbeam_channel::unbounded();
         tx_conf
-            .send((
-                config::config_diff(conf.config(), updated.config()),
-                updated,
-            ))
+            .send(PipelineUpdate {
+                diff: config::config_diff(conf.config(), updated.config()),
+                config: updated.clone(),
+                installed,
+            })
             .unwrap();
+        assert_eq!(
+            receipt
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .config(),
+            updated.config()
+        );
         wait_snapshot(&params.protection, |s| s.pipeline > before.pipeline);
         tx_cap.send(AudioMessage::Audio(chunk())).unwrap();
         tx_cap.send(AudioMessage::EndOfStream).unwrap();

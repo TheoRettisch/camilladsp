@@ -14,6 +14,10 @@
 // Mozilla Public License along with this program. If not, see
 // <https://www.gnu.org/licenses/> and <https://www.mozilla.org/MPL/2.0/>.
 
+#[cfg(test)]
+#[path = "../build.rs"]
+mod build_provenance;
+
 #[cfg(target_os = "linux")]
 extern crate alsa;
 #[cfg(target_os = "linux")]

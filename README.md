@@ -2414,6 +2414,46 @@ the serialized configuration and graph/profile identity; their schema and
 accepted values are unchanged. The declarations live in
 [`src/protection.rs`](src/protection.rs).
 
+Direct ALSA playback treats XRUN and suspension observed through either PCM
+state or `EPIPE`/`ESTRPIPE` from wait, write or availability reads as a discarded
+chunk. It retains accepted-prefix accounting, retires the backend, then drops
+and prepares the PCM. Only fresh-generation output may follow; a failed
+recovery remains terminal. The old buffer is never resumed or retried.
+
+Live pipeline replacement, including filter parameters and metadata,
+retires qualification and old output stamps. Processing services updates while
+capture is idle or playback is blocked, and acknowledges installation before
+the supervisor publishes the replacement through `GetConfig`. Device changes
+restart the run; identical configurations do nothing. Dedicated volume, mute
+and fader commands use their separate control paths.
+
+Each installed graph requires a fresh pre-arm attempt and its configured
+qualification window: the maximum of DC, enabled RMS/tone and twice enabled
+short-power tau, with an initial baseline chunk. Long-power tau is excluded.
+The paired watchdog admits one reviewed graph, so EQ and title/description
+edits can keep amplifier release inhibited until that graph is restored or its
+offline binding is reviewed and updated. Two seconds is a profile default,
+not a universal recovery time.
+
+The loopback WebSocket is privileged control access. Ownership UUIDs and
+generations coordinate restart/replay handling; they do not authenticate
+clients. Any connected client can attempt ownership takeover and guarded reset.
+Takeover preserves history, and reset still requires matching state and fresh
+generations, leaves admission inactive, and requires subsequent qualification.
+Accepted reset deliberately clears both power EWMAs; qualification does not
+prove physical cooldown. Read-only or less-trusted clients need authorization
+at the control interface. The independent watchdog also checks its own exact
+owner, attempt and receipt before allowing amplifier release.
+
+Git builds require a clean working tree and index, including nonignored untracked files.
+The build script checks on every Cargo build, including incremental builds,
+and an explicit `CAMILLA_PROTECTION_REVISION` must match HEAD. Archive builds
+require that variable from the verified pinned package; the package/archive
+hash must be checked by the build caller. The 40-character revision format is
+unchanged. Retain the executable SHA-256, source/archive provenance and build
+settings in qualification/deployment evidence: configuration hashes do not
+identify the DSP executable, and source overlays grant no qualification.
+
 ### Compressor
 The "Compressor" processor implements a standard dynamic range compressor.
 It is configured using the most common parameters.

@@ -50,6 +50,87 @@ fn status_structs() -> StatusStructs {
     }
 }
 
+#[test]
+fn active_config_waits_for_installation_and_queued_diffs_follow_requests() {
+    let initial = configuration();
+    let mut raw = serde_json::to_value(&initial).unwrap();
+    raw["title"] = serde_json::json!("first replacement");
+    raw["filters"] = serde_json::json!({"gain": {"type": "Gain", "parameters": {"gain": -6.0}}});
+    raw["pipeline"].as_array_mut().unwrap().insert(
+        0,
+        serde_json::json!({"type": "Filter", "channels": [0], "names": ["gain"]}),
+    );
+    let first =
+        config::validate_config(serde_json::from_value(raw.clone()).unwrap(), None).unwrap();
+    raw["filters"]["gain"]["parameters"]["gain"] = serde_json::json!(-12.0);
+    let second = config::validate_config(serde_json::from_value(raw).unwrap(), None).unwrap();
+    let active = Arc::new(Mutex::new(Some(initial.clone())));
+    let shared = SharedConfigs {
+        active: active.clone(),
+        previous: Arc::new(Mutex::new(None)),
+    };
+    let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
+    let (_tx_status, rx_status) = crossbeam_channel::unbounded();
+    let (tx_conf, rx_conf) = crossbeam_channel::unbounded();
+    let (tx_stop, rx_stop) = crossbeam_channel::unbounded();
+    let (tx_capture, rx_capture) = crossbeam_channel::unbounded();
+    let threads = RunThreads {
+        capture_command: tx_capture,
+        processing_stop: tx_stop,
+        barrier: Arc::new(Barrier::new(1)),
+        starting: false,
+        processing: thread::spawn(move || {
+            rx_stop.recv().unwrap();
+        }),
+        capture: thread::spawn(move || {
+            rx_capture.recv().unwrap();
+        }),
+        playback: thread::spawn(|| {}),
+    };
+    let supervisor = thread::spawn(move || {
+        supervise_run(
+            initial,
+            shared,
+            &status_structs(),
+            rx_ctrl,
+            rx_status,
+            tx_conf,
+            threads,
+        )
+        .unwrap()
+    });
+    tx_ctrl
+        .send(ControllerMessage::ConfigChanged(Box::new(first.clone())))
+        .unwrap();
+    let first_update = rx_conf.recv_timeout(Duration::from_secs(2)).unwrap();
+    // A second dequeued update proves the first queue operation has completed,
+    // without depending on scheduling at the active-config assignment.
+    tx_ctrl
+        .send(ControllerMessage::ConfigChanged(Box::new(second.clone())))
+        .unwrap();
+    let second_update = rx_conf.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(active.lock().as_ref().unwrap().config().title, None);
+    assert!(
+        matches!(&second_update.diff, config::ConfigChange::FilterParameters { filters, .. }
+        if filters == &["gain".to_string()])
+    );
+
+    for (update, expected) in [(first_update, first), (second_update, second)] {
+        update.installed.send(update.config).unwrap();
+        let start = std::time::Instant::now();
+        while active.lock().as_ref().unwrap().config() != expected.config() {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "installation not published"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    tx_ctrl.send(ControllerMessage::Stop).unwrap();
+    assert!(matches!(supervisor.join().unwrap(), ExitState::Restart));
+    assert!(active.lock().is_none());
+}
+
 enum Trigger {
     Stop,
     Exit,

@@ -289,12 +289,16 @@ fn supervise_run(
     status_structs: &StatusStructs,
     rx_ctrl: crossbeam_channel::Receiver<ControllerMessage>,
     rx_status: crossbeam_channel::Receiver<StatusMessage>,
-    tx_pipeconf: crossbeam_channel::Sender<(config::ConfigChange, config::PreparedConfig)>,
+    tx_pipeconf: crossbeam_channel::Sender<processing::PipelineUpdate>,
     mut threads: RunThreads,
 ) -> Res<ExitState> {
     let result = (|| -> Res<ExitState> {
         let mut pb_ready = false;
         let mut cap_ready = false;
+        // Diffs follow the FIFO of requested configurations. Public active
+        // state advances only when processing acknowledges installation.
+        let mut requested_config = active_config.clone();
+        let (tx_installed, rx_installed) = crossbeam_channel::unbounded();
 
         loop {
             // If startup procedure is not finished, do not process config change or exit
@@ -304,6 +308,13 @@ fn supervise_run(
                 rx_ctrl.clone()
             };
             select! {
+                recv(rx_installed) -> installed => {
+                    active_config = installed?;
+                    *shared_configs.active.lock() = Some(active_config.clone());
+                    let used_channels = config::used_capture_channels(active_config.config());
+                    debug!("Using channels {used_channels:?}");
+                    status_structs.capture.write().used_channels = used_channels;
+                },
                 recv(ctrl_ch) -> msg  => {
                     match msg {
                         Ok(ControllerMessage::ConfigChanged(new_conf)) => {
@@ -313,17 +324,17 @@ fn supervise_run(
                             }
                             status_structs.processing.set_processing_load(0.0);
                             status_structs.processing.set_resampler_load(0.0);
-                            let comp = config::config_diff(active_config.config(), new_conf.config());
+                            let comp = config::config_diff(requested_config.config(), new_conf.config());
                             match comp {
                                 config::ConfigChange::Pipeline
                                 | config::ConfigChange::MixerParameters
                                 | config::ConfigChange::FilterParameters { .. } => {
-                                    tx_pipeconf.send((comp, *new_conf.clone()))?;
-                                    active_config = *new_conf;
-                                    *shared_configs.active.lock() = Some(active_config.clone());
-                                    let used_channels = config::used_capture_channels(active_config.config());
-                                    debug!("Using channels {used_channels:?}");
-                                    status_structs.capture.write().used_channels = used_channels;
+                                    tx_pipeconf.send(processing::PipelineUpdate {
+                                        diff: comp,
+                                        config: *new_conf.clone(),
+                                        installed: tx_installed.clone(),
+                                    })?;
+                                    requested_config = *new_conf;
                                     debug!("Sent changes to pipeline");
                                 }
                                 config::ConfigChange::Devices => {

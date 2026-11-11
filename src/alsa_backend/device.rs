@@ -166,15 +166,15 @@ fn flush_protected_playback(pcmdevice: &impl PlaybackPcm, channels: &PlaybackCha
     true
 }
 
-/// ALSA reports an XRUN as EPIPE from a later wait, write or availability
-/// read, even after a RUNNING state check. That is the same discontinuity as an
-/// observed XRUN state, not a device failure. Frames already written stay
+/// ALSA reports XRUN/suspension as EPIPE/ESTRPIPE from a later wait, write or
+/// availability read, even after a RUNNING state check. Apply the same discard
+/// policy as an observed XRUN/Suspended state. Frames already written stay
 /// accounted to the old backend, which the owner retires before recovery.
-fn discard_on_xrun(operation: &str, err: alsa::Error) -> Res<PlaybackResult> {
-    if Errno::from_raw(err.errno()) != Errno::EPIPE {
+fn discard_on_discontinuity(operation: &str, err: alsa::Error) -> Res<PlaybackResult> {
+    if !matches!(Errno::from_raw(err.errno()), Errno::EPIPE | Errno::ESTRPIPE) {
         return Err(Box::new(err));
     }
-    warn!("PB: XRUN reported by {operation}, retiring the playback backend: {err}");
+    warn!("PB: discontinuity reported by {operation}, retiring the playback backend: {err}");
     Ok(PlaybackResult::Discarded)
 }
 
@@ -209,7 +209,7 @@ fn play_buffer(
         match pcmdevice.wait(timeout) {
             Ok(true) => {}
             Ok(false) => return Ok(PlaybackResult::Stalled),
-            Err(err) => return discard_on_xrun("wait", err),
+            Err(err) => return discard_on_discontinuity("wait", err),
         }
         if !protection.is_stream_current() {
             return Ok(PlaybackResult::Discarded);
@@ -227,7 +227,7 @@ fn play_buffer(
                 buffer = &mut buffer[frames * bytes_per_frame..];
             }
             Err(err) if Errno::from_raw(err.errno()) == Errno::EAGAIN => continue,
-            Err(err) => return discard_on_xrun("write", err),
+            Err(err) => return discard_on_discontinuity("write", err),
         }
         // Positive writes are accounted before state/availability or logging.
         // Observe only RUNNING around the hardware-synchronized avail read.
@@ -237,7 +237,7 @@ fn play_buffer(
         let begin = crate::protection::monotonic_ns();
         let available = match pcmdevice.avail() {
             Ok(available) => available,
-            Err(err) => return discard_on_xrun("availability read", err),
+            Err(err) => return discard_on_discontinuity("availability read", err),
         };
         let end = crate::protection::monotonic_ns();
         if pcmdevice.state() != alsa::pcm::State::Running {
@@ -1502,11 +1502,13 @@ mod protection_tests {
         };
         parameters.max_allowed_peak_db -= 0.5;
         let updated = crate::config::validate_config(updated, None).unwrap();
+        let (installed, _receipt) = crossbeam_channel::unbounded();
         tx_config
-            .send((
-                crate::config::config_diff(initial.config(), updated.config()),
-                updated,
-            ))
+            .send(crate::processing::PipelineUpdate {
+                diff: crate::config::config_diff(initial.config(), updated.config()),
+                config: updated,
+                installed,
+            })
             .unwrap();
         let after = wait_status(before["epoch"]["pipeline"].as_u64().unwrap());
         assert!(
@@ -1598,10 +1600,10 @@ mod protection_tests {
         );
     }
 
-    /// PCM results in call order. The state stays RUNNING, so every scripted
-    /// result arrives after a healthy state check.
+    /// PCM results in call order. Unscripted states stay RUNNING.
     #[derive(Default)]
     struct ScriptedPcm {
+        states: RefCell<VecDeque<alsa::pcm::State>>,
         waits: RefCell<VecDeque<alsa::Result<bool>>>,
         writes: RefCell<VecDeque<alsa::Result<usize>>>,
         avails: RefCell<VecDeque<alsa::Result<Frames>>>,
@@ -1618,12 +1620,13 @@ mod protection_tests {
                 waits: RefCell::new(waits.into()),
                 writes: RefCell::new(writes.into()),
                 avails: RefCell::new(avails.into()),
-                prepare: None,
+                ..Default::default()
             }
         }
 
         fn exhausted(&self) -> bool {
-            self.waits.borrow().is_empty()
+            self.states.borrow().is_empty()
+                && self.waits.borrow().is_empty()
                 && self.writes.borrow().is_empty()
                 && self.avails.borrow().is_empty()
         }
@@ -1631,7 +1634,10 @@ mod protection_tests {
 
     impl PlaybackPcm for ScriptedPcm {
         fn state(&self) -> alsa::pcm::State {
-            alsa::pcm::State::Running
+            self.states
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(alsa::pcm::State::Running)
         }
 
         fn pause(&self, _pause: bool) -> alsa::Result<()> {
@@ -1673,8 +1679,8 @@ mod protection_tests {
         alsa::Error::new(function, errno as i32)
     }
 
-    fn xrun<T>(function: &'static str) -> alsa::Result<T> {
-        Err(failure(function, Errno::EPIPE))
+    fn discontinuity<T>(function: &'static str, errno: Errno) -> alsa::Result<T> {
+        Err(failure(function, errno))
     }
 
     fn ring_frames() -> Frames {
@@ -1724,70 +1730,126 @@ mod protection_tests {
     }
 
     #[test]
-    fn xrun_at_wait_write_or_availability_is_a_discard_for_backend_retirement() {
+    fn xrun_and_suspend_discard_without_retry_before_backend_recovery() {
         let size = ring_frames();
         let partial = 100;
-        // (operation, waits, writes, availability reads, frames accepted first)
-        let cases: Vec<(&str, Vec<_>, Vec<_>, Vec<_>, usize)> = vec![
-            ("wait", vec![xrun("snd_pcm_wait")], vec![], vec![], 0),
-            (
-                "write",
-                vec![Ok(true)],
-                vec![xrun("snd_pcm_writei")],
-                vec![],
-                0,
-            ),
-            (
-                "write after a partial write",
-                vec![Ok(true), Ok(true)],
-                vec![Ok(partial), xrun("snd_pcm_writei")],
-                vec![Ok(size - partial as Frames)],
-                partial,
-            ),
-            (
-                "availability read",
-                vec![Ok(true)],
-                vec![Ok(FRAMES)],
-                vec![xrun("snd_pcm_avail")],
-                FRAMES,
-            ),
-        ];
-        for (operation, waits, writes, avails, accepted) in cases {
-            let pcm = ScriptedPcm::new(waits, writes, avails);
-            let (result, mut guard, stamp, mut progress) = play_scripted(&pcm);
+        for errno in [Errno::EPIPE, Errno::ESTRPIPE] {
+            // (operation, waits, writes, availability reads, frames accepted first)
+            let cases: Vec<(&str, Vec<_>, Vec<_>, Vec<_>, usize)> = vec![
+                (
+                    "wait",
+                    vec![discontinuity("snd_pcm_wait", errno)],
+                    vec![],
+                    vec![],
+                    0,
+                ),
+                (
+                    "write",
+                    vec![Ok(true)],
+                    vec![discontinuity("snd_pcm_writei", errno)],
+                    vec![],
+                    0,
+                ),
+                (
+                    "write after a partial write",
+                    vec![Ok(true), Ok(true)],
+                    vec![Ok(partial), discontinuity("snd_pcm_writei", errno)],
+                    vec![Ok(size - partial as Frames)],
+                    partial,
+                ),
+                (
+                    "availability read",
+                    vec![Ok(true)],
+                    vec![Ok(FRAMES)],
+                    vec![discontinuity("snd_pcm_avail", errno)],
+                    FRAMES,
+                ),
+            ];
+            for (operation, waits, writes, avails, accepted) in cases {
+                let pcm = ScriptedPcm::new(waits, writes, avails);
+                let (result, mut guard, stamp, mut progress) = play_scripted(&pcm);
+                assert!(
+                    matches!(result, Ok(PlaybackResult::Discarded)),
+                    "{operation}: {errno} was not discarded: {result:?}"
+                );
+                assert!(pcm.exhausted(), "{operation}: PCM operations after {errno}");
+                // A prefix the PCM accepted stays accounted to the old backend,
+                // but earns neither consumption nor completed-write credit.
+                let old = guard.shared.playback_snapshot().unwrap();
+                assert_eq!(old.submitted_frames, accepted as u64, "{operation}");
+                assert!(!old.valid && old.source_begin_ns == 0, "{operation}");
+                assert_eq!(guard.shared.completed_frame_end(), None, "{operation}");
+                // The owner retires the backend before any PCM recovery.
+                let trip = guard.trip();
+                progress.retire();
+                assert!(!stamp.is_stream_current(), "{operation}");
+                let (status, statuses) = crossbeam_channel::unbounded();
+                assert!(flush_protected_playback(
+                    &pcm,
+                    &PlaybackChannels {
+                        audio: crossbeam_channel::never(),
+                        status,
+                    }
+                ));
+                assert!(
+                    statuses.is_empty(),
+                    "successful recovery must not stop playback"
+                );
+                guard.backend_wakeup();
+                assert!(guard.expected().backend > old.backend, "{operation}");
+                let fresh = guard.shared.playback_snapshot().unwrap();
+                assert_eq!(
+                    (fresh.submitted_frames, fresh.frames),
+                    (0, 0),
+                    "{operation}"
+                );
+                assert_eq!(guard.trip(), trip, "{operation}");
+                let mut next = chunk();
+                guard.process(&mut next);
+                assert!(
+                    progress.accepts(next.protection.as_ref().unwrap()),
+                    "{operation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn suspended_state_discards_at_the_same_pcm_boundaries() {
+        use alsa::pcm::State::{Running, Suspended};
+        for states in [
+            vec![Suspended],
+            vec![Running, Suspended],
+            vec![Running, Running, Suspended],
+        ] {
+            let accepted = if states.len() == 1 { 0 } else { FRAMES };
+            let mut pcm = ScriptedPcm::new(
+                if accepted > 0 { vec![Ok(true)] } else { vec![] },
+                if accepted > 0 {
+                    vec![Ok(FRAMES)]
+                } else {
+                    vec![]
+                },
+                if states.len() == 3 {
+                    vec![Ok(ring_frames() - FRAMES as Frames)]
+                } else {
+                    vec![]
+                },
+            );
+            pcm.states = RefCell::new(states.into());
+            let (result, guard, stamp, mut progress) = play_scripted(&pcm);
             assert!(
                 matches!(result, Ok(PlaybackResult::Discarded)),
-                "{operation}: XRUN was not discarded: {result:?}"
+                "{result:?}"
             );
-            assert!(
-                pcm.exhausted(),
-                "{operation}: PCM operations after the XRUN"
-            );
-            // A prefix the PCM accepted stays accounted to the old backend,
-            // but earns neither consumption nor completed-write credit.
-            let old = guard.shared.playback_snapshot().unwrap();
-            assert_eq!(old.submitted_frames, accepted as u64, "{operation}");
-            assert!(!old.valid && old.source_begin_ns == 0, "{operation}");
-            assert_eq!(guard.shared.completed_frame_end(), None, "{operation}");
-            // The owner retires the backend before any PCM recovery.
-            let trip = guard.trip();
-            progress.retire();
-            assert!(!stamp.is_stream_current(), "{operation}");
-            guard.backend_wakeup();
-            assert!(guard.expected().backend > old.backend, "{operation}");
-            let fresh = guard.shared.playback_snapshot().unwrap();
+            assert!(pcm.exhausted());
             assert_eq!(
-                (fresh.submitted_frames, fresh.frames),
-                (0, 0),
-                "{operation}"
+                guard.shared.playback_snapshot().unwrap().submitted_frames,
+                accepted as u64
             );
-            assert_eq!(guard.trip(), trip, "{operation}");
-            let mut next = chunk();
-            guard.process(&mut next);
-            assert!(
-                progress.accepts(next.protection.as_ref().unwrap()),
-                "{operation}"
-            );
+            assert_eq!(guard.shared.completed_frame_end(), None);
+            progress.retire();
+            assert!(!stamp.is_stream_current());
         }
     }
 
@@ -1795,11 +1857,8 @@ mod protection_tests {
     fn unrelated_pcm_errors_remain_playback_errors() {
         for (operation, errno) in [
             ("snd_pcm_wait", Errno::EIO),
-            ("snd_pcm_wait", Errno::ESTRPIPE),
             ("snd_pcm_writei", Errno::ENODEV),
-            ("snd_pcm_writei", Errno::ESTRPIPE),
             ("snd_pcm_avail", Errno::EBADFD),
-            ("snd_pcm_avail", Errno::ESTRPIPE),
         ] {
             let pcm = match operation {
                 "snd_pcm_wait" => {
