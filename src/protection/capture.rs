@@ -128,7 +128,7 @@ fn shape(chunk: &AudioChunk) -> bool {
 fn copy_bits(chunk: &AudioChunk, target: &mut [u64]) {
     for (channel, wave) in chunk.waveforms.iter().take(CHANNELS).enumerate() {
         for (frame, value) in wave.iter().take(FRAMES).enumerate() {
-            target[channel * FRAMES + frame] = (*value as f64).to_bits();
+            target[channel * FRAMES + frame] = value.to_bits();
         }
     }
 }
