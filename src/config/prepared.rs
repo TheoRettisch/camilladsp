@@ -54,3 +54,44 @@ pub fn validate_config(mut config: Configuration, filename: Option<&str>) -> Res
     let guard = protection::AdmittedGuard::new(&config)?;
     Ok(PreparedConfig { config, guard })
 }
+
+/// A partial edit, resolved by the controller against its latest request.
+pub enum ConfigMutation {
+    Patch(serde_json::Value),
+    SetValue(String, serde_json::Value),
+}
+
+#[derive(Debug)]
+pub enum ConfigMutationError {
+    InvalidRequest(String),
+    Read(String),
+    Validation(String),
+}
+
+impl ConfigMutation {
+    pub fn apply(
+        self,
+        base: Option<&PreparedConfig>,
+    ) -> Result<PreparedConfig, ConfigMutationError> {
+        let base = base.ok_or_else(|| {
+            ConfigMutationError::InvalidRequest("No active config to modify".to_string())
+        })?;
+        let mut value = serde_json::to_value(base)
+            .map_err(|error| ConfigMutationError::Read(error.to_string()))?;
+        match self {
+            Self::Patch(patch) => json_patch::merge(&mut value, &patch),
+            Self::SetValue(pointer, replacement) => {
+                let target = value.pointer_mut(&pointer).ok_or_else(|| {
+                    ConfigMutationError::InvalidRequest(format!(
+                        "The requested config does not contain the path '{pointer}'"
+                    ))
+                })?;
+                *target = replacement;
+            }
+        }
+        let config = serde_json::from_value(value)
+            .map_err(|error| ConfigMutationError::Read(error.to_string()))?;
+        validate_config(config, None)
+            .map_err(|error| ConfigMutationError::Validation(error.to_string()))
+    }
+}

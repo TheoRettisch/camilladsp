@@ -1703,7 +1703,7 @@ pub enum ConfigChange {
     None,
 }
 
-pub use self::prepared::{PreparedConfig, validate_config};
+pub use self::prepared::{ConfigMutation, ConfigMutationError, PreparedConfig, validate_config};
 pub use self::utils::capture_channel_labels;
 pub use self::utils::config_diff;
 pub use self::utils::load_config;

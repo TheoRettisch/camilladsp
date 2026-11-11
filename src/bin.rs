@@ -316,36 +316,18 @@ fn supervise_run(
                     status_structs.capture.write().used_channels = used_channels;
                 },
                 recv(ctrl_ch) -> msg  => {
-                    match msg {
-                        Ok(ControllerMessage::ConfigChanged(new_conf)) => {
-                            if !ctrl_ch.is_empty() {
-                                debug!("Dropping config change command since there are more commands in the queue");
-                                continue;
+                    // Resolve partial edits here so queued and pending updates
+                    // share one FIFO base, independent of installation timing.
+                    let (new_conf, reply) = match msg {
+                        Ok(ControllerMessage::ConfigChanged(new_conf)) => (new_conf, None),
+                        Ok(ControllerMessage::MutateConfig { mutation, reply }) => {
+                            match mutation.apply(Some(&requested_config)) {
+                                Ok(conf) => (Box::new(conf), Some(reply)),
+                                Err(error) => {
+                                    let _ = reply.send(Err(error));
+                                    continue;
+                                }
                             }
-                            status_structs.processing.set_processing_load(0.0);
-                            status_structs.processing.set_resampler_load(0.0);
-                            let comp = config::config_diff(requested_config.config(), new_conf.config());
-                            match comp {
-                                config::ConfigChange::Pipeline
-                                | config::ConfigChange::MixerParameters
-                                | config::ConfigChange::FilterParameters { .. } => {
-                                    tx_pipeconf.send(processing::PipelineUpdate {
-                                        diff: comp,
-                                        config: *new_conf.clone(),
-                                        installed: tx_installed.clone(),
-                                    })?;
-                                    requested_config = *new_conf;
-                                    debug!("Sent changes to pipeline");
-                                }
-                                config::ConfigChange::Devices => {
-                                    debug!("Devices changed, restart required.");
-                                    *shared_configs.active.lock() = Some(*new_conf);
-                                    return Ok(ExitState::Restart);
-                                }
-                                config::ConfigChange::None => {
-                                    debug!("No changes in config.");
-                                }
-                            };
                         },
                         Ok(ControllerMessage::Stop) => {
                             debug!("Stop requested...");
@@ -365,6 +347,38 @@ fn supervise_run(
                         Err(err) => {
                             return Err(Box::new(err));
                         }
+                    };
+                    status_structs.processing.set_processing_load(0.0);
+                    status_structs.processing.set_resampler_load(0.0);
+                    let comp = config::config_diff(requested_config.config(), new_conf.config());
+                    let restart = match comp {
+                        config::ConfigChange::Pipeline
+                        | config::ConfigChange::MixerParameters
+                        | config::ConfigChange::FilterParameters { .. } => {
+                            tx_pipeconf.send(processing::PipelineUpdate {
+                                diff: comp,
+                                config: *new_conf.clone(),
+                                installed: tx_installed.clone(),
+                            })?;
+                            requested_config = *new_conf;
+                            debug!("Sent changes to pipeline");
+                            false
+                        }
+                        config::ConfigChange::Devices => {
+                            debug!("Devices changed, restart required.");
+                            *shared_configs.active.lock() = Some(*new_conf);
+                            true
+                        }
+                        config::ConfigChange::None => {
+                            debug!("No changes in config.");
+                            false
+                        }
+                    };
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(()));
+                    }
+                    if restart {
+                        return Ok(ExitState::Restart);
                     }
                 },
                 recv(rx_status) -> msg => {
@@ -1283,6 +1297,13 @@ fn main_process() -> i32 {
                 Ok(ControllerMessage::ConfigChanged(new_conf)) => {
                     debug!("Config change command received");
                     *active_config.lock() = Some(*new_conf);
+                }
+                Ok(ControllerMessage::MutateConfig { mutation, reply }) => {
+                    let mut active = active_config.lock();
+                    let result = mutation.apply(active.as_ref()).map(|conf| {
+                        *active = Some(conf);
+                    });
+                    let _ = reply.send(result);
                 }
                 Ok(ControllerMessage::Stop) => {
                     debug!("Stop command received");

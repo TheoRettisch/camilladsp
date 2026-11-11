@@ -2427,6 +2427,12 @@ the supervisor publishes the replacement through `GetConfig`. Device changes
 restart the run; identical configurations do nothing. Dedicated volume, mute
 and fader commands use their separate control paths.
 
+Configuration commands are handled in controller queue order. `PatchConfig`
+and `SetConfigValue` modify the latest accepted request, including updates still
+awaiting installation. Their success replies confirm validation and acceptance
+by the controller, not installation; configuration reads continue to describe
+the installed graph. A rejected partial edit leaves the request base unchanged.
+
 Each installed graph requires a fresh pre-arm attempt and its configured
 qualification window: the maximum of DC, enabled RMS/tone and twice enabled
 short-power tau, with an initial baseline chunk. Long-power tau is excluded.

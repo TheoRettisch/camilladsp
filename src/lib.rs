@@ -177,6 +177,10 @@ pub enum ExitState {
 pub enum ControllerMessage {
     // Config must be boxed, to prevent "large size difference between variants" warning
     ConfigChanged(Box<config::PreparedConfig>),
+    MutateConfig {
+        mutation: config::ConfigMutation,
+        reply: crossbeam_channel::Sender<Result<(), config::ConfigMutationError>>,
+    },
     Stop,
     Exit,
 }

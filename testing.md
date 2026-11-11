@@ -38,6 +38,11 @@ device restart, backend errors and format changes, playback completion, and
 controller/status/configuration channel disconnection with in-memory workers.
 Startup-error cases require termination requests before barrier release. A
 processing panic must be reported after all three handles have been joined.
+The configuration regression also sends both partial-edit commands through a
+loopback WebSocket while withholding installation acknowledgements. It checks
+that independent edits accumulate, rejected edits leave the request base intact,
+and configuration reads advance only after installation. No audio device is
+opened.
 
 `cargo test --lib processing::tests` also exercises stopping the real processing
 owner with idle capture and with an undrained bounded playback channel. It checks

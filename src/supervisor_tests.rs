@@ -87,11 +87,22 @@ fn active_config_waits_for_installation_and_queued_diffs_follow_requests() {
         }),
         playback: thread::spawn(|| {}),
     };
+    let statuses = status_structs();
+    let supervisor_statuses = statuses.clone();
+    let supervisor_control = tx_ctrl.clone();
+    // Both requests are already queued when the supervisor starts. Earlier
+    // requests must not be dropped: later partial edits may depend on them.
+    tx_ctrl
+        .send(ControllerMessage::ConfigChanged(Box::new(first.clone())))
+        .unwrap();
+    tx_ctrl
+        .send(ControllerMessage::ConfigChanged(Box::new(second.clone())))
+        .unwrap();
     let supervisor = thread::spawn(move || {
         supervise_run(
             initial,
             shared,
-            &status_structs(),
+            &supervisor_statuses,
             rx_ctrl,
             rx_status,
             tx_conf,
@@ -99,15 +110,7 @@ fn active_config_waits_for_installation_and_queued_diffs_follow_requests() {
         )
         .unwrap()
     });
-    tx_ctrl
-        .send(ControllerMessage::ConfigChanged(Box::new(first.clone())))
-        .unwrap();
     let first_update = rx_conf.recv_timeout(Duration::from_secs(2)).unwrap();
-    // A second dequeued update proves the first queue operation has completed,
-    // without depending on scheduling at the active-config assignment.
-    tx_ctrl
-        .send(ControllerMessage::ConfigChanged(Box::new(second.clone())))
-        .unwrap();
     let second_update = rx_conf.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(active.lock().as_ref().unwrap().config().title, None);
     assert!(
@@ -126,6 +129,132 @@ fn active_config_waits_for_installation_and_queued_diffs_follow_requests() {
             thread::sleep(Duration::from_millis(1));
         }
     }
+    #[cfg(feature = "websocket")]
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let (state_change_notify, _state_changes) = crossbeam_channel::unbounded();
+        socketserver::start_server(
+            socketserver::ServerParameters {
+                address: "127.0.0.1",
+                port: port.into(),
+                #[cfg(feature = "secure-websocket")]
+                cert_file: None,
+                #[cfg(feature = "secure-websocket")]
+                cert_pass: None,
+            },
+            socketserver::SharedData {
+                active_config: active.clone(),
+                active_config_path: Arc::new(Mutex::new(None)),
+                previous_config: Arc::new(Mutex::new(None)),
+                command_sender: supervisor_control,
+                capture_status: statuses.capture,
+                playback_status: statuses.playback,
+                processing_params: statuses.processing,
+                processing_status: statuses.status,
+                state_change_notify,
+                state_file_path: None,
+                unsaved_state_change: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let start = std::time::Instant::now();
+        let stream = loop {
+            match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => break stream,
+                Err(_) if start.elapsed() < Duration::from_secs(2) => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("WebSocket server did not start: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (mut websocket, _) =
+            tungstenite::client(format!("ws://127.0.0.1:{port}"), stream).unwrap();
+        let mut request = |command: serde_json::Value| -> serde_json::Value {
+            websocket
+                .send(tungstenite::Message::text(command.to_string()))
+                .unwrap();
+            serde_json::from_str(websocket.read().unwrap().to_text().unwrap()).unwrap()
+        };
+
+        // Hold every installation acknowledgement. Both mutation APIs must
+        // compose with accepted requests while GetConfig stays installed.
+        let mut expected = serde_json::to_value(active.lock().as_ref().unwrap()).unwrap();
+        let mut updates = Vec::new();
+        for (command, field, value) in [
+            (
+                serde_json::json!({"PatchConfig": {"title": "first patch"}}),
+                "title",
+                "first patch",
+            ),
+            (
+                serde_json::json!({"PatchConfig": {"description": "second patch"}}),
+                "description",
+                "second patch",
+            ),
+            (
+                serde_json::json!({"SetConfigValue": ["/title", "third edit"]}),
+                "title",
+                "third edit",
+            ),
+            (
+                serde_json::json!({"SetConfigValue": ["/description", "fourth edit"]}),
+                "description",
+                "fourth edit",
+            ),
+        ] {
+            let name = command.as_object().unwrap().keys().next().unwrap().clone();
+            assert_eq!(request(command)[&name]["result"], "Ok");
+            let update = rx_conf.recv_timeout(Duration::from_secs(2)).unwrap();
+            expected[field] = serde_json::json!(value);
+            assert_eq!(serde_json::to_value(&update.config).unwrap(), expected);
+            updates.push(update);
+            if updates.len() == 1 {
+                for (command, error_kind) in [
+                    (
+                        serde_json::json!({"SetConfigValue": ["/missing", 1]}),
+                        "InvalidRequestError",
+                    ),
+                    (
+                        serde_json::json!({"PatchConfig": {"title": []}}),
+                        "ConfigReadError",
+                    ),
+                    (
+                        serde_json::json!({"PatchConfig": {"title": "rejected", "processors": null}}),
+                        "ConfigValidationError",
+                    ),
+                ] {
+                    let name = command.as_object().unwrap().keys().next().unwrap().clone();
+                    assert!(request(command)[&name]["result"][error_kind].is_string());
+                    assert!(rx_conf.is_empty(), "rejected edit reached processing");
+                }
+            }
+            assert_eq!(
+                request(serde_json::json!("GetConfigTitle"))["GetConfigTitle"]["value"],
+                "first replacement"
+            );
+        }
+        for update in updates {
+            update.installed.send(update.config).unwrap();
+        }
+        let start = std::time::Instant::now();
+        while serde_json::to_value(active.lock().as_ref().unwrap()).unwrap() != expected {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "partial updates not installed"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        websocket.close(None).unwrap();
+    }
+    #[cfg(not(feature = "websocket"))]
+    drop(supervisor_control);
     tx_ctrl.send(ControllerMessage::Stop).unwrap();
     assert!(matches!(supervisor.join().unwrap(), ExitState::Restart));
     assert!(active.lock().is_none());

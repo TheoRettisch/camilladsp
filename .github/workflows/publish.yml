@@ -34,13 +34,13 @@ jobs:
         run: cargo build --release
 
       - name: Compress
-        run: tar -zcvf camilladsp.tar.gz -C target/release camilladsp --owner=0 --group=0 --numeric-owner
+        run: tar -zcvf target/camilladsp.tar.gz -C target/release camilladsp --owner=0 --group=0 --numeric-owner
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v6
         with:
           name: camilladsp-linux-amd64
-          path: camilladsp.tar.gz
+          path: target/camilladsp.tar.gz
           retention-days: 14
 
       - name: Upload binary to release
@@ -48,7 +48,7 @@ jobs:
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: camilladsp.tar.gz
+          file: target/camilladsp.tar.gz
           asset_name: camilladsp-linux-amd64.tar.gz
           tag: ${{ github.event.release.tag_name }}
 
@@ -59,13 +59,13 @@ jobs:
         run: cargo build --release --features pipewire-backend
 
       - name: Compress binary with PipeWire
-        run: tar -zcvf camilladsp-pipewire.tar.gz -C target/release camilladsp --owner=0 --group=0 --numeric-owner
+        run: tar -zcvf target/camilladsp-pipewire.tar.gz -C target/release camilladsp --owner=0 --group=0 --numeric-owner
 
       - name: Upload binary with PipeWire artifact
         uses: actions/upload-artifact@v6
         with:
           name: camilladsp-linux-pipewire-amd64
-          path: camilladsp-pipewire.tar.gz
+          path: target/camilladsp-pipewire.tar.gz
           retention-days: 14
 
       - name: Upload binary with PipeWire to release
@@ -73,7 +73,7 @@ jobs:
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: camilladsp-pipewire.tar.gz
+          file: target/camilladsp-pipewire.tar.gz
           asset_name: camilladsp-linux-pipewire-amd64.tar.gz
           tag: ${{ github.event.release.tag_name }}
 
@@ -84,13 +84,13 @@ jobs:
         run: cargo build --release --features pulse-backend
 
       - name: Compress binary with PulseAudio
-        run: tar -zcvf camilladsp-pulse.tar.gz -C target/release camilladsp --owner=0 --group=0 --numeric-owner
+        run: tar -zcvf target/camilladsp-pulse.tar.gz -C target/release camilladsp --owner=0 --group=0 --numeric-owner
 
       - name: Upload binary with PulseAudio artifact
         uses: actions/upload-artifact@v6
         with:
           name: camilladsp-linux-pulseaudio-amd64
-          path: camilladsp-pulse.tar.gz
+          path: target/camilladsp-pulse.tar.gz
           retention-days: 14
 
       - name: Upload binary with PulseAudio to release
@@ -98,7 +98,7 @@ jobs:
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: camilladsp-pulse.tar.gz
+          file: target/camilladsp-pulse.tar.gz
           asset_name: camilladsp-linux-pulseaudio-amd64.tar.gz
           tag: ${{ github.event.release.tag_name }}
 
@@ -129,13 +129,13 @@ jobs:
         run: cargo build --release
 
       - name: Compress
-        run: tar -zcvf camilladsp.tar.gz -C target/release camilladsp --owner=0 --group=0 --numeric-owner
+        run: tar -zcvf target/camilladsp.tar.gz -C target/release camilladsp --owner=0 --group=0 --numeric-owner
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v6
         with:
           name: camilladsp-linux-aarch64
-          path: camilladsp.tar.gz
+          path: target/camilladsp.tar.gz
           retention-days: 14
 
       - name: Upload binary to release
@@ -143,7 +143,7 @@ jobs:
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: camilladsp.tar.gz
+          file: target/camilladsp.tar.gz
           asset_name: camilladsp-linux-aarch64.tar.gz
           tag: ${{ github.event.release.tag_name }}
 
@@ -154,13 +154,13 @@ jobs:
         run: cargo build --release --features pipewire-backend
 
       - name: Compress binary with PipeWire
-        run: tar -zcvf camilladsp-pipewire.tar.gz -C target/release camilladsp --owner=0 --group=0 --numeric-owner
+        run: tar -zcvf target/camilladsp-pipewire.tar.gz -C target/release camilladsp --owner=0 --group=0 --numeric-owner
 
       - name: Upload binary with PipeWire artifact
         uses: actions/upload-artifact@v6
         with:
           name: camilladsp-linux-pipewire-aarch64
-          path: camilladsp-pipewire.tar.gz
+          path: target/camilladsp-pipewire.tar.gz
           retention-days: 14
 
       - name: Upload binary with PipeWire to release
@@ -168,7 +168,7 @@ jobs:
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: camilladsp-pipewire.tar.gz
+          file: target/camilladsp-pipewire.tar.gz
           asset_name: camilladsp-linux-pipewire-aarch64.tar.gz
           tag: ${{ github.event.release.tag_name }}
 
@@ -179,13 +179,13 @@ jobs:
         run: cargo build --release --features pulse-backend
 
       - name: Compress binary with PulseAudio
-        run: tar -zcvf camilladsp-pulse.tar.gz -C target/release camilladsp --owner=0 --group=0 --numeric-owner
+        run: tar -zcvf target/camilladsp-pulse.tar.gz -C target/release camilladsp --owner=0 --group=0 --numeric-owner
 
       - name: Upload binary with PulseAudio artifact
         uses: actions/upload-artifact@v6
         with:
           name: camilladsp-linux-pulseaudio-aarch64
-          path: camilladsp-pulse.tar.gz
+          path: target/camilladsp-pulse.tar.gz
           retention-days: 14
 
       - name: Upload binary with PulseAudio to release
@@ -193,6 +193,6 @@ jobs:
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: camilladsp-pulse.tar.gz
+          file: target/camilladsp-pulse.tar.gz
           asset_name: camilladsp-linux-pulseaudio-aarch64.tar.gz
           tag: ${{ github.event.release.tag_name }}
