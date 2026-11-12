@@ -226,13 +226,25 @@ impl PlaybackBufferManager {
         }
     }
 
-    pub fn sleep_for_target_delay(&self, millis_per_frame: f32) {
-        let sleep_millis = (self.target_level as f32 * millis_per_frame) as u64;
+    /// Frames the startup sleep must still add when `queued_frames` of audio
+    /// already wait behind the first chunk. A cold start has none queued and
+    /// keeps the full target; a restart behind a backlog must not add the
+    /// whole target on top of it, or the excess stays queued ahead of a full
+    /// device buffer until rate adjust drains it.
+    pub fn remaining_target_delay(&self, queued_frames: Frames) -> Frames {
+        (self.target_level - queued_frames.max(0)).max(0)
+    }
+
+    pub fn sleep_for_target_delay(&self, millis_per_frame: f32, queued_frames: Frames) {
+        let frames = self.remaining_target_delay(queued_frames);
+        let sleep_millis = (frames as f32 * millis_per_frame) as u64;
         trace!(
-            "Sleeping for {} frames = {} ms",
-            self.target_level, sleep_millis
+            "Sleeping for {} of {} target frames, {} already queued = {} ms",
+            frames, self.target_level, queued_frames, sleep_millis
         );
-        thread::sleep(Duration::from_millis(sleep_millis));
+        if sleep_millis > 0 {
+            thread::sleep(Duration::from_millis(sleep_millis));
+        }
     }
 }
 
@@ -255,5 +267,26 @@ impl DeviceBufferManager for PlaybackBufferManager {
 
     fn current_delay(&self, avail: Frames) -> Frames {
         self.data.bufsize - avail
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_sleep_covers_only_the_target_not_already_queued() {
+        let chunk: Frames = 256;
+        let manager = PlaybackBufferManager::new(chunk, 3 * chunk);
+        // Cold start: nothing waits behind the first chunk.
+        assert_eq!(manager.remaining_target_delay(0), 3 * chunk);
+        // Restart behind a backlog: the queue already provides that delay.
+        assert_eq!(manager.remaining_target_delay(chunk), 2 * chunk);
+        assert_eq!(manager.remaining_target_delay(2 * chunk), chunk);
+        assert_eq!(manager.remaining_target_delay(3 * chunk), 0);
+        assert_eq!(manager.remaining_target_delay(4 * chunk), 0);
+        assert_eq!(manager.remaining_target_delay(-chunk), 3 * chunk);
+        let none = PlaybackBufferManager::new(chunk, 0);
+        assert_eq!(none.remaining_target_delay(0), 0);
     }
 }

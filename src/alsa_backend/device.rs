@@ -181,12 +181,15 @@ fn discard_on_discontinuity(operation: &str, err: alsa::Error) -> Res<PlaybackRe
 /// Play only the remaining contiguous range of a protected chunk. A PCM
 /// discontinuity returns to the owner for retirement before recovery; no retry
 /// may replay an old stream's buffer into a freshly prepared ring.
+/// `queued_frames` is the audio already waiting behind this chunk.
+#[allow(clippy::too_many_arguments)]
 fn play_buffer(
     mut buffer: &mut [u8],
     pcmdevice: &impl PlaybackPcm,
     millis_per_frame: f32,
     bytes_per_frame: usize,
     buf_manager: &PlaybackBufferManager,
+    queued_frames: Frames,
     protection: &crate::protection::Stamp,
     progress: &mut crate::protection::playback::Playback,
 ) -> Res<PlaybackResult> {
@@ -195,7 +198,12 @@ fn play_buffer(
     }
     match pcmdevice.state() {
         alsa::pcm::State::Prepared if progress.permits_prepared() => {
-            buf_manager.sleep_for_target_delay(millis_per_frame);
+            // The first write of a fresh backend starts the empty ring
+            // (start threshold 1). Audio that queued behind this chunk while
+            // the backend recovered already counts toward the target delay,
+            // so sleep only for the rest. Every queued chunk keeps its stamp
+            // and is still checked at its own write.
+            buf_manager.sleep_for_target_delay(millis_per_frame, queued_frames);
         }
         alsa::pcm::State::Paused => pcmdevice.pause(false)?,
         alsa::pcm::State::Running => {}
@@ -627,12 +635,16 @@ fn playback_loop_bytes(
                 );
                 progress.converted(conversion_result.1);
 
+                // The channel is FIFO, so chunks behind an admitted chunk
+                // belong to its stream or a later one. Count them like the
+                // rate controller does below.
                 let playback_res = play_buffer(
                     &mut buffer,
                     &protected_pcm,
                     millis_per_frame,
                     params.bytes_per_frame,
                     buf_manager,
+                    (params.chunksize * waiting_chunks_in_channel) as Frames,
                     &protection,
                     &mut progress,
                 );
@@ -1360,7 +1372,11 @@ mod protection_tests {
     use std::collections::VecDeque;
 
     fn null_pcm() -> (alsa::PCM, PlaybackBufferManager) {
-        let mut manager = PlaybackBufferManager::new(FRAMES as Frames, 0);
+        null_pcm_with_target(0)
+    }
+
+    fn null_pcm_with_target(target_level: Frames) -> (alsa::PCM, PlaybackBufferManager) {
+        let mut manager = PlaybackBufferManager::new(FRAMES as Frames, target_level);
         // The software null PCM touches no sound card and cannot produce audio.
         let (pcm, _) = open_pcm(
             "null".to_string(),
@@ -1591,6 +1607,7 @@ mod protection_tests {
             1000.0 / SAMPLE_RATE as f32,
             CHANNELS * 3,
             &manager,
+            0,
             &stamp,
             &mut Playback::new(guard.shared.clone()),
         );
@@ -1694,6 +1711,15 @@ mod protection_tests {
 
     /// Play one admitted chunk of a fresh backend through scripted results.
     fn play_scripted(pcm: &ScriptedPcm) -> (Res<PlaybackResult>, Guard, Stamp, Playback) {
+        play_scripted_behind(pcm, 0, 0)
+    }
+
+    /// As `play_scripted`, with a target delay and audio queued behind the chunk.
+    fn play_scripted_behind(
+        pcm: &ScriptedPcm,
+        target_level: Frames,
+        queued_frames: Frames,
+    ) -> (Res<PlaybackResult>, Guard, Stamp, Playback) {
         let mut guard = Guard::new(Arc::new(Shared::default()));
         guard.install(&configuration());
         let mut output = chunk();
@@ -1701,13 +1727,14 @@ mod protection_tests {
         let stamp = output.protection.unwrap();
         let mut progress = Playback::new(guard.shared.clone());
         // Only the negotiated ring geometry is used; the null PCM stays idle.
-        let (_null, manager) = null_pcm();
+        let (_null, manager) = null_pcm_with_target(target_level);
         let result = play_buffer(
             &mut vec![0; FRAMES * CHANNELS * 3],
             pcm,
             1000.0 / SAMPLE_RATE as f32,
             CHANNELS * 3,
             &manager,
+            queued_frames,
             &stamp,
             &mut progress,
         );
@@ -1727,6 +1754,45 @@ mod protection_tests {
         assert!(matches!(result, Ok(PlaybackResult::Normal)), "{result:?}");
         assert!(pcm.exhausted());
         assert_eq!(guard.shared.completed_frame_end(), Some(FRAMES as u64));
+    }
+
+    #[test]
+    fn prepared_start_sleeps_only_for_the_target_not_already_queued() {
+        use std::time::Duration;
+
+        let size = ring_frames();
+        let prepared = || {
+            let mut pcm = ScriptedPcm::new(
+                vec![Ok(true)],
+                vec![Ok(FRAMES)],
+                vec![Ok(size - FRAMES as Frames)],
+            );
+            pcm.states = RefCell::new(vec![alsa::pcm::State::Prepared].into());
+            pcm
+        };
+        // A cold start has nothing queued and keeps the full 100 ms target
+        // sleep (less at most 1 ms of float truncation).
+        let target = (SAMPLE_RATE / 10) as Frames;
+        let pcm = prepared();
+        let start = Instant::now();
+        let (result, guard, _, _progress) = play_scripted_behind(&pcm, target, 0);
+        assert!(start.elapsed() >= Duration::from_millis(99));
+        assert!(matches!(result, Ok(PlaybackResult::Normal)), "{result:?}");
+        assert!(pcm.exhausted());
+        assert_eq!(guard.shared.completed_frame_end(), Some(FRAMES as u64));
+        // A restart whose queue already covers the target adds no sleep. A
+        // regression would sleep the whole 2 s target; the bound is loose
+        // host slack, not a timing qualification.
+        let target = (2 * SAMPLE_RATE) as Frames;
+        for queued in [target, target + FRAMES as Frames] {
+            let pcm = prepared();
+            let start = Instant::now();
+            let (result, guard, _, _progress) = play_scripted_behind(&pcm, target, queued);
+            assert!(start.elapsed() < Duration::from_secs(1), "{queued}");
+            assert!(matches!(result, Ok(PlaybackResult::Normal)), "{result:?}");
+            assert!(pcm.exhausted());
+            assert_eq!(guard.shared.completed_frame_end(), Some(FRAMES as u64));
+        }
     }
 
     #[test]

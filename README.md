@@ -1165,6 +1165,8 @@ A parameter marked (*) in any example is optional. If they are left out from the
   in the buffer of the playback device when the next chunk arrives.
   When processing starts, the playback device will delay its startup
   in order to get the initial buffer level near this value.
+  When the ALSA backend restarts playback, for example after an underrun,
+  audio already waiting to be played counts toward this delay.
   See also `enable_rate_adjust` which should be set to `true` to allow matching 
   capture and playback rates in order to keep the buffer level at the target value.
   For details on how this value is used during drift correction,
