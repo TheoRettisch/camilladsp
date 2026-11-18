@@ -1028,10 +1028,54 @@ pub enum ConvParameters {
     },
 }
 
+/// The normalized graph serializes the digest. Prepared graphs also retain
+/// the decoded taps shared by every instance of this filter.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct FileCoefficients {
+    sha256: String,
+    #[serde(skip)]
+    pub(crate) values: Option<std::sync::Arc<[PrcFmt]>>,
+}
+
+impl FileCoefficients {
+    pub(crate) fn new(values: Vec<PrcFmt>) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        for value in &values {
+            hash.update(value.to_le_bytes());
+        }
+        Self {
+            sha256: format!("{:x}", hash.finalize()),
+            values: Some(values.into()),
+        }
+    }
+}
+
+impl fmt::Debug for FileCoefficients {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.sha256, f)
+    }
+}
+
+impl PartialEq for FileCoefficients {
+    fn eq(&self, other: &Self) -> bool {
+        self.sha256 == other.sha256
+    }
+}
+
+impl Eq for FileCoefficients {}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConvParametersRaw {
     pub filename: String,
+    #[serde(
+        default,
+        rename = "coefficients_sha256",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) coefficients: Option<FileCoefficients>,
     #[serde(default)]
     format: Option<FileSampleFormat>,
     #[serde(default)]
@@ -1058,6 +1102,12 @@ impl ConvParametersRaw {
 #[serde(deny_unknown_fields)]
 pub struct ConvParametersWav {
     pub filename: String,
+    #[serde(
+        default,
+        rename = "coefficients_sha256",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) coefficients: Option<FileCoefficients>,
     #[serde(default)]
     channel: Option<usize>,
 }

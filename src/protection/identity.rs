@@ -260,20 +260,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn preparation_binds_identity_after_overrides_tokens_and_relative_paths() {
-        struct Fixture(std::path::PathBuf);
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
+    struct Fixture(std::path::PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn fixture() -> Fixture {
         let fixture = Fixture(std::env::temp_dir().join(format!(
             "camilladsp-prepared-{}-{}",
             std::process::id(),
             super::super::monotonic_ns()
         )));
         std::fs::create_dir(&fixture.0).unwrap();
+        fixture
+    }
+
+    #[test]
+    fn preparation_binds_identity_after_overrides_tokens_and_relative_paths() {
+        let fixture = fixture();
         let config_path = fixture.0.join("config.yml");
         let wav_path = fixture.0.join("capture.wav");
         let coefficient_path = fixture.0.join("coeff-48000-24.txt");
@@ -307,6 +314,9 @@ mod tests {
         expected["devices"]["chunksize"] = serde_json::json!(256);
         expected["filters"]["fir-48000"]["parameters"]["filename"] =
             serde_json::json!(coefficient_path);
+        // SHA-256 of the two decoded little-endian f64 taps [1.0, 0.0].
+        expected["filters"]["fir-48000"]["parameters"]["coefficients_sha256"] =
+            serde_json::json!("3239b05c38b825ebb79f103172438292a22a0951351a6b81be1df5d44776cc65");
         expected["pipeline"][0]["names"][0] = serde_json::json!("fir-48000");
         let expected: config::Configuration = serde_json::from_value(expected).unwrap();
         assert_eq!(prepared.config(), &expected);
@@ -318,5 +328,74 @@ mod tests {
             prepared.identity().profile,
             digest(&exported["profile"]).unwrap()
         );
+    }
+
+    #[test]
+    fn file_fir_build_and_reload_use_the_taps_bound_to_each_graph() {
+        let fixture = fixture();
+        let path = fixture.0.join("taps.wav");
+        let mut header = Vec::new();
+        crate::utils::wavtools::write_wav_header(
+            &mut header,
+            2,
+            config::BinarySampleFormat::F64_LE,
+            super::super::SAMPLE_RATE,
+        )
+        .unwrap();
+        let write_taps = |left: f64, right: f64| {
+            let mut bytes = header.clone();
+            bytes.extend(left.to_le_bytes());
+            bytes.extend(right.to_le_bytes());
+            std::fs::write(&path, bytes).unwrap();
+        };
+        let impulse = |pipeline: &mut crate::pipeline::Pipeline| {
+            let mut input = super::super::tests::chunk();
+            input.waveforms[0].fill(0.0);
+            input.waveforms[0][0] = 0.125;
+            pipeline.process_chunk(input).waveforms[0][0]
+        };
+        // Both selectors read only the right sample in this stereo WAV file.
+        for source in [
+            serde_json::json!({"type": "Wav", "filename": path, "channel": 1}),
+            serde_json::json!({"type": "Raw", "filename": path, "format": "F64_LE",
+                "skip_bytes_lines": header.len() + 8, "read_bytes_lines": 8}),
+        ] {
+            let mut raw = serde_json::to_value(super::super::tests::configuration()).unwrap();
+            raw["filters"] = serde_json::json!({"fir": {"type": "Conv", "parameters": source}});
+            raw["pipeline"].as_array_mut().unwrap().insert(
+                0,
+                serde_json::json!({"type": "Filter", "channels": [0], "names": ["fir"]}),
+            );
+            write_taps(0.0, 1.0);
+            let prepared =
+                config::validate_config(serde_json::from_value(raw).unwrap(), None).unwrap();
+            let exported = export(&prepared).unwrap();
+            let revalidate = || {
+                let graph = yaml_serde::from_str(exported["graph_yaml"].as_str().unwrap()).unwrap();
+                config::validate_config(graph, None).unwrap()
+            };
+            write_taps(0.25, 1.0);
+            assert_eq!(revalidate().identity(), prepared.identity());
+            write_taps(0.25, 0.5);
+            let changed = revalidate();
+            std::fs::remove_file(&path).unwrap();
+
+            let params = std::sync::Arc::new(crate::ProcessingParameters::default());
+            let mut pipeline =
+                crate::pipeline::Pipeline::from_config(prepared.config().clone(), params);
+            assert_eq!(impulse(&mut pipeline), 0.125);
+            assert_eq!(export(&prepared).unwrap(), exported);
+            assert_ne!(prepared.identity().graph, changed.identity().graph);
+            let config::ConfigChange::FilterParameters {
+                filters,
+                mixers,
+                processors,
+            } = config::config_diff(prepared.config(), changed.config())
+            else {
+                panic!("a change to the selected FIR taps must update the filter");
+            };
+            pipeline.update_parameters(changed.into_config(), &filters, &mixers, &processors);
+            assert_eq!(impulse(&mut pipeline), 0.0625);
+        }
     }
 }

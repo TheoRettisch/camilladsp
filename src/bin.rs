@@ -323,9 +323,6 @@ fn supervise_run(
                 recv(rx_installed) -> installed => {
                     active_config = installed?;
                     *shared_configs.active.lock() = Some(active_config.clone());
-                    let used_channels = config::used_capture_channels(active_config.config());
-                    debug!("Using channels {used_channels:?}");
-                    status_structs.capture.write().used_channels = used_channels;
                 },
                 recv(ctrl_ch) -> msg  => {
                     // Resolve partial edits here so queued and pending updates
@@ -372,7 +369,7 @@ fn supervise_run(
                             None
                         }
                         config::ConfigChange::Devices => {
-                            debug!("Devices changed, restart required.");
+                            debug!("Device settings or capture channels changed, restart required.");
                             Some(new_conf)
                         }
                         config::ConfigChange::None => {

@@ -555,11 +555,51 @@ fn startup_publication_waits_for_installation_and_rejects_poisoned_owner() {
 }
 
 #[test]
+fn mixer_changes_restart_only_when_the_capture_mask_changes() {
+    let mut raw = serde_json::to_value(configuration()).unwrap();
+    raw["mixers"] = serde_json::json!({"sparse": {
+        "channels": {"in": 24, "out": 24},
+        "mapping": [{"dest": 0, "sources": [{"channel": 0}]}]
+    }});
+    raw["pipeline"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, serde_json::json!({"type": "Mixer", "name": "sparse"}));
+    let prepare = |value: &serde_json::Value| {
+        config::validate_config(serde_json::from_value(value.clone()).unwrap(), None).unwrap()
+    };
+    let sparse = prepare(&raw);
+    raw["mixers"]["sparse"]["mapping"][0]["sources"][0]["gain"] = serde_json::json!(-6);
+    let gain = prepare(&raw);
+    assert!(matches!(
+        config::config_diff(sparse.config(), gain.config()),
+        config::ConfigChange::MixerParameters
+    ));
+
+    raw["mixers"]["sparse"]["mapping"][0]["sources"][0]["channel"] = serde_json::json!(1);
+    let rerouted = prepare(&raw);
+    raw["pipeline"][0]["bypassed"] = serde_json::json!(true);
+    let bypassed = prepare(&raw);
+    assert!(matches!(
+        config::config_diff(gain.config(), rerouted.config()),
+        config::ConfigChange::Devices
+    ));
+    assert_restart_waits_for_old_workers(rerouted, bypassed);
+}
+
+#[test]
 fn device_reload_must_not_publish_active_before_old_workers_exit() {
     let initial = configuration();
     let mut raw = initial.config().clone();
     raw.devices.queuelimit = Some(raw.devices.queuelimit() + 1);
     let replacement = config::validate_config(raw, None).unwrap();
+    assert_restart_waits_for_old_workers(initial, replacement);
+}
+
+fn assert_restart_waits_for_old_workers(
+    initial: config::PreparedConfig,
+    replacement: config::PreparedConfig,
+) {
     assert!(matches!(
         config::config_diff(initial.config(), replacement.config()),
         config::ConfigChange::Devices
@@ -572,7 +612,7 @@ fn device_reload_must_not_publish_active_before_old_workers_exit() {
     let (tx_ctrl, rx_ctrl) = crossbeam_channel::unbounded();
     let rx_pending = rx_ctrl.clone();
     let (_tx_status, rx_status) = crossbeam_channel::unbounded();
-    let (tx_conf, _rx_conf) = crossbeam_channel::unbounded();
+    let (tx_conf, rx_conf) = crossbeam_channel::unbounded();
     let (tx_stop, rx_stop) = crossbeam_channel::unbounded();
     let (tx_capture, rx_capture) = crossbeam_channel::unbounded();
     let (tx_stopping, rx_stopping) = crossbeam_channel::bounded(1);
@@ -627,8 +667,12 @@ fn device_reload_must_not_publish_active_before_old_workers_exit() {
     // Always finish and join, including when the qualification assertion fails.
     tx_finish.send(()).unwrap();
     let ExitState::RestartWithConfig(next) = supervisor.join().unwrap() else {
-        panic!("device request was lost during shutdown");
+        panic!("replacement request was lost during shutdown");
     };
+    assert!(
+        rx_conf.is_empty(),
+        "old run received an incompatible live update"
+    );
     assert_eq!(next.config(), &expected_new);
     assert!(
         active.lock().is_none(),

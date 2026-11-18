@@ -20,6 +20,7 @@ use crate::filters::Filter;
 use num_complex::Complex;
 use num_traits::Zero;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+use std::borrow::Cow;
 use std::sync::Arc;
 
 // Sample format
@@ -230,25 +231,7 @@ impl FftConv {
     }
 
     pub fn from_config(name: &str, data_length: usize, conf: config::ConvParameters) -> Self {
-        let values = match conf {
-            config::ConvParameters::Values { values } => values,
-            config::ConvParameters::Raw(params) => filters::read_coeff_file(
-                &params.filename,
-                &params.format(),
-                params.read_bytes_lines(),
-                params.skip_bytes_lines(),
-            )
-            .unwrap(),
-            config::ConvParameters::Wav(params) => {
-                filters::read_wav(&params.filename, params.channel()).unwrap()
-            }
-            config::ConvParameters::Dummy { length } => {
-                let mut values = vec![0.0; length];
-                values[0] = 1.0;
-                values
-            }
-        };
-        FftConv::new(name, data_length, &values)
+        FftConv::new(name, data_length, &coefficients(&conf))
     }
 }
 
@@ -318,24 +301,7 @@ impl Filter for FftConv {
             parameters: conf, ..
         } = conf
         {
-            let coeffs = match conf {
-                config::ConvParameters::Values { values } => values,
-                config::ConvParameters::Raw(params) => filters::read_coeff_file(
-                    &params.filename,
-                    &params.format(),
-                    params.read_bytes_lines(),
-                    params.skip_bytes_lines(),
-                )
-                .unwrap(),
-                config::ConvParameters::Wav(params) => {
-                    filters::read_wav(&params.filename, params.channel()).unwrap()
-                }
-                config::ConvParameters::Dummy { length } => {
-                    let mut values = vec![0.0; length];
-                    values[0] = 1.0;
-                    values
-                }
-            };
+            let coeffs = coefficients(&conf);
 
             let nsegments = ((coeffs.len() as PrcFmt) / (self.npoints as PrcFmt)).ceil() as usize;
 
@@ -442,30 +408,67 @@ pub unsafe fn bench_multiply_add_elements_neon(
     unsafe { neon::multiply_add_elements_neon(result, slice_a, slice_b) };
 }
 
+fn read_file_coefficients(conf: &config::ConvParameters) -> Res<Option<Vec<PrcFmt>>> {
+    let values = match conf {
+        config::ConvParameters::Raw(params) => filters::read_coeff_file(
+            &params.filename,
+            &params.format(),
+            params.read_bytes_lines(),
+            params.skip_bytes_lines(),
+        )?,
+        config::ConvParameters::Wav(params) => {
+            filters::read_wav(&params.filename, params.channel())?
+        }
+        _ => return Ok(None),
+    };
+    if values.is_empty() {
+        return Err(config::ConfigError::new("Conv coefficients are empty").into());
+    }
+    Ok(Some(values))
+}
+
+pub(crate) fn prepare_file_coefficients(conf: &mut config::ConvParameters, used: bool) -> Res<()> {
+    let binding = if used {
+        read_file_coefficients(conf)?.map(config::FileCoefficients::new)
+    } else {
+        None
+    };
+    match conf {
+        config::ConvParameters::Raw(params) => params.coefficients = binding,
+        config::ConvParameters::Wav(params) => params.coefficients = binding,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn coefficients(conf: &config::ConvParameters) -> Cow<'_, [PrcFmt]> {
+    let binding = match conf {
+        config::ConvParameters::Raw(params) => &params.coefficients,
+        config::ConvParameters::Wav(params) => &params.coefficients,
+        config::ConvParameters::Values { values } => return Cow::Borrowed(values),
+        config::ConvParameters::Dummy { length } => {
+            let mut values = vec![0.0; *length];
+            values[0] = 1.0;
+            return Cow::Owned(values);
+        }
+    };
+    match binding
+        .as_ref()
+        .and_then(|binding| binding.values.as_deref())
+    {
+        Some(values) => Cow::Borrowed(values),
+        // Direct callers can also construct a filter from an unprepared config.
+        None => Cow::Owned(
+            read_file_coefficients(conf)
+                .unwrap()
+                .expect("file-backed FIR"),
+        ),
+    }
+}
+
 /// Validate a FFT convolution config.
 pub fn validate_config(conf: &config::ConvParameters) -> Res<()> {
-    match conf {
-        config::ConvParameters::Values { .. } | config::ConvParameters::Dummy { .. } => Ok(()),
-        config::ConvParameters::Raw(params) => {
-            let coeffs = filters::read_coeff_file(
-                &params.filename,
-                &params.format(),
-                params.read_bytes_lines(),
-                params.skip_bytes_lines(),
-            )?;
-            if coeffs.is_empty() {
-                return Err(config::ConfigError::new("Conv coefficients are empty").into());
-            }
-            Ok(())
-        }
-        config::ConvParameters::Wav(params) => {
-            let coeffs = filters::read_wav(&params.filename, params.channel())?;
-            if coeffs.is_empty() {
-                return Err(config::ConfigError::new("Conv coefficients are empty").into());
-            }
-            Ok(())
-        }
-    }
+    read_file_coefficients(conf).map(|_| ())
 }
 
 #[cfg(test)]

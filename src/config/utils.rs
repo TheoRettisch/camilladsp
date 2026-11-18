@@ -23,6 +23,7 @@ use crate::processors::race;
 use crate::utils::wavtools::find_data_in_wav_stream;
 use parking_lot::RwLock;
 use serde::{Deserialize, de};
+use std::collections::HashSet;
 use std::error;
 use std::fmt;
 use std::fs::File;
@@ -432,7 +433,10 @@ pub fn config_diff(currentconf: &Configuration, newconf: &Configuration) -> Conf
     if currentconf == newconf {
         return ConfigChange::None;
     }
-    if currentconf.devices != newconf.devices {
+    // Each capture queue contains chunks built with one channel mask.
+    if currentconf.devices != newconf.devices
+        || used_capture_channels(currentconf) != used_capture_channels(newconf)
+    {
         return ConfigChange::Devices;
     }
     if currentconf.pipeline != newconf.pipeline {
@@ -629,6 +633,7 @@ pub(super) fn normalize_and_validate(conf: &mut Configuration, filename: Option<
     }
     let mut num_channels = conf.devices.capture.channels();
     let fs = conf.devices.samplerate;
+    let mut used_convolutions = HashSet::new();
     if let Some(pipeline) = &conf.pipeline {
         for step in pipeline {
             match step {
@@ -683,21 +688,21 @@ pub(super) fn normalize_and_validate(conf: &mut Configuration, filename: Option<
                             }
                         }
                         for name in &step.names {
-                            if let Some(filters) = &conf.filters {
-                                if !filters.contains_key(name) {
-                                    let msg = format!("Use of missing filter '{name}'");
-                                    return Err(ConfigError::new(&msg).into());
-                                }
-                                match filters::validate_filter(fs, filters.get(name).unwrap()) {
-                                    Ok(_) => {}
-                                    Err(err) => {
-                                        let msg = format!("Invalid filter '{name}'. Reason: {err}");
-                                        return Err(ConfigError::new(&msg).into());
-                                    }
-                                }
+                            let filter = conf
+                                .filters
+                                .as_ref()
+                                .and_then(|filters| filters.get(name))
+                                .ok_or_else(|| {
+                                    ConfigError::new(&format!("Use of missing filter '{name}'"))
+                                })?;
+                            if matches!(filter, Filter::Conv { .. }) {
+                                used_convolutions.insert(name);
                             } else {
-                                let msg = format!("Use of missing filter '{name}'");
-                                return Err(ConfigError::new(&msg).into());
+                                filters::validate_filter(fs, filter).map_err(|err| {
+                                    ConfigError::new(&format!(
+                                        "Invalid filter '{name}'. Reason: {err}"
+                                    ))
+                                })?;
                             }
                         }
                     }
@@ -798,6 +803,15 @@ pub(super) fn normalize_and_validate(conf: &mut Configuration, filename: Option<
             "Pipeline outputs {num_channels} channels, playback device has {num_channels_out}."
         );
         return Err(ConfigError::new(&msg).into());
+    }
+    for (name, filter) in conf.filters.iter_mut().flatten() {
+        if let Filter::Conv { parameters, .. } = filter {
+            filters::fftconv::prepare_file_coefficients(
+                parameters,
+                used_convolutions.contains(name),
+            )
+            .map_err(|err| ConfigError::new(&format!("Invalid filter '{name}'. Reason: {err}")))?;
+        }
     }
     Ok(())
 }

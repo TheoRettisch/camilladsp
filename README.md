@@ -2425,9 +2425,16 @@ recovery remains terminal. The old buffer is never resumed or retried.
 Live pipeline replacement, including filter parameters and metadata,
 retires qualification and old output stamps. Processing services updates while
 capture is idle or playback is blocked, and acknowledges installation before
-the supervisor publishes the replacement through `GetConfig`. Device changes
-restart the run; identical configurations do nothing. Dedicated volume, mute
-and fader commands use their separate control paths.
+the supervisor publishes the replacement through `GetConfig`. A device change or
+a change in which capture channels the pipeline needs restarts the run with a
+fresh capture queue. Identical configurations do nothing. Dedicated
+volume, mute and fader commands use their separate control paths.
+
+Validation loads the selected taps for each enabled file-backed FIR. `GetConfig`
+and `--export-protection-profile` include a derived `coefficients_sha256` in its
+`Raw` or `Wav` parameters. This hashes the decoded taps as consecutive little-endian
+64-bit floats. Each filter uses those taps until a new configuration is installed.
+Revalidating a file recomputes its digest, so changed taps require a new graph approval.
 
 Configuration commands are handled in controller queue order. `PatchConfig`
 and `SetConfigValue` modify the latest accepted request, including updates still
