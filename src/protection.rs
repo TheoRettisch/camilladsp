@@ -201,13 +201,11 @@ pub struct Shared {
     backend_wakeup_rx: crossbeam_channel::Receiver<()>,
     pipeline_wakeup: crossbeam_channel::Sender<()>,
     pipeline_wakeup_rx: crossbeam_channel::Receiver<()>,
-    commands: crossbeam_channel::Sender<Command>,
-    command_rx: crossbeam_channel::Receiver<Command>,
+    commands: parking_lot::Mutex<Option<crossbeam_channel::Sender<Command>>>,
 }
 
 impl Default for Shared {
     fn default() -> Self {
-        let (commands, command_rx) = crossbeam_channel::bounded(1);
         let (backend_wakeup, backend_wakeup_rx) = crossbeam_channel::bounded(1);
         let (pipeline_wakeup, pipeline_wakeup_rx) = crossbeam_channel::bounded(1);
         Self {
@@ -224,8 +222,7 @@ impl Default for Shared {
             backend_wakeup_rx,
             pipeline_wakeup,
             pipeline_wakeup_rx,
-            commands,
-            command_rx,
+            commands: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -241,11 +238,21 @@ pub struct Snapshot {
 impl Shared {
     /// Internal bounded mailbox, not an externally admitted wire operation.
     pub fn submit(&self, command: Command) -> Result<(), crossbeam_channel::TrySendError<Command>> {
-        self.commands.try_send(command)
+        self.commands
+            .lock()
+            .as_ref()
+            .ok_or(crossbeam_channel::TrySendError::Disconnected(command))?
+            .try_send(command)
     }
 
-    pub(crate) fn commands(&self) -> &crossbeam_channel::Receiver<Command> {
-        &self.command_rx
+    pub(crate) fn open_commands(&self) -> crossbeam_channel::Receiver<Command> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        *self.commands.lock() = Some(tx);
+        rx
+    }
+
+    pub(crate) fn close_commands(&self) {
+        self.commands.lock().take();
     }
 
     pub(crate) fn backend_wakeups(&self) -> &crossbeam_channel::Receiver<()> {

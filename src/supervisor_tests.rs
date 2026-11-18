@@ -8,7 +8,7 @@ fn configuration() -> config::PreparedConfig {
         "devices": {"samplerate": 48000, "chunksize": 256,
             "capture": {"type": "SignalGenerator", "channels": 24,
                 "signal": {"type": "Sine", "freq": 1000, "level": -20}},
-            "playback": {"type": "Alsa", "channels": 24, "device": "hw:fixture,0", "format": "S24_3_LE"}},
+            "playback": {"type": "Alsa", "channels": 24, "device": "hw:nonexistent-camilladsp-test-card,0", "format": "S24_3_LE"}},
         "processors": {"guard": {"type": "Protection", "parameters": {
             "output_channels": camillalib::protection::OUTPUT_CHANNELS,
             "tweeter_channels": camillalib::protection::TWEETER_CHANNELS,
@@ -466,6 +466,40 @@ fn startup_errors_release_waiters_before_joining() {
     ] {
         exercise(Trigger::Backend(message), true, false, false);
     }
+}
+
+#[test]
+fn failed_playback_open_keeps_the_prior_trip_readable() {
+    let config = configuration();
+    let statuses = status_structs();
+    let params = &statuses.processing;
+    {
+        let mut guard = params.protection_owner.lock().unwrap();
+        guard.install(&config);
+        let mut incomplete =
+            camillalib::audiochunk::AudioChunk::new(Vec::new(), 0.0, 0.0, 256, 256);
+        guard.process(&mut incomplete);
+    }
+    let shared = SharedConfigs {
+        active: Arc::default(),
+        previous: Arc::default(),
+    };
+    run(config, shared, statuses.clone(), crossbeam_channel::never()).unwrap();
+    assert!(matches!(
+        statuses.status.read().stop_reason,
+        StopReason::PlaybackError(_)
+    ));
+    let reply: serde_json::Value =
+        serde_json::from_str(&params.protection_reply("\"GetProtectionStatus\"").unwrap()).unwrap();
+    let reply = &reply["GetProtectionStatus"];
+    assert_eq!(reply["result"], "Ok", "{reply}");
+    let status = &reply["value"];
+    assert_eq!(status["trip"]["latched"], true);
+    assert_eq!(status["trip"]["reason"], "coverage");
+    for source in ["processing", "playback", "telemetry", "conversion"] {
+        assert_eq!(status[source]["valid"], false);
+    }
+    assert_eq!(status["playback"]["submitted_frames"], 0);
 }
 
 #[test]

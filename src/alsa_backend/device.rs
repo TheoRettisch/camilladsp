@@ -110,7 +110,21 @@ enum PlaybackResult {
 /// The PCM operations of protected playback and its recovery. ALSA is the
 /// only production implementation; tests script operation results through it.
 trait PlaybackPcm {
-    fn state(&self) -> alsa::pcm::State;
+    fn state_raw(&self) -> i32;
+
+    fn state(&self) -> alsa::Result<alsa::pcm::State> {
+        // PCM::state() panics when an unplugged device returns a negative errno.
+        let raw = self.state_raw();
+        if raw < 0 {
+            return Err(alsa::Error::new("snd_pcm_state", raw.saturating_neg()));
+        }
+        alsa::pcm::State::all()
+            .iter()
+            .copied()
+            .find(|state| *state as i32 == raw)
+            .ok_or_else(|| alsa::Error::unsupported("snd_pcm_state"))
+    }
+
     fn pause(&self, pause: bool) -> alsa::Result<()>;
     fn wait(&self, timeout_ms: u32) -> alsa::Result<bool>;
     fn writei(&self, buffer: &[u8]) -> alsa::Result<usize>;
@@ -125,8 +139,8 @@ struct AlsaPlayback<'a> {
 }
 
 impl PlaybackPcm for AlsaPlayback<'_> {
-    fn state(&self) -> alsa::pcm::State {
-        self.pcm.state()
+    fn state_raw(&self) -> i32 {
+        self.pcm.state_raw()
     }
 
     fn pause(&self, pause: bool) -> alsa::Result<()> {
@@ -196,7 +210,7 @@ fn play_buffer(
     if !progress.accepts(protection) {
         return Ok(PlaybackResult::Discarded);
     }
-    match pcmdevice.state() {
+    match pcmdevice.state()? {
         alsa::pcm::State::Prepared if progress.permits_prepared() => {
             // The first write of a fresh backend starts the empty ring
             // (start threshold 1). Audio that queued behind this chunk while
@@ -239,7 +253,7 @@ fn play_buffer(
         }
         // Positive writes are accounted before state/availability or logging.
         // Observe only RUNNING around the hardware-synchronized avail read.
-        if pcmdevice.state() != alsa::pcm::State::Running {
+        if pcmdevice.state()? != alsa::pcm::State::Running {
             return Ok(PlaybackResult::Discarded);
         }
         let begin = crate::protection::monotonic_ns();
@@ -248,7 +262,7 @@ fn play_buffer(
             Err(err) => return discard_on_discontinuity("availability read", err),
         };
         let end = crate::protection::monotonic_ns();
-        if pcmdevice.state() != alsa::pcm::State::Running {
+        if pcmdevice.state()? != alsa::pcm::State::Running {
             return Ok(PlaybackResult::Discarded);
         }
         progress
@@ -1245,6 +1259,9 @@ impl PlaybackDevice for AlsaPlaybackDevice {
                             error!("Playback error: {err}");
                         }
                         barrier.wait();
+                        // Processing has now installed its pipeline. Publish the same
+                        // empty, retired playback record as an ordinary shutdown.
+                        drop(crate::protection::playback::Playback::new(protection));
                     }
                 }
             })
@@ -1620,7 +1637,7 @@ mod protection_tests {
     /// PCM results in call order. Unscripted states stay RUNNING.
     #[derive(Default)]
     struct ScriptedPcm {
-        states: RefCell<VecDeque<alsa::pcm::State>>,
+        states: RefCell<VecDeque<i32>>,
         waits: RefCell<VecDeque<alsa::Result<bool>>>,
         writes: RefCell<VecDeque<alsa::Result<usize>>>,
         avails: RefCell<VecDeque<alsa::Result<Frames>>>,
@@ -1650,11 +1667,11 @@ mod protection_tests {
     }
 
     impl PlaybackPcm for ScriptedPcm {
-        fn state(&self) -> alsa::pcm::State {
+        fn state_raw(&self) -> i32 {
             self.states
                 .borrow_mut()
                 .pop_front()
-                .unwrap_or(alsa::pcm::State::Running)
+                .unwrap_or(alsa::pcm::State::Running as i32)
         }
 
         fn pause(&self, _pause: bool) -> alsa::Result<()> {
@@ -1767,7 +1784,7 @@ mod protection_tests {
                 vec![Ok(FRAMES)],
                 vec![Ok(size - FRAMES as Frames)],
             );
-            pcm.states = RefCell::new(vec![alsa::pcm::State::Prepared].into());
+            pcm.states = RefCell::new(vec![alsa::pcm::State::Prepared as i32].into());
             pcm
         };
         // A cold start has nothing queued and keeps the full 100 ms target
@@ -1881,41 +1898,54 @@ mod protection_tests {
     }
 
     #[test]
-    fn suspended_state_discards_at_the_same_pcm_boundaries() {
-        use alsa::pcm::State::{Running, Suspended};
-        for states in [
-            vec![Suspended],
-            vec![Running, Suspended],
-            vec![Running, Running, Suspended],
-        ] {
-            let accepted = if states.len() == 1 { 0 } else { FRAMES };
-            let mut pcm = ScriptedPcm::new(
-                if accepted > 0 { vec![Ok(true)] } else { vec![] },
-                if accepted > 0 {
-                    vec![Ok(FRAMES)]
+    fn suspension_and_disconnect_at_each_state_check_preserve_write_accounting() {
+        let running = alsa::pcm::State::Running as i32;
+        for state in [alsa::pcm::State::Suspended as i32, -(Errno::ENODEV as i32)] {
+            for states in [
+                vec![state],
+                vec![running, state],
+                vec![running, running, state],
+            ] {
+                let accepted = if states.len() == 1 { 0 } else { FRAMES };
+                let mut pcm = ScriptedPcm::new(
+                    if accepted > 0 { vec![Ok(true)] } else { vec![] },
+                    if accepted > 0 {
+                        vec![Ok(FRAMES)]
+                    } else {
+                        vec![]
+                    },
+                    if states.len() == 3 {
+                        vec![Ok(ring_frames() - FRAMES as Frames)]
+                    } else {
+                        vec![]
+                    },
+                );
+                pcm.states = RefCell::new(states.into());
+                let (result, guard, stamp, mut progress) = play_scripted(&pcm);
+                if state < 0 {
+                    let err = result
+                        .expect_err("disconnect")
+                        .downcast::<alsa::Error>()
+                        .unwrap();
+                    assert_eq!(
+                        (err.func(), err.errno()),
+                        ("snd_pcm_state", Errno::ENODEV as i32)
+                    );
                 } else {
-                    vec![]
-                },
-                if states.len() == 3 {
-                    vec![Ok(ring_frames() - FRAMES as Frames)]
-                } else {
-                    vec![]
-                },
-            );
-            pcm.states = RefCell::new(states.into());
-            let (result, guard, stamp, mut progress) = play_scripted(&pcm);
-            assert!(
-                matches!(result, Ok(PlaybackResult::Discarded)),
-                "{result:?}"
-            );
-            assert!(pcm.exhausted());
-            assert_eq!(
-                guard.shared.playback_snapshot().unwrap().submitted_frames,
-                accepted as u64
-            );
-            assert_eq!(guard.shared.completed_frame_end(), None);
-            progress.retire();
-            assert!(!stamp.is_stream_current());
+                    assert!(
+                        matches!(result, Ok(PlaybackResult::Discarded)),
+                        "{result:?}"
+                    );
+                }
+                assert!(pcm.exhausted());
+                assert_eq!(
+                    guard.shared.playback_snapshot().unwrap().submitted_frames,
+                    accepted as u64
+                );
+                assert_eq!(guard.shared.completed_frame_end(), None);
+                progress.retire();
+                assert!(!stamp.is_stream_current());
+            }
         }
     }
 

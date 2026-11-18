@@ -356,13 +356,14 @@ impl Shared {
                 json!({key: {"result": "Ok", "value": {"command_id": id, "disposition": "queued"}}})
                     .to_string()
             }
-            Err(_) => error(&key, "busy"),
+            Err(crossbeam_channel::TrySendError::Full(_)) => error(&key, "busy"),
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => error(&key, "unavailable"),
         })
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::protection::{
         Guard,
@@ -387,7 +388,7 @@ mod tests {
         reply["GetProtectionStatus"]["value"].clone()
     }
 
-    fn request(status: &Value, id: u64, reset: bool) -> String {
+    pub(crate) fn request(status: &Value, id: u64, reset: bool) -> String {
         let mut command = json!({"command_id": id,
             "expected": {"epoch": status["epoch"], "trip_generation": status["trip"]["generation"],
                 "control_revision": status["control"]["revision"]},
@@ -402,6 +403,7 @@ mod tests {
     #[test]
     fn offline_frame_to_wire_slice_for_parent_replay() {
         let (shared, mut guard, mut playback) = setup();
+        let commands = shared.open_commands();
         let mut replies = Vec::new();
         let capture = |replies: &mut Vec<Value>| {
             replies.push(
@@ -412,7 +414,7 @@ mod tests {
         capture(&mut replies);
         let prearm = request(&status(&shared), 1, false);
         shared.protection_reply(&prearm).unwrap();
-        guard.control_only(shared.commands().try_recv().unwrap());
+        guard.control_only(commands.try_recv().unwrap());
         let play = |audio: &crate::audiochunk::AudioChunk, playback: &mut Playback| {
             let stamp = audio.protection.as_ref().unwrap();
             assert!(playback.accepts(stamp));
@@ -446,7 +448,7 @@ mod tests {
         armed["SetProtectionContext"]["qualification_id"] = json!(1);
         shared.protection_reply(&armed.to_string()).unwrap();
         let mut audio = chunk();
-        guard.process_with_command(&mut audio, Some(shared.commands().try_recv().unwrap()));
+        guard.process_with_command(&mut audio, Some(commands.try_recv().unwrap()));
         assert!(
             audio
                 .waveforms
@@ -470,7 +472,7 @@ mod tests {
         guard.pause();
         let reset = request(&status(&shared), 3, true);
         shared.protection_reply(&reset).unwrap();
-        guard.control_only(shared.commands().try_recv().unwrap());
+        guard.control_only(commands.try_recv().unwrap());
         capture(&mut replies);
         assert_eq!(
             replies[5]["GetProtectionStatus"]["value"]["control"]["last_command"]["result"],
@@ -493,6 +495,7 @@ mod tests {
     #[test]
     fn actual_wire_commands_reset_while_paused_and_reject_duplicates() {
         let (shared, mut guard, _playback) = setup();
+        let commands = shared.open_commands();
         for (id, reset) in [(1, false), (2, true)] {
             let text = request(&status(&shared), id, reset);
             let duplicate =
@@ -503,9 +506,9 @@ mod tests {
                     .unwrap()
                     .contains("invalid")
             );
-            assert!(shared.commands().is_empty());
+            assert!(commands.is_empty());
             assert!(shared.protection_reply(&text).unwrap().contains("queued"));
-            guard.control_only(shared.commands().try_recv().unwrap());
+            guard.control_only(commands.try_recv().unwrap());
             let result = status(&shared);
             assert_eq!(result["control"]["last_command"]["result"], "applied");
             assert_eq!(result["control"]["last_command"]["command_id"], id);
@@ -571,9 +574,10 @@ mod tests {
     #[test]
     fn real_guard_forwards_and_arms_only_after_full_qualification() {
         let (shared, mut guard, _playback) = setup();
+        let commands = shared.open_commands();
         let text = request(&status(&shared), 1, false);
         assert!(shared.protection_reply(&text).unwrap().contains("queued"));
-        guard.control_only(shared.commands().try_recv().unwrap());
+        guard.control_only(commands.try_recv().unwrap());
         let armed = |shared: &Shared, id| {
             let mut command: Value =
                 serde_json::from_str(&request(&status(shared), id, false)).unwrap();
@@ -588,7 +592,7 @@ mod tests {
         };
         armed(&shared, 2);
         let mut audio = chunk();
-        guard.process_with_command(&mut audio, Some(shared.commands().try_recv().unwrap()));
+        guard.process_with_command(&mut audio, Some(commands.try_recv().unwrap()));
         assert!(audio.waveforms.iter().flatten().all(|v| *v == 0.0));
         assert_eq!(
             status(&shared)["control"]["last_command"]["result"],
@@ -605,7 +609,7 @@ mod tests {
         assert!(audio.waveforms.iter().flatten().any(|v| *v != 0.0));
         assert_eq!(status(&shared)["guard"]["state"], "active");
         armed(&shared, 3);
-        guard.process_with_command(&mut chunk(), Some(shared.commands().try_recv().unwrap()));
+        guard.process_with_command(&mut chunk(), Some(commands.try_recv().unwrap()));
         let status = status(&shared);
         assert_eq!(status["control"]["last_command"]["result"], "applied");
         assert_eq!(status["control"]["mode"], "armed");
@@ -614,6 +618,7 @@ mod tests {
     #[test]
     fn wire_rejects_wrong_process_unknown_fields_and_boolean_counters() {
         let (shared, guard, _playback) = setup();
+        let commands = shared.open_commands();
         let base: Value = serde_json::from_str(&request(&status(&shared), 1, false)).unwrap();
         for field in ["command_id", "qualification_id", "parent_reset_generation"] {
             let mut request = base.clone();
@@ -642,7 +647,7 @@ mod tests {
                 .unwrap()
                 .contains("state_mismatch")
         );
-        assert!(shared.commands().is_empty());
+        assert!(commands.is_empty());
         assert_eq!(guard.control.revision, 0);
     }
 }

@@ -427,12 +427,13 @@ fn bounded_mailbox_rejects_a_second_pending_command() {
         qualification_id: 1,
         operation: Operation::Context(Mode::Prearm),
     };
+    let commands = shared.open_commands();
     shared.submit(request).unwrap();
     assert!(matches!(
         shared.submit(request),
         Err(crossbeam_channel::TrySendError::Full(_))
     ));
-    assert_eq!(shared.commands().try_recv().unwrap(), request);
+    assert_eq!(commands.try_recv().unwrap(), request);
 }
 
 #[test]

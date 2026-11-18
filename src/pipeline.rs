@@ -329,7 +329,15 @@ impl Pipeline {
     }
 
     /// Process an AudioChunk by calling either a MixerStep or a FilterStep
-    pub fn process_chunk(&mut self, mut chunk: AudioChunk) -> AudioChunk {
+    pub fn process_chunk(&mut self, chunk: AudioChunk) -> AudioChunk {
+        self.process_chunk_with_final_step(chunk, |_| {})
+    }
+
+    pub(crate) fn process_chunk_with_final_step(
+        &mut self,
+        mut chunk: AudioChunk,
+        final_step: impl FnOnce(&mut AudioChunk),
+    ) -> AudioChunk {
         let start = Instant::now();
         let main_volume = self.volume.process_chunk(&mut chunk);
         for mut step in &mut self.steps {
@@ -351,6 +359,7 @@ impl Pipeline {
         // Mixers may replace AudioChunk. Attach main-volume provenance only
         // after the graph so a replacement cannot lose or forge observation.
         chunk.main_volume = Some(main_volume);
+        final_step(&mut chunk);
         let secs_elapsed = start.elapsed().as_secs_f32();
         let load = 100.0 * secs_elapsed / self.secs_per_chunk;
         self.processing_params.set_processing_load(load);

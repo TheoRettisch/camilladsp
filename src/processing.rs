@@ -88,13 +88,12 @@ impl ProcessingControl {
     fn candidate_command(
         &mut self,
         protection: &mut crate::protection::Guard,
-        shared: &crate::protection::Shared,
+        commands: &crossbeam_channel::Receiver<crate::protection::control::Command>,
     ) -> Option<crate::protection::control::Command> {
         // A ready audio receive (or a slow pipeline) must not win a race with
         // the original arm deadline and apply a command after its wait expired.
         self.expire_armed(protection);
-        self.take_armed()
-            .or_else(|| shared.commands().try_recv().ok())
+        self.take_armed().or_else(|| commands.try_recv().ok())
     }
 
     fn pause(&mut self, protection: &mut crate::protection::Guard) {
@@ -248,9 +247,10 @@ pub fn run_processing(
             };
         }
 
+        let shared = &processing_params.protection;
+        let command_rx = shared.open_commands();
         barrier_proc.wait();
         debug!("Processing loop starts now!");
-        let shared = processing_params.protection.clone();
         let mut control = ProcessingControl {
             paused: true,
             armed: None,
@@ -273,7 +273,7 @@ pub fn run_processing(
             control.expire_armed(&mut protection);
             let arm_timeout = control.arm_timeout();
             let commands = if control.armed.is_none() {
-                shared.commands()
+                &command_rx
             } else {
                 &no_commands
             };
@@ -345,9 +345,10 @@ pub fn run_processing(
                 Ok(AudioMessage::Audio(mut chunk)) => {
                     control.paused = false;
                     //trace!("AudioMessage::Audio received");
-                    chunk = pipeline.process_chunk(chunk);
-                    let command = control.candidate_command(&mut protection, &shared);
-                    protection.process_with_command(&mut chunk, command);
+                    chunk = pipeline.process_chunk_with_final_step(chunk, |chunk| {
+                        let command = control.candidate_command(&mut protection, &command_rx);
+                        protection.process_with_command(chunk, command);
+                    });
                     pending = Some(AudioMessage::Audio(chunk));
                 }
                 Ok(AudioMessage::EndOfStream) => {
@@ -367,7 +368,13 @@ pub fn run_processing(
                 }
             }
         }
-        control.pause(&mut protection);
+        shared.close_commands();
+        control.reject_armed(&mut protection);
+        // Finish a submission that won the race with closing the mailbox.
+        if let Ok(command) = command_rx.try_recv() {
+            protection.control_only(command);
+        }
+        protection.pause();
         processing_params.set_processing_load(0.0);
         processing_params.set_resampler_load(0.0);
         if let Some(h) = thread_handle {
@@ -520,7 +527,11 @@ mod tests {
             else {
                 panic!("missing updated output")
             };
-            assert!(output.protection.unwrap().is_current());
+            let stamp = output.protection.unwrap();
+            assert!(stamp.is_current());
+            let guard_secs = Duration::from_nanos(stamp.source_end_ns - stamp.source_begin_ns);
+            let chunk_secs = FRAMES as f32 / crate::protection::SAMPLE_RATE as f32;
+            assert!(params.processing_load() >= 100.0 * guard_secs.as_secs_f32() / chunk_secs);
             assert!(
                 output
                     .waveforms
@@ -756,7 +767,7 @@ mod tests {
             } else {
                 Instant::now() + Duration::from_secs(10)
             });
-            let command = control.candidate_command(&mut guard, &shared);
+            let command = control.candidate_command(&mut guard, &crossbeam_channel::never());
             assert_eq!(command.is_none(), expired);
             guard.process_with_command(&mut chunk(), command);
             let after = shared.guard_snapshot().unwrap().record;
@@ -1035,6 +1046,13 @@ mod tests {
         // Nothing further retires: a repeated read publishes nothing.
         status_reply(params.protection_reply("\"GetProtectionStatus\""));
         assert_eq!(params.protection.guard_snapshot(), Some(settled));
+        for (id, op) in [(1, "SetProtectionContext"), (2, "ResetProtection")] {
+            let request =
+                crate::protection::wire::tests::request(status, id, op == "ResetProtection");
+            let reply: serde_json::Value =
+                serde_json::from_str(&params.protection_reply(&request).unwrap()).unwrap();
+            assert_eq!(reply[op]["code"], "unavailable", "{reply}");
+        }
     }
 
     #[test]
