@@ -185,6 +185,59 @@ mod tests {
     use crate::mixer::used_input_channels;
 
     #[test]
+    fn sparse_mixer_preserves_upstream_compressor_sidechain() {
+        use crate::config::{self, BinarySampleFormat};
+        use crate::pipeline::Pipeline;
+        use crate::utils::conversions::buffer_to_chunk_rawbytes;
+        use serde_json::json;
+
+        let mut raw = serde_json::to_value(crate::protection::tests::configuration()).unwrap();
+        raw["devices"]["capture"] = json!({
+            "type": "Alsa", "device": "hw:test", "channels": 4, "format": "S16_LE"
+        });
+        // RACE feeds input 2 into the compressor's monitor on 1. Input 3 is unused.
+        raw["processors"]["crossfeed"] = json!({"type": "RACE", "parameters": {
+            "channels": 4, "channel_a": 1, "channel_b": 2, "delay": 0.15, "attenuation": 6
+        }});
+        raw["processors"]["compressor"] = json!({"type": "Compressor", "parameters": {
+            "channels": 4, "monitor_channels": [1], "process_channels": [0],
+            "attack": 0.0005, "release": 0.1, "threshold": -20, "factor": 4
+        }});
+        raw["mixers"] = json!({"route": {"channels": {"in": 4, "out": 24},
+            "mapping": [{"dest": 0, "sources": [{"channel": 0}]}]}});
+        raw["pipeline"] = json!([
+            {"type": "Processor", "name": "crossfeed"},
+            {"type": "Processor", "name": "compressor"},
+            {"type": "Mixer", "name": "route"},
+            {"type": "Processor", "name": "guard"}
+        ]);
+        let conf = config::validate_config(serde_json::from_value(raw).unwrap(), None).unwrap();
+        let frames = conf.config().devices.chunksize;
+        let used = config::used_capture_channels(conf.config());
+        let mut pipeline = Pipeline::from_config(conf.into_config(), Default::default());
+        let mut routed_sample = |sidechain: i16| {
+            let frame = [4096, 0, sidechain, i16::MAX]
+                .map(i16::to_le_bytes)
+                .concat();
+            let buffer = frame.repeat(frames);
+            let chunk = buffer_to_chunk_rawbytes(
+                &buffer,
+                4,
+                &BinarySampleFormat::S16_LE,
+                buffer.len(),
+                &used,
+                false,
+            );
+            assert!(chunk.waveforms[3].is_empty());
+            pipeline.process_chunk(chunk).waveforms[0][frames - 1]
+        };
+        let quiet = routed_sample(0);
+        let loud = routed_sample(24576);
+        assert!((quiet - 0.125).abs() < 1e-6);
+        assert!(loud > 0.0 && loud < quiet / 2.0);
+    }
+
+    #[test]
     fn check_all_used() {
         let chans = MixerChannels { r#in: 2, out: 4 };
         let src0 = MixerSource {

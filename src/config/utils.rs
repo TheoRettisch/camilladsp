@@ -492,6 +492,13 @@ pub fn config_diff(currentconf: &Configuration, newconf: &Configuration) -> Conf
             if let Some(current_proc) = oldprocs.get(proc)
                 && params != current_proc
             {
+                if std::mem::discriminant(params) != std::mem::discriminant(current_proc)
+                    && newconf.pipeline.iter().flatten().any(|step| {
+                        matches!(step, PipelineStep::Processor(step) if &step.name == proc && !step.is_bypassed())
+                    })
+                {
+                    return ConfigChange::Pipeline;
+                }
                 processors.push(proc.to_string());
             }
         }
@@ -695,8 +702,13 @@ pub(super) fn normalize_and_validate(conf: &mut Configuration, filename: Option<
                                 .ok_or_else(|| {
                                     ConfigError::new(&format!("Use of missing filter '{name}'"))
                                 })?;
-                            if matches!(filter, Filter::Conv { .. }) {
-                                used_convolutions.insert(name);
+                            if let Filter::Conv { parameters, .. } = filter {
+                                // File taps also bind the graph identity for a zero-channel step.
+                                if step.channels.as_deref() != Some(&[])
+                                    || !matches!(parameters, ConvParameters::Values { .. })
+                                {
+                                    used_convolutions.insert(name);
+                                }
                             } else {
                                 filters::validate_filter(fs, filter).map_err(|err| {
                                     ConfigError::new(&format!(
@@ -816,21 +828,51 @@ pub(super) fn normalize_and_validate(conf: &mut Configuration, filename: Option<
     Ok(())
 }
 
-/// Get a vector telling which channels are actually used in the pipeline
+/// Get the capture channels needed by a validated pipeline.
 pub fn used_capture_channels(conf: &Configuration) -> Vec<bool> {
-    if let Some(pipeline) = &conf.pipeline {
-        for step in pipeline.iter() {
-            if let PipelineStep::Mixer(mix) = step
-                && !mix.is_bypassed()
-            {
-                // Safe to unwrap here since we have already verified that the mixer exists
-                let mixerconf = conf.mixers.as_ref().unwrap().get(&mix.name).unwrap();
-                return mixer::used_input_channels(mixerconf);
+    let pipeline = conf.pipeline.as_deref().unwrap_or_default();
+    let first_mixer = pipeline
+        .iter()
+        .enumerate()
+        .find_map(|(index, step)| match step {
+            PipelineStep::Mixer(mix) if !mix.is_bypassed() => Some((index, mix)),
+            _ => None,
+        });
+    let Some((index, mix)) = first_mixer else {
+        return vec![true; conf.devices.capture.channels()];
+    };
+    let mut used = mixer::used_input_channels(&conf.mixers.as_ref().unwrap()[&mix.name]);
+    // Trace cross-channel dependencies back from the mixer's inputs to capture.
+    for step in pipeline[..index].iter().rev() {
+        let PipelineStep::Processor(step) = step else {
+            continue;
+        };
+        if step.is_bypassed() {
+            continue;
+        }
+        let monitors = match &conf.processors.as_ref().unwrap()[&step.name] {
+            Processor::Compressor { parameters, .. } => &parameters.monitor_channels,
+            Processor::NoiseGate { parameters, .. } => &parameters.monitor_channels,
+            Processor::RACE { parameters, .. } => {
+                let (a, b) = (parameters.channel_a, parameters.channel_b);
+                if used[a] || used[b] {
+                    used[a] = true;
+                    used[b] = true;
+                }
+                continue;
             }
+            Processor::Protection { .. } => continue, // Always the final step.
+        };
+        let monitors = monitors.as_deref().unwrap_or_default();
+        if monitors.is_empty() {
+            used.fill(true);
+            break;
+        }
+        for &channel in monitors {
+            used[channel] = true;
         }
     }
-    let capture_channels = conf.devices.capture.channels();
-    vec![true; capture_channels]
+    used
 }
 
 pub fn capture_channel_labels(config: Option<&Configuration>) -> Option<Vec<Option<String>>> {

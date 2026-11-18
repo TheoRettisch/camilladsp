@@ -478,10 +478,33 @@ mod tests {
 
     #[test]
     fn configuration_wakes_idle_capture_before_the_next_candidate() {
-        // Cover both graph construction and in-place parameter changes. The
-        // changed gain makes the next candidate unsafe, proving installation
-        // of the actual pipeline rather than just publication of a new epoch.
-        for initial in [configuration(), configuration_with_gain(1.0)] {
+        let with_processor = |processor| {
+            let mut conf = serde_json::to_value(configuration()).unwrap();
+            conf["processors"]["dynamics"] = processor;
+            conf["pipeline"].as_array_mut().unwrap().insert(
+                0,
+                serde_json::json!({"type": "Processor", "name": "dynamics"}),
+            );
+            config::validate_config(serde_json::from_value(conf).unwrap(), None).unwrap()
+        };
+        let compressor = with_processor(serde_json::json!({"type": "Compressor", "parameters": {
+            "channels": 24, "attack": 0.001, "release": 0.001, "threshold": -6, "factor": 1
+        }}));
+        let gate = with_processor(serde_json::json!({"type": "NoiseGate", "parameters": {
+            "channels": 24, "monitor_channels": [2], "process_channels": [0],
+            "attack": 0.001, "release": 0.001, "threshold": -6, "attenuation": 20
+        }}));
+        // Both tweeters peak. Only the replacement gate attenuates channel 0,
+        // so the guard must report channel 1 on the first chunk after the ack.
+        let mut gated_input = chunk();
+        gated_input.waveforms[0][FRAMES - 1] = 1.0;
+        gated_input.waveforms[1][FRAMES - 1] = 1.0;
+        let gain = configuration_with_gain(9.5);
+        for (initial, updated, input, trip_channel) in [
+            (configuration(), gain.clone(), chunk(), 0),
+            (configuration_with_gain(1.0), gain, chunk(), 0),
+            (compressor, gate, gated_input, 1),
+        ] {
             let params = Arc::new(ProcessingParameters::default());
             let (tx_pb, rx_pb) = crossbeam_channel::bounded(1);
             let (tx_cap, rx_cap) = crossbeam_channel::bounded(1);
@@ -498,7 +521,6 @@ mod tests {
             );
             barrier.wait();
             let before = params.protection.guard_snapshot().unwrap().record;
-            let updated = configuration_with_gain(9.5);
             let (installed, receipt) = crossbeam_channel::unbounded();
             tx_conf
                 .send(PipelineUpdate {
@@ -522,7 +544,7 @@ mod tests {
             // A closed config source must be disabled, while audio and control
             // remain serviceable. It must not make the pump spin or exit.
             drop(tx_conf);
-            tx_cap.send(AudioMessage::Audio(chunk())).unwrap();
+            tx_cap.send(AudioMessage::Audio(input)).unwrap();
             let AudioMessage::Audio(output) = rx_pb.recv_timeout(Duration::from_secs(2)).unwrap()
             else {
                 panic!("missing updated output")
@@ -547,7 +569,7 @@ mod tests {
                 .trip
                 .unwrap();
             assert_eq!(trip.reason, crate::protection::Reason::Peak);
-            assert_eq!(trip.channel, Some(0));
+            assert_eq!(trip.channel, Some(trip_channel));
             tx_cap.send(AudioMessage::EndOfStream).unwrap();
             assert!(matches!(
                 rx_pb.recv_timeout(Duration::from_secs(2)).unwrap(),

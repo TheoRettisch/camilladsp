@@ -408,7 +408,7 @@ pub unsafe fn bench_multiply_add_elements_neon(
     unsafe { neon::multiply_add_elements_neon(result, slice_a, slice_b) };
 }
 
-fn read_file_coefficients(conf: &config::ConvParameters) -> Res<Option<Vec<PrcFmt>>> {
+fn validate_and_read_file_coefficients(conf: &config::ConvParameters) -> Res<Option<Vec<PrcFmt>>> {
     let values = match conf {
         config::ConvParameters::Raw(params) => filters::read_coeff_file(
             &params.filename,
@@ -418,6 +418,11 @@ fn read_file_coefficients(conf: &config::ConvParameters) -> Res<Option<Vec<PrcFm
         )?,
         config::ConvParameters::Wav(params) => {
             filters::read_wav(&params.filename, params.channel())?
+        }
+        config::ConvParameters::Values { values } if values.is_empty() => {
+            return Err(
+                config::ConfigError::new("Conv Values require at least one coefficient").into(),
+            );
         }
         _ => return Ok(None),
     };
@@ -429,7 +434,7 @@ fn read_file_coefficients(conf: &config::ConvParameters) -> Res<Option<Vec<PrcFm
 
 pub(crate) fn prepare_file_coefficients(conf: &mut config::ConvParameters, used: bool) -> Res<()> {
     let binding = if used {
-        read_file_coefficients(conf)?.map(config::FileCoefficients::new)
+        validate_and_read_file_coefficients(conf)?.map(config::FileCoefficients::new)
     } else {
         None
     };
@@ -459,7 +464,7 @@ fn coefficients(conf: &config::ConvParameters) -> Cow<'_, [PrcFmt]> {
         Some(values) => Cow::Borrowed(values),
         // Direct callers can also construct a filter from an unprepared config.
         None => Cow::Owned(
-            read_file_coefficients(conf)
+            validate_and_read_file_coefficients(conf)
                 .unwrap()
                 .expect("file-backed FIR"),
         ),
@@ -468,7 +473,7 @@ fn coefficients(conf: &config::ConvParameters) -> Cow<'_, [PrcFmt]> {
 
 /// Validate a FFT convolution config.
 pub fn validate_config(conf: &config::ConvParameters) -> Res<()> {
-    read_file_coefficients(conf).map(|_| ())
+    validate_and_read_file_coefficients(conf).map(|_| ())
 }
 
 #[cfg(test)]
@@ -491,6 +496,32 @@ mod tests {
             }
         }
         true
+    }
+
+    #[test]
+    fn preparation_rejects_empty_inline_taps_when_filter_is_enabled() {
+        let mut graph = serde_json::to_value(crate::protection::tests::configuration()).unwrap();
+        graph["filters"] = serde_json::json!({"fir": {"type": "Conv", "parameters": {
+            "type": "Values", "values": []
+        }}});
+        graph["pipeline"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({"type": "Filter", "names": ["fir"], "bypassed": true}),
+        );
+        graph["pipeline"].as_array_mut().unwrap().insert(
+            1,
+            serde_json::json!({"type": "Filter", "names": ["fir"], "channels": []}),
+        );
+        let prepare =
+            |graph| crate::config::validate_config(serde_json::from_value(graph).unwrap(), None);
+        prepare(graph.clone()).unwrap();
+
+        graph["pipeline"][0]["bypassed"] = false.into();
+        let error = prepare(graph.clone()).expect_err("empty active FIR was admitted");
+        assert!(error.to_string().contains("Invalid filter 'fir'"));
+
+        graph["filters"]["fir"]["parameters"]["values"] = serde_json::json!([1.0]);
+        prepare(graph).unwrap();
     }
 
     #[test]
