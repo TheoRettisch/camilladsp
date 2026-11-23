@@ -128,6 +128,13 @@ pub enum Instance {
         max_crest_db: f64,
         hold_s: f64,
     },
+    TweeterLf {
+        targets: Vec<String>,
+        expected_highpass_hz: f64,
+        limit_dbfs: f64,
+        energy_blocks: u8,
+        hold_blocks: u8,
+    },
     SignedDc {
         targets: Vec<String>,
         limit_fs: f64,
@@ -145,6 +152,7 @@ pub enum Instance {
 impl Instance {
     fn descriptor(&self) -> (&[String], Reason) {
         match self {
+            Self::TweeterLf { targets, .. } => (targets, Reason::TweeterLf),
             Self::SignedDc { targets, .. } => (targets, Reason::PositiveDc),
             Self::Peak { targets, .. } => (targets, Reason::Peak),
             Self::Rms { targets, .. } => (targets, Reason::Rms),
@@ -160,7 +168,7 @@ impl Instance {
 pub(super) struct Destination {
     pub id: Id,
     pub lane: usize,
-    pub policies: [Id; Reason::PositiveDc as usize + 1],
+    pub policies: [Id; Reason::TweeterLf as usize + 1],
     pub peak: Option<f64>,
     pub policy: Policy,
 }
@@ -235,6 +243,7 @@ impl Parameters {
             binding: [0; 4],
         };
         let mut bindings = BTreeMap::new();
+        let mut lf_sources = BTreeMap::new();
         let mut resolved = Vec::new();
         let mut algorithms = BTreeMap::new();
         for (index, (id, source)) in self.destinations.iter().enumerate() {
@@ -320,6 +329,34 @@ impl Parameters {
                         p.tone_crest = positive(max_crest_db)?;
                         p.tone_frames = frames(hold_s)?;
                         p.tone_frames
+                    }
+                    Instance::TweeterLf {
+                        expected_highpass_hz,
+                        limit_dbfs,
+                        energy_blocks,
+                        hold_blocks,
+                        ..
+                    } => {
+                        if signal.role != Role::Tweeter
+                            || !(1..=32).contains(&energy_blocks)
+                            || !(1..=64).contains(&hold_blocks)
+                        {
+                            return Err(invalid(
+                                "invalid tweeter LF role, integration or persistence",
+                            ));
+                        }
+                        // Identical filters on a shared lane advance once per candidate.
+                        let source = *lf_sources
+                            .entry((signal.lane, expected_highpass_hz.to_bits()))
+                            .or_insert(index);
+                        p.tweeter_lf = Some(super::tweeter_lf::TweeterLf {
+                            coefficients: super::tweeter_lf::coefficients(expected_highpass_hz)?,
+                            source,
+                            limit_power: power(limit_dbfs)?,
+                            energy_blocks,
+                            hold_blocks,
+                        });
+                        FRAMES as u64 * (8 + u64::from(energy_blocks) + u64::from(hold_blocks) - 1)
                     }
                     Instance::SignedDc {
                         limit_fs,
@@ -535,7 +572,7 @@ mod tests {
             ("/policies/hf_peak/limit_dbfs", json!(true)),
             ("/policies/hf_freeze/hold_s", json!(1e25)),
             ("/policies/hf_peak", Value::Null),
-            ("/policies/hf_peak/kind", json!("tweeter_lf")),
+            ("/policies/hf_peak/kind", json!("excursion")),
         ] {
             assert!(
                 changed(&p, |params| *params.pointer_mut(path).unwrap() = value).is_err(),

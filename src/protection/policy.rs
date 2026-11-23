@@ -15,6 +15,7 @@ pub(super) struct History {
     dc_frames: u64,
     signature: Option<(f64, f64)>,
     pub(super) signed_dc: DcWindow,
+    pub(super) lf_window: super::tweeter_lf::EnergyWindow,
 }
 
 impl History {
@@ -24,12 +25,14 @@ impl History {
         self.dc_frames = 0;
         self.signature = None;
         self.signed_dc = DcWindow::default();
+        self.lf_window = Default::default();
     }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Policy {
     pub(super) signed_dc: Option<SignedDc>,
+    pub(super) tweeter_lf: Option<super::tweeter_lf::TweeterLf>,
     pub(super) rms_limit: Option<f64>,
     pub(super) short_limit: Option<f64>,
     pub(super) long_limit: Option<f64>,

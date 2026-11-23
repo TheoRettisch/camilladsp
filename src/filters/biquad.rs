@@ -66,6 +66,14 @@ impl BiquadCoefficients {
         }
     }
 
+    /// Advance one direct-form II transposed section with caller-owned state.
+    pub(crate) fn step(&self, input: PrcFmt, s1: &mut PrcFmt, s2: &mut PrcFmt) -> PrcFmt {
+        let out = *s1 + self.b0 * input;
+        *s1 = *s2 + self.b1 * input - self.a1 * out;
+        *s2 = self.b2 * input - self.a2 * out;
+        out
+    }
+
     pub fn is_stable(&self) -> bool {
         self.a2.abs() < 1.0 && (self.a1.abs() < (self.a2 + 1.0))
     }
@@ -433,10 +441,7 @@ impl Biquad {
 
     /// Process a single sample.
     pub fn process_single(&mut self, input: PrcFmt) -> PrcFmt {
-        let out = self.s1 + self.coeffs.b0 * input;
-        self.s1 = self.s2 + self.coeffs.b1 * input - self.coeffs.a1 * out;
-        self.s2 = self.coeffs.b2 * input - self.coeffs.a2 * out;
-        out
+        self.coeffs.step(input, &mut self.s1, &mut self.s2)
     }
 
     /// Flush stored subnormal numbers to zero.

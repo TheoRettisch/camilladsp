@@ -23,6 +23,9 @@ mod record;
 #[cfg(test)]
 mod signed_dc_tests;
 mod state;
+mod tweeter_lf;
+#[cfg(test)]
+mod tweeter_lf_tests;
 pub mod wire;
 use control::{Command, Control, Mode, Operation};
 use record::AtomicRecord;
@@ -140,6 +143,7 @@ pub enum Reason {
     Numeric = 9,
     PositiveDc = 10,
     NegativeDc = 11,
+    TweeterLf = 12,
 }
 
 impl Reason {
@@ -156,7 +160,6 @@ impl Reason {
     fn policy_slot(self) -> usize {
         match self {
             Self::NegativeDc => Self::PositiveDc as usize,
-            Self::Numeric => Self::DcFrozen as usize, // Frozen-signature quantization.
             _ => self as usize,
         }
     }
@@ -172,6 +175,7 @@ impl Reason {
             Self::Tone => "crest_tone",
             Self::DcFrozen => "frozen",
             Self::Numeric => "numeric",
+            Self::TweeterLf => "tweeter_lf",
             Self::PositiveDc | Self::NegativeDc => "signed_dc",
         }
     }
@@ -640,6 +644,7 @@ impl Guard {
         if shape_valid && finite {
             let plan = &self.configuration.as_ref().unwrap().policy;
             let mut first = None;
+            let mut lf_powers = [None; CHANNELS];
             for (lane, q) in powers.into_iter().enumerate() {
                 if !q.is_finite() {
                     let key = (0, lane, 0, Id::default(), Id::default());
@@ -669,9 +674,30 @@ impl Guard {
                         result.veto |= assessment.veto;
                     }
                     self.detector.prearm_veto |= result.veto;
-                    if let Some(reason) = result.reason {
+                    // Frozen-signature quantization can produce a numeric fault.
+                    let existing = result.reason.map(|reason| {
+                        let kind = if reason == Reason::Numeric {
+                            Reason::DcFrozen
+                        } else {
+                            reason
+                        };
+                        (reason, kind)
+                    });
+                    let lf_reason = d.policy.tweeter_lf.and_then(|lf| {
+                        let power = lf_powers[lf.source].get_or_insert_with(|| {
+                            self.detector.lf_filters[lf.source]
+                                .block_power(&lf.coefficients, &chunk.waveforms[lane])
+                        });
+                        let assessment = lf.observe(&mut history.lf_window, *power, prearm);
+                        self.detector.prearm_veto |= assessment.veto;
+                        assessment.reason
+                    });
+                    for (reason, kind) in [existing, lf_reason.map(|r| (r, Reason::TweeterLf))]
+                        .into_iter()
+                        .flatten()
+                    {
                         let numeric = reason == Reason::Numeric;
-                        let policy = d.policies[reason.policy_slot()];
+                        let policy = d.policies[kind.policy_slot()];
                         let key = (
                             if numeric { 0 } else { 1 },
                             lane,

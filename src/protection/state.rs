@@ -53,6 +53,7 @@ impl StreamState {
 #[derive(Debug, Default)]
 pub(super) struct DetectorState {
     pub history: [policy::History; CHANNELS],
+    pub lf_filters: [super::tweeter_lf::Cascade; CHANNELS],
     pub prearm_veto: bool,
 }
 
@@ -61,6 +62,7 @@ impl DetectorState {
         for history in &mut self.history {
             history.break_continuity();
         }
+        self.lf_filters = Default::default();
         self.prearm_veto = false;
     }
 

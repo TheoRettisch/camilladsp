@@ -2408,7 +2408,7 @@ The guard checks shape and finite samples on all 24 final playback channels.
 Its signals name distinct lanes and roles. Destinations name individual speaker
 feeds and may share a signal. Each policy names its kind, parameters and sorted
 destination IDs. Peak, frozen, RMS, short power, long power and signed DC can protect
-individual destinations. Crest-tone policies require tweeter destinations.
+individual destinations. Crest-tone and low-frequency energy policies require tweeter destinations.
 A trip masks the entire chunk and retains its original profile, policy,
 destination, lane and decisive frame across a compatible graph edit.
 
@@ -2418,6 +2418,13 @@ non-overlapping candidate window whose signed mean reaches the absolute limit
 vetoes prearm. Consecutive crossings of the same polarity trip on the final
 block and report polarity +1 or −1. A clean window clears persistence and a
 stream interruption also discards the partial window.
+
+An optional `tweeter_lf` policy declares the intended `expected_highpass_hz`
+(600–12000 Hz). Two private Butterworth low-pass sections measure candidate
+energy at one third of that frequency. The last `energy_blocks` (1–32) complete
+block powers form a sliding mean. Every full mean at or above `limit_dbfs`
+vetoes prearm, and `hold_blocks` (1–64) consecutive hits trip at the exclusive
+block end. Qualification reserves eight additional blocks for settling.
 
 The [parity fixture](testdata/protection-parity.yml) shares a subwoofer lane.
 The [split fixture](testdata/protection-split.yml) assigns independent lanes.
