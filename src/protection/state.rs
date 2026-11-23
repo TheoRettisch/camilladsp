@@ -53,6 +53,7 @@ impl StreamState {
 #[derive(Debug, Default)]
 pub(super) struct DetectorState {
     pub history: [policy::History; CHANNELS],
+    pub excursion: Vec<super::excursion::History>,
     pub lf_filters: [super::tweeter_lf::Cascade; CHANNELS],
     pub prearm_veto: bool,
 }
@@ -62,13 +63,15 @@ impl DetectorState {
         for history in &mut self.history {
             history.break_continuity();
         }
+        self.excursion.fill(Default::default());
         self.lf_filters = Default::default();
         self.prearm_veto = false;
     }
 
     pub fn accepted_reset(&mut self) {
         // Only accepted reset clears accumulated short/long power.
-        *self = Self::default();
+        self.break_continuity();
+        self.history.fill(Default::default());
     }
 }
 

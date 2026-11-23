@@ -128,6 +128,10 @@ pub enum Instance {
         max_crest_db: f64,
         hold_s: f64,
     },
+    Excursion {
+        targets: Vec<String>,
+        model: Box<super::excursion::Pack>,
+    },
     TweeterLf {
         targets: Vec<String>,
         expected_highpass_hz: f64,
@@ -152,6 +156,7 @@ pub enum Instance {
 impl Instance {
     fn descriptor(&self) -> (&[String], Reason) {
         match self {
+            Self::Excursion { targets, .. } => (targets, Reason::Excursion),
             Self::TweeterLf { targets, .. } => (targets, Reason::TweeterLf),
             Self::SignedDc { targets, .. } => (targets, Reason::PositiveDc),
             Self::Peak { targets, .. } => (targets, Reason::Peak),
@@ -168,7 +173,8 @@ impl Instance {
 pub(super) struct Destination {
     pub id: Id,
     pub lane: usize,
-    pub policies: [Id; Reason::TweeterLf as usize + 1],
+    pub policies: [Id; Reason::Excursion as usize + 1],
+    pub model: Option<super::excursion::Model>,
     pub peak: Option<f64>,
     pub policy: Policy,
 }
@@ -176,6 +182,7 @@ pub(super) struct Destination {
 pub(super) struct Plan {
     pub destinations: [Destination; CHANNELS],
     pub count: usize,
+    pub model_count: usize,
     pub peak_floor: [f64; CHANNELS],
     pub qualification_frames: u64,
     pub silence_power: f64,
@@ -237,6 +244,7 @@ impl Parameters {
         let mut plan = Plan {
             destinations: [Destination::default(); CHANNELS],
             count: self.destinations.len(),
+            model_count: 0,
             peak_floor: [f64::INFINITY; CHANNELS],
             qualification_frames: FRAMES as u64,
             silence_power: power(self.activity.silence_dbfs)?,
@@ -254,6 +262,7 @@ impl Parameters {
             let dest = &mut plan.destinations[index];
             dest.id = Id::new(id)?;
             dest.lane = signal.lane;
+            let mut model_binding = None;
             let mut peak_db = 0.0;
             let mut ceiling = f64::NEG_INFINITY;
             let (mut short, mut long) = (None, None);
@@ -329,6 +338,17 @@ impl Parameters {
                         p.tone_crest = positive(max_crest_db)?;
                         p.tone_frames = frames(hold_s)?;
                         p.tone_frames
+                    }
+                    Instance::Excursion { ref model, .. } => {
+                        if signal.role == Role::Tweeter || targets.len() != 1 {
+                            return Err(invalid(
+                                "excursion requires one sub or midwoofer destination",
+                            ));
+                        }
+                        dest.model = Some(model.compile(id, plan.model_count)?);
+                        plan.model_count += 1;
+                        model_binding = Some(model);
+                        FRAMES as u64 * u64::from(model.settle_blocks)
                     }
                     Instance::TweeterLf {
                         expected_highpass_hz,
@@ -415,7 +435,8 @@ impl Parameters {
                     signal.role,
                     signal.lane,
                     short.map(|v| v.1),
-                    long.map(|v| v.1)
+                    long.map(|v| v.1),
+                    model_binding
                 ]),
             );
         }

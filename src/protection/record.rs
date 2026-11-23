@@ -136,7 +136,7 @@ macro_rules! variants {
         }
     };
 }
-variants!(Reason: Peak, Nonfinite, Coverage, Rms, ShortPower, LongPower, Tone, DcFrozen, Numeric, PositiveDc, NegativeDc, TweeterLf);
+variants!(Reason: Peak, Nonfinite, Coverage, Rms, ShortPower, LongPower, Tone, DcFrozen, Numeric, PositiveDc, NegativeDc, TweeterLf, Excursion, ModelDomain);
 variants!(State: Inactive, Qualifying, Active, Tripped);
 variants!(Mode: Prearm, Armed);
 variants!(control::Result: Applied, Invalid, StateMismatch, NotQualified);

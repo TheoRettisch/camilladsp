@@ -1,0 +1,41 @@
+{
+  "type": "sealed_linear_v1",
+  "registration": "synthetic",
+  "destination_id": "sub_b",
+  "loading": "sealed_independent_single_coil",
+  "sample_rate_hz": 48000,
+  "si": {
+    "re_ohm": 4.0,
+    "le_h": 0.0005,
+    "bl_n_per_a": 10.0,
+    "mms_kg": 0.05,
+    "rms_ns_per_m": 1.0,
+    "cms_m_per_n": 0.001,
+    "sd_m2": 0.03,
+    "vb_m3": 0.024,
+    "rho_kg_per_m3": 1.2,
+    "c_m_per_s": 343.0
+  },
+  "settle_blocks": 375,
+  "volts_peak_per_fs": 20.0,
+  "terminal_peak_bound_v": 10.0,
+  "limit_mm_one_way": 2.1,
+  "error_margin_mm": 0.05,
+  "validated_error_mm": 0.005,
+  "transition_error_mm": 0.0,
+  "coefficient_words": [
+    "3feb0da30c4c1968",
+    "bfd8999e0ad8c864",
+    "3fe0210286045a52",
+    "3f6f7cf341157b5f",
+    "3feff5ce1c33a29c",
+    "c004f7b67b05a89e",
+    "3e657ef127a6e650",
+    "3ef5d4ecec4581ea",
+    "3fefffc6be90c748",
+    "3f93af36596eb323",
+    "3f04fdf780b8fcea",
+    "3dfca9418a33ddc0"
+  ],
+  "calibration_sha256": "b9ca6b855cb4cdfcec969db49561960d0f8cdfd2f4e19b2b2470ed5313ba8f97"
+}

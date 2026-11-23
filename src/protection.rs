@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(any(test, feature = "protection-test-capture"))]
 mod capture;
 pub mod control;
+mod excursion;
+#[cfg(test)]
+mod excursion_tests;
 pub mod identity;
 #[cfg(test)]
 mod lifecycle_tests;
@@ -144,6 +147,8 @@ pub enum Reason {
     PositiveDc = 10,
     NegativeDc = 11,
     TweeterLf = 12,
+    Excursion = 13,
+    ModelDomain = 14,
 }
 
 impl Reason {
@@ -160,6 +165,7 @@ impl Reason {
     fn policy_slot(self) -> usize {
         match self {
             Self::NegativeDc => Self::PositiveDc as usize,
+            Self::ModelDomain => Self::Excursion as usize,
             _ => self as usize,
         }
     }
@@ -176,6 +182,8 @@ impl Reason {
             Self::DcFrozen => "frozen",
             Self::Numeric => "numeric",
             Self::TweeterLf => "tweeter_lf",
+            Self::Excursion => "excursion",
+            Self::ModelDomain => "model_domain",
             Self::PositiveDc | Self::NegativeDc => "signed_dc",
         }
     }
@@ -441,6 +449,11 @@ impl Guard {
             .checked_add(1)
             .unwrap();
         assert!(epoch <= i64::MAX as u64);
+        // The process-lifetime binding fixes the model inventory. Allocate
+        // histories once during cold installation, before audio processing.
+        self.detector
+            .excursion
+            .resize(conf.guard().plan.model_count, Default::default());
         self.configuration = None;
         self.stream.new_pipeline(epoch);
         self.activity.interrupt();
@@ -541,6 +554,29 @@ impl Guard {
         let decision_ns = monotonic_ns();
         let masked =
             !self.qualification.is_active() || self.fault.trip.is_some() || !assessment.shape_valid;
+        if assessment.shape_valid && assessment.finite && !self.detector.excursion.is_empty() {
+            let plan = &self.configuration.as_ref().unwrap().policy;
+            let mut failure = None;
+            for d in &plan.destinations[..plan.count] {
+                if let Some(m) = d.model
+                    && let Some(offset) = m.commit(&mut self.detector.excursion[m.index], masked)
+                {
+                    let key = (d.lane, offset, d.policies[Reason::Excursion as usize], d.id);
+                    if failure.is_none_or(|old| key < old) {
+                        failure = Some(key);
+                    }
+                }
+            }
+            if let Some((lane, offset, policy, dest)) = failure {
+                self.latch_target(
+                    Reason::Numeric,
+                    Some(lane),
+                    self.stream.frames + offset as u64,
+                    policy,
+                    dest,
+                );
+            }
+        }
         if masked {
             for waveform in &mut chunk.waveforms {
                 waveform.fill(0.0);
@@ -647,11 +683,10 @@ impl Guard {
             let mut lf_powers = [None; CHANNELS];
             for (lane, q) in powers.into_iter().enumerate() {
                 if !q.is_finite() {
-                    let key = (0, lane, 0, Id::default(), Id::default());
+                    let key = (0, lane, FRAMES, 0, Id::default(), Id::default());
                     if first.is_none_or(|(old, _)| key < old) {
                         first = Some((key, Reason::Numeric));
                     }
-                    continue;
                 }
                 let peak = peaks[lane];
                 let mut signed_sum = None;
@@ -660,6 +695,27 @@ impl Guard {
                     .enumerate()
                     .filter(|(_, d)| d.lane == lane)
                 {
+                    if let Some(m) = d.model
+                        && let Some((reason, offset)) = m.assess(
+                            &mut self.detector.excursion[m.index],
+                            &chunk.waveforms[lane],
+                        )
+                    {
+                        let key = (
+                            if reason == Reason::Numeric { 0 } else { 1 },
+                            lane,
+                            offset,
+                            1,
+                            d.policies[Reason::Excursion as usize],
+                            d.id,
+                        );
+                        if first.is_none_or(|(old, _)| key < old) {
+                            first = Some((key, reason));
+                        }
+                    }
+                    if !q.is_finite() {
+                        continue;
+                    }
                     let history = &mut self.detector.history[i];
                     let prearm = self.control.mode == Mode::Prearm;
                     let mut result =
@@ -699,8 +755,9 @@ impl Guard {
                         let numeric = reason == Reason::Numeric;
                         let policy = d.policies[kind.policy_slot()];
                         let key = (
-                            if numeric { 0 } else { 1 },
+                            if numeric { 0 } else { 2 },
                             lane,
+                            FRAMES,
                             if numeric { 1 } else { reason.policy_slot() },
                             policy,
                             d.id,
@@ -711,11 +768,11 @@ impl Guard {
                     }
                 }
             }
-            if let Some(((_, lane, _, policy, dest), reason)) = first {
+            if let Some(((_, lane, offset, _, policy, dest), reason)) = first {
                 self.latch_target(
                     reason,
                     Some(lane),
-                    self.stream.frames + FRAMES as u64,
+                    self.stream.frames + offset as u64,
                     policy,
                     dest,
                 );
