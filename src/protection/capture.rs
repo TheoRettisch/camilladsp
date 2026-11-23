@@ -250,7 +250,7 @@ impl Capture {
                     "forwarded_bits": bits(&block.forwarded), "guard_active": block.active,
                     "graph_sha256": identity::hex(block.identity.graph),
                     "profile_sha256": identity::hex(block.identity.profile),
-                    "trip": block.trip.map(|t| json!({"generation": t.generation, "reason": t.reason.kind(), "origin_profile_sha256":identity::hex(t.origin_profile), "policy_id":t.policy_id.text(), "destination_id":t.destination_id.text(), "polarity":null,
+                    "trip": block.trip.map(|t| json!({"generation": t.generation, "reason": t.reason.kind(), "origin_profile_sha256":identity::hex(t.origin_profile), "policy_id":t.policy_id.text(), "destination_id":t.destination_id.text(), "polarity":t.reason.polarity(),
                         "channel": t.channel, "frame": t.frame, "at_ns": t.at_ns}))}).as_object().unwrap().clone());
             } else {
                 let pcm: String = block.pcm.iter().map(|v| format!("{v:02x}")).collect();

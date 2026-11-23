@@ -20,6 +20,8 @@ mod lifecycle_tests;
 pub mod playback;
 mod policy;
 mod record;
+#[cfg(test)]
+mod signed_dc_tests;
 mod state;
 pub mod wire;
 use control::{Command, Control, Mode, Operation};
@@ -136,9 +138,29 @@ pub enum Reason {
     Tone = 7,
     DcFrozen = 8,
     Numeric = 9,
+    PositiveDc = 10,
+    NegativeDc = 11,
 }
 
 impl Reason {
+    // Encode DC polarity in the durable reason word so other faults can never
+    // acquire a polarity. Both signs share one policy slot and tie rank.
+    fn polarity(self) -> Option<i8> {
+        match self {
+            Self::PositiveDc => Some(1),
+            Self::NegativeDc => Some(-1),
+            _ => None,
+        }
+    }
+
+    fn policy_slot(self) -> usize {
+        match self {
+            Self::NegativeDc => Self::PositiveDc as usize,
+            Self::Numeric => Self::DcFrozen as usize, // Frozen-signature quantization.
+            _ => self as usize,
+        }
+    }
+
     pub fn kind(self) -> &'static str {
         match self {
             Self::Peak => "peak",
@@ -150,6 +172,7 @@ impl Reason {
             Self::Tone => "crest_tone",
             Self::DcFrozen => "frozen",
             Self::Numeric => "numeric",
+            Self::PositiveDc | Self::NegativeDc => "signed_dc",
         }
     }
 }
@@ -626,29 +649,33 @@ impl Guard {
                     continue;
                 }
                 let peak = peaks[lane];
+                let mut signed_sum = None;
                 for (i, d) in plan.destinations[..plan.count]
                     .iter()
                     .enumerate()
                     .filter(|(_, d)| d.lane == lane)
                 {
-                    let result = d.policy.assess(
-                        &mut self.detector.history[i],
-                        peak,
-                        q,
-                        self.control.mode == Mode::Prearm,
-                        self.candidate.observable,
-                    );
+                    let history = &mut self.detector.history[i];
+                    let prearm = self.control.mode == Mode::Prearm;
+                    let mut result =
+                        d.policy
+                            .assess(history, peak, q, prearm, self.candidate.observable);
+                    if let Some(dc) = d.policy.signed_dc {
+                        let sum = signed_sum.get_or_insert_with(|| {
+                            policy::CompensatedSum::block(&chunk.waveforms[lane])
+                        });
+                        let assessment = dc.observe(&mut history.signed_dc, *sum, prearm);
+                        result.reason = result.reason.or(assessment.reason);
+                        result.veto |= assessment.veto;
+                    }
                     self.detector.prearm_veto |= result.veto;
                     if let Some(reason) = result.reason {
                         let numeric = reason == Reason::Numeric;
-                        // The only policy arithmetic capable of overflow after finite q
-                        // is frozen-signature quantization.
-                        let policy =
-                            d.policies[if numeric { Reason::DcFrozen } else { reason } as usize];
+                        let policy = d.policies[reason.policy_slot()];
                         let key = (
                             if numeric { 0 } else { 1 },
                             lane,
-                            if numeric { 1 } else { reason as usize },
+                            if numeric { 1 } else { reason.policy_slot() },
                             policy,
                             d.id,
                         );

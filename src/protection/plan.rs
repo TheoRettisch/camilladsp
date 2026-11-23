@@ -128,6 +128,12 @@ pub enum Instance {
         max_crest_db: f64,
         hold_s: f64,
     },
+    SignedDc {
+        targets: Vec<String>,
+        limit_fs: f64,
+        window_blocks: u8,
+        same_sign_windows: u8,
+    },
     Frozen {
         targets: Vec<String>,
         floor_dbfs: f64,
@@ -139,6 +145,7 @@ pub enum Instance {
 impl Instance {
     fn descriptor(&self) -> (&[String], Reason) {
         match self {
+            Self::SignedDc { targets, .. } => (targets, Reason::PositiveDc),
             Self::Peak { targets, .. } => (targets, Reason::Peak),
             Self::Rms { targets, .. } => (targets, Reason::Rms),
             Self::ShortPower { targets, .. } => (targets, Reason::ShortPower),
@@ -153,7 +160,7 @@ impl Instance {
 pub(super) struct Destination {
     pub id: Id,
     pub lane: usize,
-    pub policies: [Id; 9], // Indexed by the six existing Reason discriminants (1..=8).
+    pub policies: [Id; Reason::PositiveDc as usize + 1],
     pub peak: Option<f64>,
     pub policy: Policy,
 }
@@ -255,7 +262,7 @@ impl Parameters {
                 if targets.binary_search(id).is_err() {
                     continue;
                 }
-                let slot = &mut dest.policies[reason as usize];
+                let slot = &mut dest.policies[reason.policy_slot()];
                 if *slot != Id::default() {
                     return Err(invalid("overlapping kind and destination"));
                 }
@@ -313,6 +320,28 @@ impl Parameters {
                         p.tone_crest = positive(max_crest_db)?;
                         p.tone_frames = frames(hold_s)?;
                         p.tone_frames
+                    }
+                    Instance::SignedDc {
+                        limit_fs,
+                        window_blocks,
+                        same_sign_windows,
+                        ..
+                    } => {
+                        if !(64..=192).contains(&window_blocks)
+                            || !(2..=8).contains(&same_sign_windows)
+                            || !(limit_fs > 0.0 && limit_fs <= 1.0)
+                        {
+                            return Err(invalid("invalid signed DC window, persistence or limit"));
+                        }
+                        p.signed_dc = Some(super::policy::SignedDc {
+                            limit_fs,
+                            window_blocks,
+                            same_sign_windows,
+                        });
+                        // All factors are bounded above before widening.
+                        FRAMES as u64
+                            * u64::from(window_blocks)
+                            * (1 + u64::from(same_sign_windows))
                     }
                     Instance::Frozen {
                         floor_dbfs,
@@ -506,7 +535,7 @@ mod tests {
             ("/policies/hf_peak/limit_dbfs", json!(true)),
             ("/policies/hf_freeze/hold_s", json!(1e25)),
             ("/policies/hf_peak", Value::Null),
-            ("/policies/hf_peak/kind", json!("signed_dc")),
+            ("/policies/hf_peak/kind", json!("tweeter_lf")),
         ] {
             assert!(
                 changed(&p, |params| *params.pointer_mut(path).unwrap() = value).is_err(),

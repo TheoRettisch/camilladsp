@@ -14,6 +14,7 @@ pub(super) struct History {
     tone_frames: u64,
     dc_frames: u64,
     signature: Option<(f64, f64)>,
+    pub(super) signed_dc: DcWindow,
 }
 
 impl History {
@@ -22,11 +23,13 @@ impl History {
         self.tone_frames = 0;
         self.dc_frames = 0;
         self.signature = None;
+        self.signed_dc = DcWindow::default();
     }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Policy {
+    pub(super) signed_dc: Option<SignedDc>,
     pub(super) rms_limit: Option<f64>,
     pub(super) short_limit: Option<f64>,
     pub(super) long_limit: Option<f64>,
@@ -41,6 +44,94 @@ pub(super) struct Policy {
     pub(super) dc_tolerance: f64,
     pub(super) epsilon: f64,
     pub(super) freeze_floor: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct CompensatedSum {
+    sum: f64,
+    correction: f64,
+}
+
+impl CompensatedSum {
+    fn add(&mut self, x: f64) {
+        // Neumaier summation retains small residuals even across cancellation.
+        let next = self.sum + x;
+        self.correction += if self.sum.abs() >= x.abs() {
+            (self.sum - next) + x
+        } else {
+            (x - next) + self.sum
+        };
+        self.sum = next;
+    }
+
+    pub fn block(samples: &[f64]) -> Self {
+        let mut total = Self::default();
+        for &x in samples {
+            total.add(x);
+        }
+        total
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SignedDc {
+    pub limit_fs: f64,
+    pub window_blocks: u8,
+    pub same_sign_windows: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct DcWindow {
+    total: CompensatedSum,
+    blocks: u8,
+    // Sign and length of the last run of completed, above-limit means.
+    run: i8,
+}
+
+impl SignedDc {
+    pub fn observe(
+        &self,
+        window: &mut DcWindow,
+        block: CompensatedSum,
+        prearm: bool,
+    ) -> Assessment {
+        // The caller has checked finite lane sum-of-squares. This bounds every
+        // sample by sqrt(f64::MAX), far below overflow even over 192 blocks.
+        window.total.add(block.sum);
+        window.total.add(block.correction);
+        window.blocks += 1;
+        let mut reason = None;
+        if window.blocks == self.window_blocks {
+            let frames = (FRAMES * usize::from(window.blocks)) as f64;
+            // Normalize the high/low pair after cancellation. Compare the signed
+            // sum with ±limit*N using a fused difference: rounding the mean (or
+            // the scaled threshold) first can miss equality at non-power-of-two N.
+            let mut total = CompensatedSum::default();
+            total.add(window.total.sum);
+            total.add(window.total.correction);
+            let above = (-self.limit_fs).mul_add(frames, total.sum) + total.correction >= 0.0;
+            let below = self.limit_fs.mul_add(frames, total.sum) + total.correction <= 0.0;
+            window.total = CompensatedSum::default();
+            window.blocks = 0;
+            let k = self.same_sign_windows as i8;
+            window.run = if above {
+                (window.run.max(0) + 1).min(k)
+            } else if below {
+                (window.run.min(0) - 1).max(-k)
+            } else {
+                0
+            };
+            if window.run == k {
+                reason = Some(Reason::PositiveDc);
+            } else if window.run == -k {
+                reason = Some(Reason::NegativeDc);
+            }
+        }
+        Assessment {
+            reason,
+            veto: prearm && window.run != 0,
+        }
+    }
 }
 
 pub(super) struct Assessment {

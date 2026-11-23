@@ -136,7 +136,7 @@ macro_rules! variants {
         }
     };
 }
-variants!(Reason: Peak, Nonfinite, Coverage, Rms, ShortPower, LongPower, Tone, DcFrozen, Numeric);
+variants!(Reason: Peak, Nonfinite, Coverage, Rms, ShortPower, LongPower, Tone, DcFrozen, Numeric, PositiveDc, NegativeDc);
 variants!(State: Inactive, Qualifying, Active, Tripped);
 variants!(Mode: Prearm, Armed);
 variants!(control::Result: Applied, Invalid, StateMismatch, NotQualified);
@@ -538,6 +538,8 @@ mod tests {
             Reason::LongPower,
             Reason::Tone,
             Reason::DcFrozen,
+            Reason::PositiveDc,
+            Reason::NegativeDc,
         ] {
             let mut value = guard_record();
             value.trip.as_mut().unwrap().reason = reason;

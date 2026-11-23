@@ -210,7 +210,7 @@ impl Shared {
                 "trip": {"generation": guard.trip_generation, "latched": guard.trip.is_some(), "reason": reason,
                     "origin_profile_sha256":guard.trip.map(|t|identity::hex(t.origin_profile)),
                     "policy_id":guard.trip.as_ref().and_then(|t|t.policy_id.text()),
-                    "destination_id":guard.trip.as_ref().and_then(|t|t.destination_id.text()), "polarity":null,
+                    "destination_id":guard.trip.as_ref().and_then(|t|t.destination_id.text()), "polarity":guard.trip.and_then(|t|t.reason.polarity()),
                     "channel": guard.trip.and_then(|t| t.channel), "frame": guard.trip.map(|t| t.frame), "at_ns": guard.trip.map(|t| t.at_ns)},
                 "control": {"owner": guard.control.owner.map(uuid_text), "revision": guard.control.revision,
                     "parent_reset_generation": guard.control.parent_reset_generation, "qualification_id": guard.control.qualification_id,
@@ -375,7 +375,7 @@ pub(crate) mod tests {
         (shared, guard, playback)
     }
 
-    fn status(shared: &Shared) -> Value {
+    pub(crate) fn status(shared: &Shared) -> Value {
         let text = shared.protection_reply("\"GetProtectionStatus\"").unwrap();
         let reply: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(reply["GetProtectionStatus"]["result"], "Ok", "{text}");

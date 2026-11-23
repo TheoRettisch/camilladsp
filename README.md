@@ -2407,10 +2407,17 @@ One enabled `Protection` processor must end the 48 kHz, 256-frame pipeline.
 The guard checks shape and finite samples on all 24 final playback channels.
 Its signals name distinct lanes and roles. Destinations name individual speaker
 feeds and may share a signal. Each policy names its kind, parameters and sorted
-destination IDs. Peak, frozen, RMS, short power and long power can protect
+destination IDs. Peak, frozen, RMS, short power, long power and signed DC can protect
 individual destinations. Crest-tone policies require tweeter destinations.
 A trip masks the entire chunk and retains its original profile, policy,
 destination, lane and decisive frame across a compatible graph edit.
+
+An optional `signed_dc` policy accepts `limit_fs` in (0, 1], `window_blocks`
+from 64 to 192 and `same_sign_windows` from 2 to 8. Each complete,
+non-overlapping candidate window whose signed mean reaches the absolute limit
+vetoes prearm. Consecutive crossings of the same polarity trip on the final
+block and report polarity +1 or −1. A clean window clears persistence and a
+stream interruption also discards the partial window.
 
 The [parity fixture](testdata/protection-parity.yml) shares a subwoofer lane.
 The [split fixture](testdata/protection-split.yml) assigns independent lanes.

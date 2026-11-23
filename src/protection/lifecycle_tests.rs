@@ -15,7 +15,7 @@ fn setup(muted: bool, ramp_ms: f32) -> (Arc<ProcessingParameters>, Pipeline, Gua
     (params, pipeline, guard)
 }
 
-fn command(guard: &Guard, operation: Operation, qualification_id: u64) -> Command {
+pub(super) fn command(guard: &Guard, operation: Operation, qualification_id: u64) -> Command {
     Command {
         id: guard.control.command_high_water + 1,
         expected: guard.expected(),
@@ -27,7 +27,7 @@ fn command(guard: &Guard, operation: Operation, qualification_id: u64) -> Comman
     }
 }
 
-fn prearm(guard: &mut Guard, qualification_id: u64) {
+pub(super) fn prearm(guard: &mut Guard, qualification_id: u64) {
     let command = command(guard, Operation::Context(Mode::Prearm), qualification_id);
     guard.control_only(command);
     assert_eq!(
@@ -42,7 +42,7 @@ fn process(pipeline: &mut Pipeline, guard: &mut Guard) -> AudioChunk {
     candidate
 }
 
-fn zero(chunk: &AudioChunk) -> bool {
+pub(super) fn zero(chunk: &AudioChunk) -> bool {
     chunk.waveforms.iter().flatten().all(|s| *s == 0.0)
 }
 
