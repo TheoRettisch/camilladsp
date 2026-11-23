@@ -91,6 +91,18 @@ where
     Ok(value)
 }
 
+// Validate object uniqueness before a typed HashMap or JSON mutation can
+// collapse duplicate keys. Keep the typed parser's source locations and types.
+pub fn parse_yaml_config(text: &str) -> Result<Configuration, yaml_serde::Error> {
+    yaml_serde::from_str::<yaml_serde::Value>(text)?;
+    yaml_serde::from_str(text)
+}
+
+pub fn parse_json_config(text: &str) -> Result<Configuration, serde_json::Error> {
+    serde_json::from_str::<yaml_serde::Value>(text)?;
+    serde_json::from_str(text)
+}
+
 pub fn load_config(filename: &str) -> Res<Configuration> {
     let file = match File::open(filename) {
         Ok(f) => f,
@@ -108,7 +120,7 @@ pub fn load_config(filename: &str) -> Res<Configuration> {
             return Err(ConfigError::new(&msg).into());
         }
     };
-    let configuration: Configuration = match yaml_serde::from_str(&contents) {
+    let configuration: Configuration = match parse_yaml_config(&contents) {
         Ok(config) => config,
         Err(err) => {
             let msg = format!("Invalid config file!\n{err}");

@@ -1,51 +1,10 @@
 //! Fixed-size sample statistics and audio-time policy, owned by the guard.
 
-use super::{FRAMES, Parameters, Reason, SAMPLE_RATE};
-use crate::{PrcFmt, Res, config};
-
-fn frames(seconds: f64) -> u64 {
-    (seconds * SAMPLE_RATE as f64).ceil() as u64
-}
-
-pub(super) fn validate(p: &Parameters) -> Res<()> {
-    let durations = [
-        p.dc_freeze_seconds,
-        p.tweeter_rms_fault_seconds,
-        p.tweeter_avg_power_tau_seconds * 2.0,
-        p.tweeter_long_avg_power_tau_seconds,
-        p.tone_fault_seconds,
-    ];
-    let limits = [
-        p.max_tweeter_rms_db,
-        p.max_tweeter_avg_power_db,
-        p.max_tweeter_long_avg_power_db,
-        p.tone_min_rms_db,
-        Some(p.silence_threshold_db),
-    ];
-    if durations
-        .iter()
-        .any(|x| !x.is_finite() || *x <= 0.0 || *x * SAMPLE_RATE as f64 >= i64::MAX as f64)
-        || [
-            p.dc_freeze_peak_rms_tolerance_db,
-            p.level_freshness_epsilon_db,
-            p.tone_crest_db,
-        ]
-        .iter()
-        .any(|x| !x.is_finite() || *x <= 0.0)
-        || limits.iter().flatten().any(|x| {
-            !x.is_finite() || *x >= p.max_allowed_peak_db || 10.0_f64.powf(*x / 10.0) == 0.0
-        })
-        || p.max_tweeter_long_avg_power_db.is_some_and(|long| {
-            p.max_tweeter_avg_power_db.is_none_or(|short| long >= short)
-                || p.tweeter_long_avg_power_tau_seconds <= p.tweeter_avg_power_tau_seconds
-        })
-    {
-        return Err(
-            config::ConfigError::new("Invalid protection policy thresholds or windows").into(),
-        );
-    }
-    Ok(())
-}
+use super::{FRAMES, Reason};
+#[cfg(test)]
+use super::{Parameters, SAMPLE_RATE};
+#[cfg(test)]
+use crate::config;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct History {
@@ -66,23 +25,22 @@ impl History {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Policy {
-    rms_limit: Option<f64>,
-    short_limit: Option<f64>,
-    long_limit: Option<f64>,
-    tone_limit: Option<f64>,
-    rms_frames: u64,
-    tone_frames: u64,
-    dc_frames: u64,
-    short_alpha: f64,
-    prearm_alpha: f64,
-    long_alpha: f64,
-    tone_crest: f64,
-    dc_tolerance: f64,
-    epsilon: f64,
-    pub qualification_frames: u64,
-    pub silence_power: f64,
+    pub(super) rms_limit: Option<f64>,
+    pub(super) short_limit: Option<f64>,
+    pub(super) long_limit: Option<f64>,
+    pub(super) tone_limit: Option<f64>,
+    pub(super) rms_frames: u64,
+    pub(super) tone_frames: u64,
+    pub(super) dc_frames: u64,
+    pub(super) short_alpha: f64,
+    pub(super) prearm_alpha: f64,
+    pub(super) long_alpha: f64,
+    pub(super) tone_crest: f64,
+    pub(super) dc_tolerance: f64,
+    pub(super) epsilon: f64,
+    pub(super) freeze_floor: Option<f64>,
 }
 
 pub(super) struct Assessment {
@@ -106,50 +64,17 @@ fn update_power(prior: &mut f64, q: f64, alpha: f64, observable: bool) -> f64 {
 }
 
 impl Policy {
-    pub fn new(p: &Parameters) -> Self {
-        let power = |db: f64| 10.0_f64.powf(db / 10.0);
-        let alpha = |tau: f64| -(-(FRAMES as f64 / SAMPLE_RATE as f64) / tau).exp_m1();
-        let mut qualification = p.dc_freeze_seconds;
-        if p.max_tweeter_rms_db.is_some() {
-            qualification = qualification.max(p.tweeter_rms_fault_seconds);
-        }
-        if p.max_tweeter_avg_power_db.is_some() {
-            qualification = qualification.max(2.0 * p.tweeter_avg_power_tau_seconds);
-        }
-        if p.tone_min_rms_db.is_some() {
-            qualification = qualification.max(p.tone_fault_seconds);
-        }
-        Self {
-            rms_limit: p.max_tweeter_rms_db.map(power),
-            short_limit: p.max_tweeter_avg_power_db.map(power),
-            long_limit: p.max_tweeter_long_avg_power_db.map(power),
-            tone_limit: p.tone_min_rms_db.map(power),
-            rms_frames: frames(p.tweeter_rms_fault_seconds),
-            tone_frames: frames(p.tone_fault_seconds),
-            dc_frames: frames(p.dc_freeze_seconds),
-            short_alpha: alpha(p.tweeter_avg_power_tau_seconds),
-            prearm_alpha: alpha(p.tweeter_avg_power_tau_seconds / 2.5),
-            long_alpha: alpha(p.tweeter_long_avg_power_tau_seconds),
-            tone_crest: p.tone_crest_db,
-            dc_tolerance: p.dc_freeze_peak_rms_tolerance_db,
-            epsilon: p.level_freshness_epsilon_db,
-            qualification_frames: frames(qualification),
-            silence_power: power(p.silence_threshold_db),
-        }
-    }
-
     pub fn assess(
         &self,
         h: &mut History,
-        samples: &[PrcFmt],
+        peak: f64,
+        q: f64,
         prearm: bool,
         observable: bool,
     ) -> Assessment {
-        let peak = samples.iter().fold(0.0_f64, |p, x| p.max(x.abs()));
-        let q = samples.iter().map(|x| x * x).sum::<f64>() / FRAMES as f64;
         if !q.is_finite() {
             return Assessment {
-                reason: Some(Reason::Nonfinite),
+                reason: Some(Reason::Numeric),
                 veto: false,
             };
         }
@@ -162,6 +87,7 @@ impl Policy {
             reason = Some(Reason::Rms);
         }
         if let Some(limit) = self.short_limit {
+            let retained = h.short_power;
             let e = update_power(
                 &mut h.short_power,
                 q,
@@ -172,17 +98,22 @@ impl Policy {
                 },
                 observable,
             );
-            if e >= limit {
+            if retained >= limit || e >= limit {
                 reason = reason.or(Some(Reason::ShortPower));
             }
         }
-        if let Some(limit) = self.long_limit
-            && update_power(&mut h.long_power, q, self.long_alpha, observable) >= limit
-        {
-            reason = reason.or(Some(Reason::LongPower));
+        if let Some(limit) = self.long_limit {
+            let retained = h.long_power;
+            let next = update_power(&mut h.long_power, q, self.long_alpha, observable);
+            if retained >= limit || next >= limit {
+                reason = reason.or(Some(Reason::LongPower));
+            }
         }
-        let peak_db = 20.0 * peak.log10();
-        let rms_db = 10.0 * q.log10();
+        let levels = (q > 0.0
+            && (self.tone_limit.is_some_and(|l| q >= l)
+                || self.freeze_floor.is_some_and(|l| q > l)))
+        .then(|| (20.0 * peak.log10(), 10.0 * q.log10()));
+        let (peak_db, rms_db) = levels.unwrap_or((0.0, 0.0));
         let crest = peak_db - rms_db;
         if consecutive(
             &mut h.tone_frames,
@@ -191,8 +122,7 @@ impl Policy {
         ) {
             reason = reason.or(Some(Reason::Tone));
         }
-        let signature = if q > self.silence_power
-            && peak * peak > self.silence_power
+        let signature = if self.freeze_floor.is_some_and(|l| q > l && peak * peak > l)
             && crest.abs() <= self.dc_tolerance
         {
             Some((
@@ -202,6 +132,12 @@ impl Policy {
         } else {
             None
         };
+        if signature.is_some_and(|(a, b)| !a.is_finite() || !b.is_finite()) {
+            return Assessment {
+                reason: Some(Reason::Numeric),
+                veto: false,
+            };
+        }
         if consecutive(
             &mut h.dc_frames,
             signature.is_some() && signature == h.signature,
@@ -227,7 +163,31 @@ mod tests {
     };
     use std::sync::Arc;
 
-    fn setup(p: Parameters) -> Guard {
+    use serde_json::{Value, json};
+    fn fixture() -> Value {
+        serde_json::to_value(parameters()).unwrap()
+    }
+    fn destination_policy(p: &Value) -> Policy {
+        let (plan, _) = serde_json::from_value::<Parameters>(p.clone())
+            .unwrap()
+            .compile()
+            .unwrap();
+        plan.destinations
+            .iter()
+            .find(|d| d.id.text() == Some("tw_l"))
+            .unwrap()
+            .policy
+    }
+    fn rms(db: f64, hold: f64) -> Value {
+        json!({"kind":"rms","targets":["tw_l","tw_r"],"limit_dbfs":db,"hold_s":hold})
+    }
+    fn crest_policy(db: f64, hold: f64, crest: f64) -> Value {
+        json!({"kind":"crest_tone","targets":["tw_l","tw_r"],"min_rms_dbfs":db,"hold_s":hold,"max_crest_db":crest})
+    }
+    fn power(kind: &str, db: f64, tau: f64) -> Value {
+        json!({"kind":kind,"targets":["tw_l","tw_r"],"limit_dbfs":db,"tau_s":tau})
+    }
+    fn setup(p: Value) -> Guard {
         let mut conf = serde_json::to_value(configuration()).unwrap();
         conf["processors"]["guard"]["parameters"] = serde_json::to_value(p).unwrap();
         let conf = serde_json::from_value(conf).unwrap();
@@ -278,13 +238,11 @@ mod tests {
                 let threshold = 10.0 * 0.0625_f64.log10();
                 for offset in [-0.01, 0.0, 0.01] {
                     let db = threshold + offset;
-                    let mut p = parameters();
+                    let mut p = fixture();
                     if tone {
-                        p.tone_min_rms_db = Some(threshold);
-                        p.tone_fault_seconds = 0.01001;
+                        p["policies"]["tone"] = crest_policy(threshold, 0.01001, 4.5);
                     } else {
-                        p.max_tweeter_rms_db = Some(threshold);
-                        p.tweeter_rms_fault_seconds = 0.01001;
+                        p["policies"]["rms"] = rms(threshold, 0.01001);
                     }
                     let mut g = setup(p);
                     // Use exactly the compiled limit at equality; samples have
@@ -309,9 +267,8 @@ mod tests {
 
     #[test]
     fn consecutive_policies_reset_on_below_limit_and_pause() {
-        let mut p = parameters();
-        p.max_tweeter_rms_db = Some(-20.0);
-        p.tweeter_rms_fault_seconds = 0.010;
+        let mut p = fixture();
+        p["policies"]["rms"] = rms(-20.0, 0.010);
         let mut g = setup(p);
         for _ in 0..5 {
             g.process(&mut input(1, 0.02, false));
@@ -328,25 +285,23 @@ mod tests {
 
     #[test]
     fn crest_and_dc_tolerance_boundaries_are_inclusive() {
-        let samples = input(0, 0.125, false).waveforms.remove(0);
         let crest = 20.0 * 0.5_f64.log10() - 10.0 * 0.125_f64.log10();
         for tone in [false, true] {
             for offset in [-0.01, 0.0, 0.01] {
-                let mut p = parameters();
-                p.dc_freeze_seconds = FRAMES as f64 / SAMPLE_RATE as f64;
+                let mut p = fixture();
+                p["policies"]["hf_freeze"]["hold_s"] = json!(FRAMES as f64 / SAMPLE_RATE as f64);
                 if tone {
-                    p.tone_min_rms_db = Some(-20.0);
-                    p.tone_fault_seconds = p.dc_freeze_seconds;
-                    p.tone_crest_db = crest + offset;
+                    p["policies"]["tone"] =
+                        crest_policy(-20.0, FRAMES as f64 / SAMPLE_RATE as f64, crest + offset);
                 } else {
-                    p.dc_freeze_peak_rms_tolerance_db = crest + offset;
+                    p["policies"]["hf_freeze"]["crest_tolerance_db"] = json!(crest + offset);
                 }
-                let policy = Policy::new(&p);
+                let policy = destination_policy(&p);
                 let mut h = History::default();
-                let mut result = policy.assess(&mut h, &samples, true, true);
+                let mut result = policy.assess(&mut h, 0.5, 0.125, true, true);
                 if !tone {
                     assert!(result.reason.is_none()); // Signature baseline.
-                    result = policy.assess(&mut h, &samples, true, true);
+                    result = policy.assess(&mut h, 0.5, 0.125, true, true);
                 }
                 assert_eq!(
                     result.reason,
@@ -362,9 +317,8 @@ mod tests {
 
     #[test]
     fn sustained_candidate_hazard_trips_even_when_mute_blocks_observability() {
-        let mut p = parameters();
-        p.max_tweeter_rms_db = Some(-20.0);
-        p.tweeter_rms_fault_seconds = 0.010;
+        let mut p = fixture();
+        p["policies"]["rms"] = rms(-20.0, 0.010);
         let mut g = setup(p);
         for _ in 0..2 {
             let mut audio = input(1, 0.02, false);
@@ -378,8 +332,8 @@ mod tests {
 
     #[test]
     fn dc_signature_baseline_quantization_change_and_silence() {
-        let mut p = parameters();
-        p.dc_freeze_seconds = 0.01001;
+        let mut p = fixture();
+        p["policies"]["hf_freeze"]["hold_s"] = json!(0.01001);
         let mut g = setup(p);
         for _ in 0..10 {
             g.process(&mut input(0, 0.0, true));
@@ -401,15 +355,23 @@ mod tests {
 
     #[test]
     fn short_power_audio_time_matches_closed_form_and_long_is_not_accelerated() {
-        let mut p = parameters();
-        p.max_tweeter_avg_power_db = Some(-10.0);
-        p.max_tweeter_long_avg_power_db = Some(-20.0);
-        let policy = Policy::new(&p);
-        assert_eq!(policy.qualification_frames, 480_000); // not 180 seconds
+        let mut p = fixture();
+        p["policies"]["short"] = power("short_power", -10.0, 5.0);
+        p["policies"]["long"] = power("long_power", -20.0, 90.0);
+        let policy = destination_policy(&p);
+        assert_eq!(
+            serde_json::from_value::<Parameters>(p)
+                .unwrap()
+                .compile()
+                .unwrap()
+                .0
+                .qualification_frames,
+            480_000
+        ); // not 180 seconds
         for prearm in [false, true] {
             let mut h = History::default();
             for _ in 0..1000 {
-                policy.assess(&mut h, &[0.1; FRAMES], prearm, true);
+                policy.assess(&mut h, 0.1, 0.01, prearm, true);
             }
             let dt = 1000.0 * FRAMES as f64 / SAMPLE_RATE as f64;
             assert!(
@@ -424,10 +386,10 @@ mod tests {
 
     #[test]
     fn power_thresholds_are_inclusive_and_veto_is_strict() {
-        let mut p = parameters();
-        p.max_tweeter_avg_power_db = Some(-10.0);
-        p.max_tweeter_long_avg_power_db = Some(-20.0);
-        let mut policy = Policy::new(&p);
+        let mut p = fixture();
+        p["policies"]["short"] = power("short_power", -10.0, 5.0);
+        p["policies"]["long"] = power("long_power", -20.0, 90.0);
+        let mut policy = destination_policy(&p);
         // Exact fixed point: update arithmetic adds zero at equality.
         let q = 0.0625;
         for long in [false, true] {
@@ -444,7 +406,7 @@ mod tests {
                 } else {
                     policy.short_limit = Some(q + offset);
                 }
-                let a = policy.assess(&mut h, &[0.25; FRAMES], true, true);
+                let a = policy.assess(&mut h, 0.25, q, true, true);
                 assert_eq!(
                     a.reason,
                     if offset <= 0.0 {
@@ -465,21 +427,21 @@ mod tests {
     #[test]
     fn marginal_overload_veto_survives_skipped_reads_and_requires_full_window() {
         for overload in [0.01, 0.05] {
-            let mut p = parameters();
-            p.max_tweeter_avg_power_db = Some(-20.0);
+            let mut p = fixture();
+            p["policies"]["short"] = power("short_power", -20.0, 5.0);
             let mut g = setup(p);
             let q = 10.0_f64.powf((-20.0 + overload) / 10.0);
             for _ in 0..=480_000 / 256 {
                 let mut audio = input(1, q, false);
                 g.process(&mut audio);
-                assert!(!g.qualification.is_active() && g.detector.short_power_veto);
+                assert!(!g.qualification.is_active() && g.detector.prearm_veto);
                 assert!(audio.waveforms.iter().flatten().all(|x| *x == 0.0));
             }
             if overload == 0.01 {
                 assert!(g.fault.trip.is_none());
-                let heat = g.detector.history[1].short_power;
+                let heat = g.detector.history[5].short_power;
                 context(&mut g, Operation::Context(Mode::Prearm), 2);
-                assert_eq!(g.detector.history[1].short_power, heat);
+                assert_eq!(g.detector.history[5].short_power, heat);
                 for _ in 0..480_000 / 256 {
                     g.process(&mut input(1, 0.0, false));
                     assert!(!g.qualification.is_active());
@@ -494,16 +456,16 @@ mod tests {
 
     #[test]
     fn masked_audio_and_pause_never_cool_and_only_reset_clears_heat() {
-        let mut p = parameters();
-        p.max_tweeter_avg_power_db = Some(-10.0);
-        p.max_tweeter_long_avg_power_db = Some(-20.0);
-        let mut g = setup(p);
+        let mut p = fixture();
+        p["policies"]["short"] = power("short_power", -10.0, 5.0);
+        p["policies"]["long"] = power("long_power", -20.0, 90.0);
+        let mut g = setup(p.clone());
         for _ in 0..10 {
             g.process(&mut input(0, 0.005, false));
         }
         let heat = (
-            g.detector.history[0].short_power,
-            g.detector.history[0].long_power,
+            g.detector.history[4].short_power,
+            g.detector.history[4].long_power,
         );
         for _ in 0..100 {
             let mut masked = input(0, 0.0, false);
@@ -515,16 +477,20 @@ mod tests {
         assert_eq!(
             heat,
             (
-                g.detector.history[0].short_power,
-                g.detector.history[0].long_power
+                g.detector.history[4].short_power,
+                g.detector.history[4].long_power
             )
         );
-        g.install(&config::validate_config(configuration(), None).unwrap());
+        let mut next = serde_json::to_value(configuration()).unwrap();
+        next["processors"]["guard"]["parameters"] = p;
+        assert!(g.install(
+            &config::validate_config(serde_json::from_value(next).unwrap(), None).unwrap()
+        ));
         assert_eq!(
             heat,
             (
-                g.detector.history[0].short_power,
-                g.detector.history[0].long_power
+                g.detector.history[4].short_power,
+                g.detector.history[4].long_power
             )
         );
         g.shared
@@ -534,16 +500,16 @@ mod tests {
         assert_eq!(
             heat,
             (
-                g.detector.history[0].short_power,
-                g.detector.history[0].long_power
+                g.detector.history[4].short_power,
+                g.detector.history[4].long_power
             )
         );
         context(&mut g, Operation::Context(Mode::Prearm), 3);
         context(&mut g, Operation::Reset, 4);
         assert_eq!(
             (
-                g.detector.history[0].short_power,
-                g.detector.history[0].long_power
+                g.detector.history[4].short_power,
+                g.detector.history[4].long_power
             ),
             (0.0, 0.0)
         );
@@ -551,21 +517,21 @@ mod tests {
 
     #[test]
     fn post_hold_context_preserves_heat_and_restarts_complete_window() {
-        let mut p = parameters();
-        p.max_tweeter_avg_power_db = Some(-10.0);
-        p.tweeter_avg_power_tau_seconds = 0.02;
-        p.dc_freeze_seconds = 0.01;
+        let mut p = fixture();
+        p["policies"]["short"] = power("short_power", -10.0, 5.0);
+        p["policies"]["short"]["tau_s"] = json!(0.02);
+        p["policies"]["hf_freeze"]["hold_s"] = json!(0.01);
         let mut g = setup(p);
         context(&mut g, Operation::Reset, 2);
         for _ in 0..10 {
             g.process(&mut input(0, 0.01, false));
         }
         assert!(g.qualification.is_active());
-        let heat = g.detector.history[0].short_power;
+        let heat = g.detector.history[4].short_power;
         context(&mut g, Operation::Context(Mode::Prearm), 3);
         assert!(!g.qualification.is_active());
         assert_eq!(g.qualification.frames(), 0);
-        assert_eq!(g.detector.history[0].short_power, heat);
+        assert_eq!(g.detector.history[4].short_power, heat);
         for _ in 0..8 {
             g.process(&mut input(0, 0.001, false));
             assert!(!g.qualification.is_active());
@@ -576,10 +542,10 @@ mod tests {
 
     #[test]
     fn prearm_veto_revokes_local_active_and_rejects_same_chunk_armed_command() {
-        let mut p = parameters();
-        p.max_tweeter_avg_power_db = Some(-20.0);
-        p.tweeter_avg_power_tau_seconds = 0.02;
-        p.dc_freeze_seconds = 0.01;
+        let mut p = fixture();
+        p["policies"]["short"] = power("short_power", -20.0, 5.0);
+        p["policies"]["short"]["tau_s"] = json!(0.02);
+        p["policies"]["hf_freeze"]["hold_s"] = json!(0.01);
         let mut g = setup(p);
         for _ in 0..10 {
             g.process(&mut input(0, 0.0, false));
@@ -599,47 +565,22 @@ mod tests {
             g.control.last_command.unwrap().result,
             ControlResult::NotQualified
         );
-        assert!(g.detector.short_power_veto && !g.qualification.is_active());
+        assert!(g.detector.prearm_veto && !g.qualification.is_active());
     }
 
     #[test]
     fn invalid_profile_relationships_and_all_policy_identity_changes() {
-        let mut p = parameters();
-        p.max_tweeter_long_avg_power_db = Some(-30.0);
-        assert!(p.validate().is_err());
-        p.max_tweeter_avg_power_db = Some(-20.0);
-        assert!(p.validate().is_ok());
-        p.tweeter_long_avg_power_tau_seconds = 5.0;
-        assert!(p.validate().is_err());
-        p = parameters();
-        p.dc_freeze_seconds = f64::NAN;
-        assert!(p.validate().is_err());
-        let original = parameters();
-        let base = setup(original.clone())
-            .configuration
-            .unwrap()
-            .identity
-            .profile;
-        let value = serde_json::to_value(&original).unwrap();
-        for (key, old) in value.as_object().unwrap() {
-            if key.ends_with("channels") {
-                continue;
-            }
-            let mut changed = value.clone();
-            changed[key] = if old.is_null() {
-                serde_json::json!(-30.0)
-            } else {
-                serde_json::json!(old.as_f64().unwrap() * 1.01)
-            };
-            if key == "max_tweeter_long_avg_power_db" {
-                changed["max_tweeter_avg_power_db"] = serde_json::json!(-20.0);
-            }
-            let g = setup(serde_json::from_value(changed).unwrap());
-            assert_ne!(
-                g.configuration.as_ref().unwrap().identity.profile,
-                base,
-                "{key}"
-            );
-        }
+        let mut p = fixture();
+        p["policies"]["long"] = power("long_power", -30.0, 90.0);
+        let valid = |p: &Value| {
+            serde_json::from_value::<Parameters>(p.clone()).is_ok_and(|p| p.compile().is_ok())
+        };
+        assert!(!valid(&p));
+        p["policies"]["short"] = power("short_power", -20.0, 5.0);
+        assert!(valid(&p));
+        p["policies"]["long"]["tau_s"] = json!(5.0);
+        assert!(!valid(&p));
+        p["policies"]["hf_freeze"]["hold_s"] = Value::Null;
+        assert!(!valid(&p));
     }
 }

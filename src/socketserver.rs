@@ -83,13 +83,21 @@ enum ValueWithOptionalLimits {
     Limited(f32, f32, f32),
 }
 
+fn unique_mutation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<serde_json::Value, D::Error> {
+    let value = yaml_serde::Value::deserialize(d)?;
+    serde_json::to_value(value).map_err(serde::de::Error::custom)
+}
+
 #[derive(Debug, PartialEq, Deserialize)]
 enum WsCommand {
     SetConfigFilePath(String),
     SetConfig(String),
     SetConfigJson(String),
-    PatchConfig(serde_json::Value),
-    SetConfigValue(String, serde_json::Value),
+    PatchConfig(#[serde(deserialize_with = "unique_mutation")] serde_json::Value),
+    SetConfigValue(
+        String,
+        #[serde(deserialize_with = "unique_mutation")] serde_json::Value,
+    ),
     Reload,
     GetConfig,
     GetConfigValue(String),
@@ -680,6 +688,15 @@ fn handle_command(
                 Some(path) => match config::load_config(path.as_str()) {
                     Ok(conf) => match config::validate_config(conf, Some(path.as_str())) {
                         Ok(conf) => {
+                            if let Err(err) = shared_data_inst
+                                .processing_params
+                                .protection
+                                .check_binding(&conf)
+                            {
+                                return Some(WsReply::Reload {
+                                    result: WsResult::ConfigValidationError(err.to_string()),
+                                });
+                            }
                             debug!("WS: Config file loaded successfully, send to controller");
                             match shared_data_inst
                                 .command_sender
@@ -1312,86 +1329,100 @@ fn handle_command(
                 })
             }
         },
-        WsCommand::SetConfig(config_yml) => {
-            match yaml_serde::from_str::<config::Configuration>(&config_yml) {
-                Ok(conf) => match config::validate_config(conf, None) {
-                    Ok(conf) => {
-                        match shared_data_inst
-                            .command_sender
-                            .try_send(ControllerMessage::ConfigChanged(Box::new(conf)))
-                        {
-                            Ok(()) => Some(WsReply::SetConfig {
-                                result: WsResult::Ok,
-                            }),
-                            Err(TrySendError::Full(_)) => {
-                                debug!("Error sending new config, too many requests");
-                                Some(WsReply::SetConfig {
-                                    result: WsResult::RateLimitExceededError,
-                                })
-                            }
-                            Err(TrySendError::Disconnected(_)) => {
-                                debug!("Error sending new config, channel was disconnected");
-                                Some(WsReply::SetConfig {
-                                    result: WsResult::ShutdownInProgressError,
-                                })
-                            }
+        WsCommand::SetConfig(config_yml) => match config::parse_yaml_config(&config_yml) {
+            Ok(conf) => match config::validate_config(conf, None) {
+                Ok(conf) => {
+                    if let Err(err) = shared_data_inst
+                        .processing_params
+                        .protection
+                        .check_binding(&conf)
+                    {
+                        return Some(WsReply::SetConfig {
+                            result: WsResult::ConfigValidationError(err.to_string()),
+                        });
+                    }
+                    match shared_data_inst
+                        .command_sender
+                        .try_send(ControllerMessage::ConfigChanged(Box::new(conf)))
+                    {
+                        Ok(()) => Some(WsReply::SetConfig {
+                            result: WsResult::Ok,
+                        }),
+                        Err(TrySendError::Full(_)) => {
+                            debug!("Error sending new config, too many requests");
+                            Some(WsReply::SetConfig {
+                                result: WsResult::RateLimitExceededError,
+                            })
+                        }
+                        Err(TrySendError::Disconnected(_)) => {
+                            debug!("Error sending new config, channel was disconnected");
+                            Some(WsReply::SetConfig {
+                                result: WsResult::ShutdownInProgressError,
+                            })
                         }
                     }
-                    Err(error) => {
-                        debug!("Error validating config: {error}");
-                        Some(WsReply::SetConfig {
-                            result: WsResult::ConfigValidationError(error.to_string()),
-                        })
-                    }
-                },
+                }
                 Err(error) => {
-                    debug!("Error parsing yaml: {error}");
+                    debug!("Error validating config: {error}");
                     Some(WsReply::SetConfig {
-                        result: WsResult::ConfigReadError(error.to_string()),
+                        result: WsResult::ConfigValidationError(error.to_string()),
                     })
                 }
+            },
+            Err(error) => {
+                debug!("Error parsing yaml: {error}");
+                Some(WsReply::SetConfig {
+                    result: WsResult::ConfigReadError(error.to_string()),
+                })
             }
-        }
-        WsCommand::SetConfigJson(config_json) => {
-            match serde_json::from_str::<config::Configuration>(&config_json) {
-                Ok(conf) => match config::validate_config(conf, None) {
-                    Ok(conf) => {
-                        match shared_data_inst
-                            .command_sender
-                            .try_send(ControllerMessage::ConfigChanged(Box::new(conf)))
-                        {
-                            Ok(()) => Some(WsReply::SetConfigJson {
-                                result: WsResult::Ok,
-                            }),
-                            Err(TrySendError::Full(_)) => {
-                                debug!("Error sending new config, too many requests");
-                                Some(WsReply::SetConfigJson {
-                                    result: WsResult::RateLimitExceededError,
-                                })
-                            }
-                            Err(TrySendError::Disconnected(_)) => {
-                                debug!("Error sending new config, channel was disconnected");
-                                Some(WsReply::SetConfigJson {
-                                    result: WsResult::ShutdownInProgressError,
-                                })
-                            }
+        },
+        WsCommand::SetConfigJson(config_json) => match config::parse_json_config(&config_json) {
+            Ok(conf) => match config::validate_config(conf, None) {
+                Ok(conf) => {
+                    if let Err(err) = shared_data_inst
+                        .processing_params
+                        .protection
+                        .check_binding(&conf)
+                    {
+                        return Some(WsReply::SetConfigJson {
+                            result: WsResult::ConfigValidationError(err.to_string()),
+                        });
+                    }
+                    match shared_data_inst
+                        .command_sender
+                        .try_send(ControllerMessage::ConfigChanged(Box::new(conf)))
+                    {
+                        Ok(()) => Some(WsReply::SetConfigJson {
+                            result: WsResult::Ok,
+                        }),
+                        Err(TrySendError::Full(_)) => {
+                            debug!("Error sending new config, too many requests");
+                            Some(WsReply::SetConfigJson {
+                                result: WsResult::RateLimitExceededError,
+                            })
+                        }
+                        Err(TrySendError::Disconnected(_)) => {
+                            debug!("Error sending new config, channel was disconnected");
+                            Some(WsReply::SetConfigJson {
+                                result: WsResult::ShutdownInProgressError,
+                            })
                         }
                     }
-                    Err(error) => {
-                        debug!("Error validating config: {error}");
-                        Some(WsReply::SetConfigJson {
-                            result: WsResult::ConfigValidationError(error.to_string()),
-                        })
-                    }
-                },
+                }
                 Err(error) => {
-                    debug!("Error parsing json: {error}");
+                    debug!("Error validating config: {error}");
                     Some(WsReply::SetConfigJson {
-                        result: WsResult::ConfigReadError(error.to_string()),
+                        result: WsResult::ConfigValidationError(error.to_string()),
                     })
                 }
+            },
+            Err(error) => {
+                debug!("Error parsing json: {error}");
+                Some(WsReply::SetConfigJson {
+                    result: WsResult::ConfigReadError(error.to_string()),
+                })
             }
-        }
+        },
         WsCommand::PatchConfig(value) => Some(WsReply::PatchConfig {
             result: request_config_mutation(config::ConfigMutation::Patch(value), shared_data_inst),
         }),
@@ -1401,36 +1432,32 @@ fn handle_command(
                 shared_data_inst,
             ),
         }),
-        WsCommand::ReadConfig(config_yml) => {
-            match yaml_serde::from_str::<config::Configuration>(&config_yml) {
-                Ok(conf) => Some(WsReply::ReadConfig {
-                    result: WsResult::Ok,
-                    value: yaml_serde::to_string(&conf).unwrap(),
-                }),
-                Err(error) => {
-                    debug!("Error reading config: {error}");
-                    Some(WsReply::ReadConfig {
-                        result: WsResult::ConfigReadError(error.to_string()),
-                        value: error.to_string(),
-                    })
-                }
+        WsCommand::ReadConfig(config_yml) => match config::parse_yaml_config(&config_yml) {
+            Ok(conf) => Some(WsReply::ReadConfig {
+                result: WsResult::Ok,
+                value: yaml_serde::to_string(&conf).unwrap(),
+            }),
+            Err(error) => {
+                debug!("Error reading config: {error}");
+                Some(WsReply::ReadConfig {
+                    result: WsResult::ConfigReadError(error.to_string()),
+                    value: error.to_string(),
+                })
             }
-        }
-        WsCommand::ReadConfigJson(config_json) => {
-            match serde_json::from_str::<config::Configuration>(&config_json) {
-                Ok(conf) => Some(WsReply::ReadConfigJson {
-                    result: WsResult::Ok,
-                    value: serde_json::to_string(&conf).unwrap(),
-                }),
-                Err(error) => {
-                    error!("Error reading config: {}", error);
-                    Some(WsReply::ReadConfigJson {
-                        result: WsResult::ConfigReadError(error.to_string()),
-                        value: error.to_string(),
-                    })
-                }
+        },
+        WsCommand::ReadConfigJson(config_json) => match config::parse_json_config(&config_json) {
+            Ok(conf) => Some(WsReply::ReadConfigJson {
+                result: WsResult::Ok,
+                value: serde_json::to_string(&conf).unwrap(),
+            }),
+            Err(error) => {
+                error!("Error reading config: {}", error);
+                Some(WsReply::ReadConfigJson {
+                    result: WsResult::ConfigReadError(error.to_string()),
+                    value: error.to_string(),
+                })
             }
-        }
+        },
         WsCommand::ReadConfigFile(path) => match config::load_config(&path) {
             Ok(conf) => Some(WsReply::ReadConfigFile {
                 result: WsResult::Ok,
@@ -1444,32 +1471,30 @@ fn handle_command(
                 })
             }
         },
-        WsCommand::ValidateConfig(config_yml) => {
-            match yaml_serde::from_str::<config::Configuration>(&config_yml) {
-                Ok(conf) => match config::validate_config(conf, None) {
-                    Ok(conf) => Some(WsReply::ValidateConfig {
-                        result: WsResult::Ok,
-                        value: yaml_serde::to_string(&conf).unwrap(),
-                    }),
-                    Err(error) => {
-                        debug!("Config error: {error}");
-                        Some(WsReply::ValidateConfig {
-                            result: WsResult::ConfigValidationError(error.to_string()),
-                            value: error.to_string(),
-                        })
-                    }
-                },
+        WsCommand::ValidateConfig(config_yml) => match config::parse_yaml_config(&config_yml) {
+            Ok(conf) => match config::validate_config(conf, None) {
+                Ok(conf) => Some(WsReply::ValidateConfig {
+                    result: WsResult::Ok,
+                    value: yaml_serde::to_string(&conf).unwrap(),
+                }),
                 Err(error) => {
                     debug!("Config error: {error}");
                     Some(WsReply::ValidateConfig {
-                        result: WsResult::ConfigReadError(error.to_string()),
+                        result: WsResult::ConfigValidationError(error.to_string()),
                         value: error.to_string(),
                     })
                 }
+            },
+            Err(error) => {
+                debug!("Config error: {error}");
+                Some(WsReply::ValidateConfig {
+                    result: WsResult::ConfigReadError(error.to_string()),
+                    value: error.to_string(),
+                })
             }
-        }
+        },
         WsCommand::ValidateConfigJson(config_json) => {
-            match serde_json::from_str::<config::Configuration>(&config_json) {
+            match config::parse_json_config(&config_json) {
                 Ok(conf) => match config::validate_config(conf, None) {
                     Ok(conf) => Some(WsReply::ValidateConfigJson {
                         result: WsResult::Ok,
@@ -1815,6 +1840,12 @@ mod tests {
         let cmd = Message::text("\"Reload\"");
         let res = parse_command(cmd).unwrap();
         assert_eq!(res, WsCommand::Reload);
+        for duplicate in [
+            r#"{"PatchConfig":{"processors":{"guard":{"parameters":{"policies":{"hf":{},"hf":{}}}}}}}"#,
+            r#"{"SetConfigValue":["/processors/guard/parameters",{"signals":{"x":{},"x":{}}}]}"#,
+        ] {
+            assert!(parse_command(Message::text(duplicate)).is_err());
+        }
         let cmd = Message::text("asdfasdf");
         let res = parse_command(cmd);
         assert!(res.is_err());

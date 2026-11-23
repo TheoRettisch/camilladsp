@@ -2401,20 +2401,21 @@ These are special "filters" that work on several channels at the same time.
 Processors take an optional `description` property.
 This is intended for the user and is not used by CamillaDSP itself.
 
-### Protection (fixed-profile fork)
+### Protection (final output guard)
 
-This fork requires one final, enabled `Protection` processor. Its channel fields
-assert the supported profile and do not remap audio:
+One enabled `Protection` processor must end the 48 kHz, 256-frame pipeline.
+The guard checks shape and finite samples on all 24 final playback channels.
+Its signals name distinct lanes and roles. Destinations name individual speaker
+feeds and may share a signal. Each policy names its kind, parameters and sorted
+destination IDs. Peak, frozen, RMS, short power and long power can protect
+individual destinations. Crest-tone policies require tweeter destinations.
+A trip masks the entire chunk and retains its original profile, policy,
+destination, lane and decisive frame across a compatible graph edit.
 
-- `output_channels` must list every output in order, `[0, 1, ..., 23]`.
-- `tweeter_channels` must be exactly `[0, 1]`, in that order.
-
-Admission rejects other mappings. The guard checks nonfinite samples on all 24
-outputs and applies peak and sustained tweeter policies to outputs 0 and 1.
-The same fixed topology appears in protection status. These fields remain in
-the serialized configuration and graph/profile identity; their schema and
-accepted values are unchanged. The declarations live in
-[`src/protection.rs`](src/protection.rs).
+The [parity fixture](testdata/protection-parity.yml) shares a subwoofer lane.
+The [split fixture](testdata/protection-split.yml) assigns independent lanes.
+`--export-protection-profile` emits the schema-2 graph, resolved policies,
+qualification frame count and digests used by the protocol-2 status consumer.
 
 Direct ALSA playback treats XRUN and suspension observed through either PCM
 state or `EPIPE`/`ESTRPIPE` from wait, write or availability reads as a discarded
@@ -2443,8 +2444,8 @@ by the controller, not installation; configuration reads continue to describe
 the installed graph. A rejected partial edit leaves the request base unchanged.
 
 Each installed graph requires a fresh pre-arm attempt and its configured
-qualification window: the maximum of DC, enabled RMS/tone and twice enabled
-short-power tau, with an initial baseline chunk. Long-power tau is excluded.
+qualification window. It is the longest of one chunk, each enabled hold time
+and twice each short-power time constant, rounded up to whole frames.
 The paired watchdog admits one reviewed graph, so EQ and title/description
 edits can keep amplifier release inhibited until that graph is restored or its
 offline binding is reviewed and updated. Two seconds is a profile default,

@@ -1756,7 +1756,7 @@ pub enum ConfigChange {
 pub use self::prepared::{ConfigMutation, ConfigMutationError, PreparedConfig, validate_config};
 pub use self::utils::capture_channel_labels;
 pub use self::utils::config_diff;
-pub use self::utils::load_config;
 pub use self::utils::load_validate_config;
 pub use self::utils::playback_channel_labels;
 pub use self::utils::used_capture_channels;
+pub use self::utils::{load_config, parse_json_config, parse_yaml_config};

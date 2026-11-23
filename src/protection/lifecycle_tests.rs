@@ -1,7 +1,7 @@
 use super::*;
-use crate::ProcessingParameters;
 use crate::filters::basicfilters::{AppliedVolume, Volume};
 use crate::pipeline::Pipeline;
+use crate::{PrcFmt, ProcessingParameters};
 use control::{Expected, Result as ControlResult, State};
 use tests::{chunk, configuration};
 

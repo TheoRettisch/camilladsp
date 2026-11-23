@@ -1,4 +1,4 @@
-//! Version-1 protection operations. Socket handlers copy fixed atomic records;
+//! Version-2 protection operations. Socket handlers copy fixed atomic records;
 //! only the processing owner applies queued control commands.
 
 use super::{
@@ -179,16 +179,7 @@ impl Shared {
                 "control_revision": r.revision, "parent_reset_generation": r.parent_reset_generation,
                 "qualification_id": r.qualification_id,
             }));
-            let reason = guard.trip.map(|trip| match trip.reason {
-                super::Reason::Peak => "peak",
-                super::Reason::Nonfinite => "nonfinite",
-                super::Reason::Coverage => "coverage",
-                super::Reason::Rms => "rms",
-                super::Reason::ShortPower => "short_power",
-                super::Reason::LongPower => "long_power",
-                super::Reason::Tone => "tone",
-                super::Reason::DcFrozen => "dc_frozen",
-            });
+            let reason = guard.trip.map(|t| t.reason.kind());
             let state = match guard.state {
                 control::State::Inactive => "inactive",
                 control::State::Qualifying => "qualifying",
@@ -204,7 +195,7 @@ impl Shared {
                 powers.fill(0.0);
             }
             return Ok(json!({
-                "protocol": 1,
+                "protocol": 2,
                 "clock": {"name": "CLOCK_MONOTONIC", "boot_id": host.boot, "time_namespace_inode": host.namespace},
                 "snapshot_at_ns": now,
                 "epoch": epoch(host, guard.pipeline, guard.backend, guard.reset),
@@ -212,11 +203,14 @@ impl Shared {
                 "identity": {"fork_revision": identity::FORK_REVISION,
                     "graph_sha256": identity::hex(guard.identity.graph), "profile_sha256": identity::hex(guard.identity.profile),
                     "backend": "alsa-hw-ring-v1", "sample_rate": super::SAMPLE_RATE, "chunk_frames": super::FRAMES,
-                    "output_channels": super::OUTPUT_CHANNELS, "tweeter_channels": super::TWEETER_CHANNELS},
+                    "playback_channels":super::CHANNELS},
                 "guard": {"state": state, "final": guard.final_guard, "coverage_valid": guard.final_guard && guard.processing_valid,
-                    "candidate_observable": guard.candidate_observable, "short_power_veto": guard.short_power_veto,
+                    "candidate_observable": guard.candidate_observable, "prearm_veto": guard.prearm_veto,
                     "qualified_frames": guard.qualified_frames},
                 "trip": {"generation": guard.trip_generation, "latched": guard.trip.is_some(), "reason": reason,
+                    "origin_profile_sha256":guard.trip.map(|t|identity::hex(t.origin_profile)),
+                    "policy_id":guard.trip.as_ref().and_then(|t|t.policy_id.text()),
+                    "destination_id":guard.trip.as_ref().and_then(|t|t.destination_id.text()), "polarity":null,
                     "channel": guard.trip.and_then(|t| t.channel), "frame": guard.trip.map(|t| t.frame), "at_ns": guard.trip.map(|t| t.at_ns)},
                 "control": {"owner": guard.control.owner.map(uuid_text), "revision": guard.control.revision,
                     "parent_reset_generation": guard.control.parent_reset_generation, "qualification_id": guard.control.qualification_id,

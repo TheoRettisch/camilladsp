@@ -207,6 +207,10 @@ fn run(
     status_structs: StatusStructs,
     rx_ctrl: crossbeam_channel::Receiver<ControllerMessage>,
 ) -> Res<ExitState> {
+    status_structs
+        .processing
+        .protection
+        .bind_run(&active_config)?;
     let (tx_pb, rx_pb) = crossbeam_channel::bounded(active_config.config().devices.queuelimit());
     let (tx_cap, rx_cap) = crossbeam_channel::bounded(active_config.config().devices.queuelimit());
 
@@ -352,6 +356,11 @@ fn supervise_run(
                             return Err(Box::new(err));
                         }
                     };
+                    if let Err(error)=status_structs.processing.protection.check_binding(&new_conf) {
+                        warn!("Rejected protection rebind: {error}");
+                        if let Some(reply)=reply { let _=reply.send(Err(config::ConfigMutationError::Validation(error.to_string()))); }
+                        continue;
+                    }
                     status_structs.processing.set_processing_load(0.0);
                     status_structs.processing.set_resampler_load(0.0);
                     let comp = config::config_diff(requested_config.config(), new_conf.config());
@@ -500,16 +509,25 @@ fn next_configuration(
     rx_command: &crossbeam_channel::Receiver<ControllerMessage>,
     mut requested: Option<config::PreparedConfig>,
     wait: bool,
+    protection: &camillalib::protection::Shared,
 ) -> Option<config::PreparedConfig> {
     loop {
         if rx_command.is_empty() && (requested.is_some() || !wait) {
             return requested;
         }
         match rx_command.recv() {
-            Ok(ControllerMessage::ConfigChanged(config)) => requested = Some(*config),
+            Ok(ControllerMessage::ConfigChanged(config)) => match protection.check_binding(&config)
+            {
+                Ok(()) => requested = Some(*config),
+                Err(error) => warn!("Rejected protection rebind: {error}"),
+            },
             Ok(ControllerMessage::MutateConfig { mutation, reply }) => {
-                let result = mutation.apply(requested.as_ref()).map(|config| {
+                let result = mutation.apply(requested.as_ref()).and_then(|config| {
+                    protection
+                        .check_binding(&config)
+                        .map_err(|e| config::ConfigMutationError::Validation(e.to_string()))?;
                     requested = Some(config);
+                    Ok(())
                 });
                 let _ = reply.send(result);
             }
@@ -1290,7 +1308,12 @@ fn main_process() -> i32 {
 
     let mut requested_config = None;
     loop {
-        let Some(config) = next_configuration(&rx_command, requested_config.take(), wait) else {
+        let Some(config) = next_configuration(
+            &rx_command,
+            requested_config.take(),
+            wait,
+            &status_structs.processing.protection,
+        ) else {
             return EXIT_OK;
         };
 

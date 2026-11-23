@@ -122,8 +122,11 @@ fn replace_pipeline(
     new_config: &config::PreparedConfig,
     processing_params: &Arc<ProcessingParameters>,
 ) -> bool {
+    if protection.shared.check_binding(new_config).is_err() {
+        return false;
+    }
     control.reject_armed(protection);
-    protection.install(new_config);
+    assert!(protection.install(new_config));
     let new_config = new_config.config().clone();
     match diff {
         config::ConfigChange::Pipeline | config::ConfigChange::MixerParameters => {
@@ -168,7 +171,7 @@ pub fn run_processing(
                 return;
             }
         };
-        protection.install(&conf_proc);
+        assert!(protection.install(&conf_proc));
         let conf_proc = conf_proc.into_config();
         let chunksize = conf_proc.devices.chunksize;
         let samplerate = conf_proc.devices.samplerate;

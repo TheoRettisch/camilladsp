@@ -7,7 +7,7 @@ use super::control::{self, ControlSnapshot, Mode, Receipt, State};
 use super::{CHANNELS, Reason, Trip, identity};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(super) const GUARD_WORDS: usize = 45;
+pub(super) const GUARD_WORDS: usize = 57;
 pub(super) const PLAYBACK_WORDS: usize = 43;
 
 /// Every element is atomic; the sequence counter does not excuse non-atomic
@@ -136,7 +136,7 @@ macro_rules! variants {
         }
     };
 }
-variants!(Reason: Peak, Nonfinite, Coverage, Rms, ShortPower, LongPower, Tone, DcFrozen);
+variants!(Reason: Peak, Nonfinite, Coverage, Rms, ShortPower, LongPower, Tone, DcFrozen, Numeric);
 variants!(State: Inactive, Qualifying, Active, Tripped);
 variants!(Mode: Prearm, Armed);
 variants!(control::Result: Applied, Invalid, StateMismatch, NotQualified);
@@ -156,7 +156,7 @@ pub struct GuardRecord {
     pub state: State,
     pub candidate_observable: bool,
     pub qualified_frames: u64,
-    pub short_power_veto: bool,
+    pub prearm_veto: bool,
     pub attempt_required: bool,
     pub trip_generation: u64,
     pub trip: Option<Trip>,
@@ -182,7 +182,7 @@ impl GuardRecord {
         e.put(self.state as u64);
         e.flag(self.candidate_observable);
         e.put(self.qualified_frames);
-        e.flag(self.short_power_veto);
+        e.flag(self.prearm_veto);
         e.flag(self.attempt_required);
         e.put(self.trip_generation);
         // Zero is no trip: every Reason discriminant is positive.
@@ -195,6 +195,17 @@ impl GuardRecord {
         );
         e.put(self.trip.map_or(0, |t| t.frame));
         e.put(self.trip.map_or(0, |t| t.at_ns));
+        for word in self.trip.map_or([0; 4], |t| t.origin_profile) {
+            e.put(word);
+        }
+        for id in [
+            self.trip.map(|t| t.policy_id),
+            self.trip.map(|t| t.destination_id),
+        ] {
+            for bytes in id.unwrap_or_default().0.chunks_exact(8) {
+                e.put(u64::from_be_bytes(bytes.try_into().unwrap()));
+            }
+        }
         // Zero is no owner: the control owner rejects a zero UUID.
         let owner = self.control.owner.unwrap_or(0);
         e.put((owner >> 64) as u64);
@@ -238,16 +249,29 @@ impl GuardRecord {
         let state = State::decode(d.take())?;
         let candidate_observable = d.flag()?;
         let qualified_frames = d.take();
-        let short_power_veto = d.flag()?;
+        let prearm_veto = d.flag()?;
         let attempt_required = d.flag()?;
         let trip_generation = d.take();
         let reason = d.take();
         let (generation, channel, frame, at_ns) = (d.take(), d.take(), d.take(), d.take());
+        let origin_profile = std::array::from_fn(|_| d.take());
+        let mut read_id = || {
+            let mut id = super::Id::default();
+            for bytes in id.0.chunks_exact_mut(8) {
+                bytes.copy_from_slice(&d.take().to_be_bytes());
+            }
+            id
+        };
+        let policy_id = read_id();
+        let destination_id = read_id();
         let trip = match reason {
             0 => None,
             reason => Some(Trip {
                 generation,
                 reason: Reason::decode(reason)?,
+                origin_profile,
+                policy_id,
+                destination_id,
                 channel: match channel.checked_sub(1) {
                     Some(channel) => Some(usize::try_from(channel).ok()?),
                     None => None,
@@ -297,7 +321,7 @@ impl GuardRecord {
             state,
             candidate_observable,
             qualified_frames,
-            short_power_veto,
+            prearm_veto,
             attempt_required,
             trip_generation,
             trip,
@@ -430,12 +454,15 @@ mod tests {
             state: State::Tripped,
             candidate_observable: true,
             qualified_frames: 108,
-            short_power_veto: true,
+            prearm_veto: true,
             attempt_required: true,
             trip_generation: 109,
             trip: Some(Trip {
                 generation: 110,
                 reason: Reason::Tone,
+                origin_profile: [101; 4],
+                policy_id: super::super::Id::new("tone").unwrap(),
+                destination_id: super::super::Id::new("tw_l").unwrap(),
                 channel: Some(1),
                 frame: 111,
                 at_ns: 112,
@@ -475,7 +502,7 @@ mod tests {
         let flags: [fn(&mut GuardRecord) -> &mut bool; 5] = [
             |s| &mut s.processing_valid,
             |s| &mut s.candidate_observable,
-            |s| &mut s.short_power_veto,
+            |s| &mut s.prearm_veto,
             |s| &mut s.attempt_required,
             |s| &mut s.final_guard,
         ];

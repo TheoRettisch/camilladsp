@@ -247,7 +247,7 @@ impl Guard {
                     return Result::StateMismatch;
                 }
                 if !has_candidate
-                    || self.detector.short_power_veto
+                    || self.detector.prearm_veto
                     || !self.qualification.is_active()
                     || !self.candidate.observable
                     || self.fault.trip.is_some()

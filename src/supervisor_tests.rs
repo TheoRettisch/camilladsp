@@ -9,16 +9,7 @@ fn configuration() -> config::PreparedConfig {
             "capture": {"type": "SignalGenerator", "channels": 24,
                 "signal": {"type": "Sine", "freq": 1000, "level": -20}},
             "playback": {"type": "Alsa", "channels": 24, "device": "hw:nonexistent-camilladsp-test-card,0", "format": "S24_3_LE"}},
-        "processors": {"guard": {"type": "Protection", "parameters": {
-            "output_channels": camillalib::protection::OUTPUT_CHANNELS,
-            "tweeter_channels": camillalib::protection::TWEETER_CHANNELS,
-            "max_allowed_peak_db": -0.5, "dc_freeze_seconds": 2.0,
-            "dc_freeze_peak_rms_tolerance_db": 0.25, "level_freshness_epsilon_db": 0.01,
-            "max_tweeter_rms_db": null, "tweeter_rms_fault_seconds": 5.0,
-            "max_tweeter_avg_power_db": null, "tweeter_avg_power_tau_seconds": 5.0,
-            "max_tweeter_long_avg_power_db": null, "tweeter_long_avg_power_tau_seconds": 90.0,
-            "tone_min_rms_db": null, "tone_crest_db": 6.0,
-            "tone_fault_seconds": 5.0, "silence_threshold_db": -90.0}}},
+        "processors": {"guard": {"type": "Protection", "parameters": {"routing_sha256": "1111111111111111111111111111111111111111111111111111111111111111", "activity": {"silence_dbfs": -70.0}, "signals": {"high_l": {"lane": 0, "role": "tweeter"}, "high_r": {"lane": 1, "role": "tweeter"}, "door_l": {"lane": 2, "role": "midwoofer"}, "door_r": {"lane": 3, "role": "midwoofer"}, "bass": {"lane": 4, "role": "sub"}}, "destinations": {"tw_l": "high_l", "tw_r": "high_r", "mid_l": "door_l", "mid_r": "door_r", "sub_a": "bass", "sub_b": "bass"}, "policies": {"hf_peak": {"kind": "peak", "targets": ["tw_l", "tw_r"], "limit_dbfs": -0.5}, "hf_freeze": {"kind": "frozen", "targets": ["tw_l", "tw_r"], "floor_dbfs": -70.0, "crest_tolerance_db": 0.25, "quantum_db": 0.05, "hold_s": 2.0}}}}},
         "pipeline": [{"type": "Processor", "name": "guard"}]
     });
     config::validate_config(serde_json::from_value(raw).unwrap(), None).unwrap()
@@ -374,7 +365,12 @@ fn exercise(trigger: Trigger, starting: bool, panic_processing: bool, panic_capt
                     else {
                         unreachable!()
                     };
-                    parameters.max_allowed_peak_db = -1.0;
+                    let camillalib::protection::Instance::Peak { limit_dbfs, .. } =
+                        parameters.policies.get_mut("hf_peak").unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    *limit_dbfs = -1.0;
                     drop(rx_conf.take());
                 }
                 let changed = config::validate_config(raw, None).unwrap();
@@ -712,7 +708,13 @@ fn assert_restart_waits_for_old_workers(
         active.lock().is_none(),
         "retired configuration is still public"
     );
-    let selected = next_configuration(&rx_pending, Some(*next), false).unwrap();
+    let selected = next_configuration(
+        &rx_pending,
+        Some(*next),
+        false,
+        &camillalib::protection::Shared::default(),
+    )
+    .unwrap();
     assert!(response.recv().unwrap().is_ok());
     assert_eq!(
         selected.config().devices.queuelimit(),

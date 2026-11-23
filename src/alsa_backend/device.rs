@@ -1533,7 +1533,12 @@ mod protection_tests {
         else {
             unreachable!()
         };
-        parameters.max_allowed_peak_db -= 0.5;
+        let crate::protection::Instance::Peak { limit_dbfs, .. } =
+            parameters.policies.get_mut("hf_peak").unwrap()
+        else {
+            unreachable!()
+        };
+        *limit_dbfs -= 0.5;
         let updated = crate::config::validate_config(updated, None).unwrap();
         let (installed, _receipt) = crossbeam_channel::unbounded();
         tx_config

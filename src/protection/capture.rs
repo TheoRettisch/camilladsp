@@ -250,7 +250,7 @@ impl Capture {
                     "forwarded_bits": bits(&block.forwarded), "guard_active": block.active,
                     "graph_sha256": identity::hex(block.identity.graph),
                     "profile_sha256": identity::hex(block.identity.profile),
-                    "trip": block.trip.map(|t| json!({"generation": t.generation, "reason": t.reason as u64,
+                    "trip": block.trip.map(|t| json!({"generation": t.generation, "reason": t.reason.kind(), "origin_profile_sha256":identity::hex(t.origin_profile), "policy_id":t.policy_id.text(), "destination_id":t.destination_id.text(), "polarity":null,
                         "channel": t.channel, "frame": t.frame, "at_ns": t.at_ns}))}).as_object().unwrap().clone());
             } else {
                 let pcm: String = block.pcm.iter().map(|v| format!("{v:02x}")).collect();
@@ -459,6 +459,6 @@ mod tests {
         let value = guard.shared.capture.stop(1, &guard.shared).unwrap();
         assert_eq!(value["records"][0]["shape_valid"], false);
         assert_eq!(value["records"][0]["candidate_bits"][0], "7ff8000000000000");
-        assert_eq!(value["records"][0]["trip"]["reason"], 2);
+        assert_eq!(value["records"][0]["trip"]["reason"], "nonfinite");
     }
 }

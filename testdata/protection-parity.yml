@@ -1,0 +1,324 @@
+title: CarmillaDSP fixed 48 kHz protected candidate
+description: 48 kHz / 256 frames. Inputs 0/1 carry music and 2/3 carry guarded navigation.
+  Only the midwoofer band sums navigation. Bench candidate with placeholder driver
+  trims and delays.
+devices:
+  samplerate: 48000
+  chunksize: 256
+  queuelimit: null
+  silence_threshold: null
+  silence_timeout: null
+  capture:
+    type: Alsa
+    channels: 4
+    device: hw:Loopback,1,1
+    format: S32_LE
+    stop_on_inactive: null
+    link_volume_control: null
+    link_mute_control: null
+    labels: null
+  playback:
+    type: Alsa
+    channels: 24
+    device: hw:D624,0
+    format: S24_3_LE
+  enable_rate_adjust: true
+  target_level: 768
+  adjust_period: null
+  resampler: null
+  capture_samplerate: null
+  stop_on_rate_change: true
+  rate_measure_interval: 1.0
+  volume_ramp_time: null
+  volume_limit: 0.0
+  multithreaded: null
+  worker_threads: null
+mixers:
+  music_and_nav_to_active_front_sub:
+    description: null
+    channels:
+      in: 4
+      out: 24
+    mapping:
+    - dest: 0
+      sources:
+      - channel: 0
+        gain: 0.0
+        inverted: false
+        mute: null
+        scale: null
+      mute: null
+    - dest: 1
+      sources:
+      - channel: 1
+        gain: 0.0
+        inverted: false
+        mute: null
+        scale: null
+      mute: null
+    - dest: 2
+      sources:
+      - channel: 0
+        gain: -3.0
+        inverted: false
+        mute: null
+        scale: null
+      - channel: 2
+        gain: -14.0
+        inverted: false
+        mute: null
+        scale: null
+      mute: null
+    - dest: 3
+      sources:
+      - channel: 1
+        gain: -3.0
+        inverted: false
+        mute: null
+        scale: null
+      - channel: 3
+        gain: -14.0
+        inverted: false
+        mute: null
+        scale: null
+      mute: null
+    - dest: 4
+      sources:
+      - channel: 0
+        gain: -9.0
+        inverted: false
+        mute: null
+        scale: null
+      - channel: 1
+        gain: -9.0
+        inverted: false
+        mute: null
+        scale: null
+      mute: null
+    labels: null
+filters:
+  tweeter_trim_r:
+    type: Gain
+    description: null
+    parameters:
+      gain: 0.0
+      inverted: null
+      mute: null
+      scale: null
+  mid_hp:
+    type: BiquadCombo
+    description: null
+    parameters:
+      type: LinkwitzRileyHighpass
+      freq: 80.0
+      order: 4
+  mid_trim_l:
+    type: Gain
+    description: null
+    parameters:
+      gain: 0.0
+      inverted: null
+      mute: null
+      scale: null
+  mid_trim_r:
+    type: Gain
+    description: null
+    parameters:
+      gain: 0.0
+      inverted: null
+      mute: null
+      scale: null
+  sub_delay:
+    type: Delay
+    description: null
+    parameters:
+      delay: 0.0
+      unit: ms
+      subsample: null
+  tweeter_hp:
+    type: BiquadCombo
+    description: null
+    parameters:
+      type: LinkwitzRileyHighpass
+      freq: 3000.0
+      order: 4
+  tweeter_delay_r:
+    type: Delay
+    description: null
+    parameters:
+      delay: 0.0
+      unit: ms
+      subsample: null
+  tweeter_trim_l:
+    type: Gain
+    description: null
+    parameters:
+      gain: 0.0
+      inverted: null
+      mute: null
+      scale: null
+  mid_lp:
+    type: BiquadCombo
+    description: null
+    parameters:
+      type: LinkwitzRileyLowpass
+      freq: 3000.0
+      order: 4
+  sub_trim:
+    type: Gain
+    description: null
+    parameters:
+      gain: 0.0
+      inverted: null
+      mute: null
+      scale: null
+  tweeter_delay_l:
+    type: Delay
+    description: null
+    parameters:
+      delay: 0.0
+      unit: ms
+      subsample: null
+  mid_delay_l:
+    type: Delay
+    description: null
+    parameters:
+      delay: 0.0
+      unit: ms
+      subsample: null
+  mid_delay_r:
+    type: Delay
+    description: null
+    parameters:
+      delay: 0.0
+      unit: ms
+      subsample: null
+  sub_lp:
+    type: BiquadCombo
+    description: null
+    parameters:
+      type: LinkwitzRileyLowpass
+      freq: 80.0
+      order: 4
+  sub_level:
+    type: Volume
+    description: null
+    parameters:
+      ramp_time: 150.0
+      fader: Aux1
+      limit: null
+processors:
+  protection:
+    type: Protection
+    description: null
+    parameters:
+      routing_sha256: '1111111111111111111111111111111111111111111111111111111111111111'
+      activity:
+        silence_dbfs: -70.0
+      signals:
+        high_l:
+          lane: 0
+          role: tweeter
+        high_r:
+          lane: 1
+          role: tweeter
+        door_l:
+          lane: 2
+          role: midwoofer
+        door_r:
+          lane: 3
+          role: midwoofer
+        bass:
+          lane: 4
+          role: sub
+      destinations:
+        tw_l: high_l
+        tw_r: high_r
+        mid_l: door_l
+        mid_r: door_r
+        sub_a: bass
+        sub_b: bass
+      policies:
+        hf_peak:
+          kind: peak
+          targets:
+          - tw_l
+          - tw_r
+          limit_dbfs: -0.5
+        hf_freeze:
+          kind: frozen
+          targets:
+          - tw_l
+          - tw_r
+          floor_dbfs: -70.0
+          crest_tolerance_db: 0.25
+          quantum_db: 0.05
+          hold_s: 2.0
+pipeline:
+- type: Mixer
+  name: music_and_nav_to_active_front_sub
+  description: null
+  bypassed: null
+- type: Filter
+  channels:
+  - 0
+  - 1
+  names:
+  - tweeter_hp
+  description: null
+  bypassed: null
+- type: Filter
+  channels:
+  - 0
+  names:
+  - tweeter_trim_l
+  - tweeter_delay_l
+  description: null
+  bypassed: null
+- type: Filter
+  channels:
+  - 1
+  names:
+  - tweeter_trim_r
+  - tweeter_delay_r
+  description: null
+  bypassed: null
+- type: Filter
+  channels:
+  - 2
+  - 3
+  names:
+  - mid_hp
+  - mid_lp
+  description: null
+  bypassed: null
+- type: Filter
+  channels:
+  - 2
+  names:
+  - mid_trim_l
+  - mid_delay_l
+  description: null
+  bypassed: null
+- type: Filter
+  channels:
+  - 3
+  names:
+  - mid_trim_r
+  - mid_delay_r
+  description: null
+  bypassed: null
+- type: Filter
+  channels:
+  - 4
+  names:
+  - sub_lp
+  - sub_trim
+  - sub_delay
+  - sub_level
+  description: null
+  bypassed: null
+- type: Processor
+  name: protection
+  description: null
+  bypassed: null

@@ -110,32 +110,13 @@ pub fn hex(words: [u64; 4]) -> String {
     words.iter().map(|word| format!("{word:016x}")).collect()
 }
 
-fn profile(parameters: &super::Parameters, policy: &super::policy::Policy) -> Value {
-    serde_json::json!({
-        "algorithm": "protection-audio-time-v1",
-        "parameters": parameters,
-        "qualification_frames": policy.qualification_frames,
-        "enabled": {"rms": parameters.max_tweeter_rms_db.is_some(),
-            "short_power": parameters.max_tweeter_avg_power_db.is_some(),
-            "long_power": parameters.max_tweeter_long_avg_power_db.is_some(),
-            "tone": parameters.tone_min_rms_db.is_some(), "dc_frozen": true},
-        "short_prearm_factor": 2.5,
-        "qualification_rule": "candidate-baseline-max-windows-short-veto-v1",
-    })
-}
-
-pub(super) fn prepare(
-    conf: &config::Configuration,
-    parameters: &super::Parameters,
-    policy: &super::policy::Policy,
-) -> Res<Identity> {
+pub(super) fn prepare(conf: &config::Configuration, profile: &Value) -> Res<Identity> {
     // GetConfig uses this same YAML serialization. Round-trip it before
     // canonicalization so f32 config scalars have the same text semantics.
     let graph: Value = yaml_serde::from_str(&yaml_serde::to_string(conf)?)?;
-    let profile = profile(parameters, policy);
     Ok(Identity {
         graph: digest(&graph)?,
-        profile: digest(&profile)?,
+        profile: digest(profile)?,
     })
 }
 
@@ -145,14 +126,14 @@ pub fn export(conf: &config::PreparedConfig) -> Res<Value> {
     let admitted = conf.guard();
     let identity = admitted.identity;
     Ok(serde_json::json!({
-        "schema_version": 1,
-        "protocol": 1,
+        "schema_version": 2,
+        "protocol": 2,
         "backend": "alsa-hw-ring-v1",
         "fork_revision": FORK_REVISION,
         "graph_sha256": hex(identity.graph),
         "profile_sha256": hex(identity.profile),
         "graph_yaml": yaml_serde::to_string(conf)?,
-        "profile": profile(&admitted.parameters, &admitted.policy),
+        "profile": admitted.profile,
     }))
 }
 
@@ -224,7 +205,12 @@ mod tests {
         else {
             unreachable!()
         };
-        parameters.max_allowed_peak_db = -12.0;
+        let crate::protection::Instance::Peak { limit_dbfs, .. } =
+            parameters.policies.get_mut("hf_peak").unwrap()
+        else {
+            unreachable!()
+        };
+        *limit_dbfs = -12.0;
         let changed = config::validate_config(edited, None).unwrap();
         assert_ne!(original.identity().graph, changed.identity().graph);
         assert_ne!(original.identity().profile, changed.identity().profile);

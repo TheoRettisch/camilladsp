@@ -4,8 +4,10 @@
 //! graph changes cannot clear a trip. Only stamped guard output may enter ALSA.
 
 use crate::audiochunk::AudioChunk;
-use crate::{PrcFmt, Res, config};
-use serde::{Deserialize, Serialize};
+use crate::{Res, config};
+mod plan;
+use plan::Plan;
+pub use plan::{Id, Instance, Parameters};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -27,61 +29,21 @@ use state::{
     CandidateObservation, DetectorState, FaultState, OutputActivity, Qualification, StreamState,
 };
 
-/// Fixed protection profile. Configuration fields assert these mappings;
-/// they do not select or remap channels.
+/// Fixed playback geometry for global safety coverage and forwarded telemetry.
 pub const OUTPUT_CHANNELS: [usize; 24] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
 ];
-pub const TWEETER_CHANNELS: [usize; 2] = [0, 1];
+
 pub const CHANNELS: usize = OUTPUT_CHANNELS.len();
 pub const FRAMES: usize = 256;
 pub const SAMPLE_RATE: usize = 48_000;
-// Default DC window; parameter-dependent qualification is compiled in Policy.
+// Reviewed parity fixture window. Runtime admission uses the compiled Q.
+#[cfg(test)]
 pub const QUALIFICATION_FRAMES: u64 = 2 * SAMPLE_RATE as u64;
 
 fn bump(value: u64) -> u64 {
     assert!(value < i64::MAX as u64, "Protection counter exhausted");
     value + 1
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Parameters {
-    /// Must equal OUTPUT_CHANNELS, in order; a fixed-profile assertion.
-    pub output_channels: [usize; CHANNELS],
-    /// Must equal TWEETER_CHANNELS, in order; a fixed-profile assertion.
-    pub tweeter_channels: [usize; TWEETER_CHANNELS.len()],
-    pub max_allowed_peak_db: f64,
-    pub dc_freeze_seconds: f64,
-    pub dc_freeze_peak_rms_tolerance_db: f64,
-    pub level_freshness_epsilon_db: f64,
-    pub max_tweeter_rms_db: Option<f64>,
-    pub tweeter_rms_fault_seconds: f64,
-    pub max_tweeter_avg_power_db: Option<f64>,
-    pub tweeter_avg_power_tau_seconds: f64,
-    pub max_tweeter_long_avg_power_db: Option<f64>,
-    pub tweeter_long_avg_power_tau_seconds: f64,
-    pub tone_min_rms_db: Option<f64>,
-    pub tone_crest_db: f64,
-    pub tone_fault_seconds: f64,
-    pub silence_threshold_db: f64,
-}
-
-impl Parameters {
-    pub fn validate(&self) -> Res<()> {
-        if self.output_channels != OUTPUT_CHANNELS
-            || self.tweeter_channels != TWEETER_CHANNELS
-            || !self.max_allowed_peak_db.is_finite()
-            || self.max_allowed_peak_db > 0.0
-            || self.max_allowed_peak_db < -120.0
-        {
-            return Err(
-                config::ConfigError::new("Invalid protection channel map or peak limit").into(),
-            );
-        }
-        policy::validate(self)?;
-        Ok(())
-    }
 }
 
 /// Validate before constructing or updating any executable graph. The declared
@@ -127,7 +89,6 @@ fn admission(conf: &config::Configuration) -> Res<Parameters> {
                 )
                 .into());
             }
-            parameters.validate()?;
             found = Some(parameters.clone());
         }
     }
@@ -139,24 +100,23 @@ fn admission(conf: &config::Configuration) -> Res<Parameters> {
 /// Compiled once during preparation, never paired with another raw graph.
 #[derive(Clone, Debug)]
 pub(crate) struct AdmittedGuard {
-    parameters: Parameters,
-    peak_limit: PrcFmt,
-    policy: policy::Policy,
+    plan: Box<Plan>,
     identity: identity::Identity,
+    profile: serde_json::Value,
 }
 
 impl AdmittedGuard {
     pub(crate) fn new(conf: &config::Configuration) -> Res<Self> {
-        let parameters = admission(conf)?;
-        let peak_limit = 10.0_f64.powf(parameters.max_allowed_peak_db / 20.0) as PrcFmt;
-        let policy = policy::Policy::new(&parameters);
-        let identity = identity::prepare(conf, &parameters, &policy)?;
+        let (plan, profile) = admission(conf)?.compile()?;
+        let identity = identity::prepare(conf, &profile)?;
         Ok(Self {
-            parameters,
-            peak_limit,
-            policy,
+            plan: Box::new(plan),
+            profile,
             identity,
         })
+    }
+    pub(crate) fn binding(&self) -> [u64; 4] {
+        self.plan.binding
     }
 
     pub(crate) fn identity(&self) -> identity::Identity {
@@ -175,12 +135,32 @@ pub enum Reason {
     LongPower = 6,
     Tone = 7,
     DcFrozen = 8,
+    Numeric = 9,
+}
+
+impl Reason {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Peak => "peak",
+            Self::Nonfinite => "nonfinite",
+            Self::Coverage => "coverage",
+            Self::Rms => "rms",
+            Self::ShortPower => "short_power",
+            Self::LongPower => "long_power",
+            Self::Tone => "crest_tone",
+            Self::DcFrozen => "frozen",
+            Self::Numeric => "numeric",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Trip {
     pub generation: u64,
     pub reason: Reason,
+    pub origin_profile: [u64; 4],
+    pub policy_id: Id,
+    pub destination_id: Id,
     pub channel: Option<usize>,
     pub frame: u64,
     pub at_ns: u64,
@@ -188,6 +168,7 @@ pub struct Trip {
 
 #[derive(Debug)]
 pub struct Shared {
+    binding: std::sync::OnceLock<[u64; 4]>,
     epoch: AtomicU64,
     backend: AtomicU64,
     reset: AtomicU64,
@@ -209,6 +190,7 @@ impl Default for Shared {
         let (backend_wakeup, backend_wakeup_rx) = crossbeam_channel::bounded(1);
         let (pipeline_wakeup, pipeline_wakeup_rx) = crossbeam_channel::bounded(1);
         Self {
+            binding: Default::default(),
             epoch: AtomicU64::new(0),
             backend: AtomicU64::new(1),
             reset: AtomicU64::new(0),
@@ -236,6 +218,24 @@ pub struct Snapshot {
 }
 
 impl Shared {
+    pub fn check_binding(&self, conf: &config::PreparedConfig) -> Res<()> {
+        if self
+            .binding
+            .get()
+            .is_some_and(|b| *b != conf.guard().binding())
+        {
+            return Err(config::ConfigError::new(
+                "Protection destination memory binding requires a cold start",
+            )
+            .into());
+        }
+        Ok(())
+    }
+    pub fn bind_run(&self, conf: &config::PreparedConfig) -> Res<()> {
+        self.binding.get_or_init(|| conf.guard().binding());
+        self.check_binding(conf)
+    }
+
     /// Internal bounded mailbox, not an externally admitted wire operation.
     pub fn submit(&self, command: Command) -> Result<(), crossbeam_channel::TrySendError<Command>> {
         self.commands
@@ -351,7 +351,7 @@ pub fn monotonic_ns() -> u64 {
 #[derive(Debug)]
 pub struct Guard {
     pub(crate) shared: Arc<Shared>,
-    configuration: Option<AdmittedGuard>,
+    configuration: Option<RuntimePlan>,
     stream: StreamState,
     detector: DetectorState,
     fault: FaultState,
@@ -361,11 +361,19 @@ pub struct Guard {
     activity: OutputActivity,
 }
 
+#[derive(Debug)]
+struct RuntimePlan {
+    policy: Plan,
+    identity: identity::Identity,
+}
+
 /// Facts about the original candidate; no sample copies or retained evidence.
 #[derive(Clone, Copy)]
 struct CandidateAssessment {
     shape_valid: bool,
     finite: bool,
+    peaks: [f64; CHANNELS],
+    powers: [f64; CHANNELS],
 }
 
 /// Accounting for the samples actually forwarded after whole-chunk containment.
@@ -392,7 +400,10 @@ impl Guard {
         }
     }
 
-    pub fn install(&mut self, conf: &config::PreparedConfig) {
+    pub fn install(&mut self, conf: &config::PreparedConfig) -> bool {
+        if self.shared.bind_run(conf).is_err() {
+            return false;
+        }
         self.sync_backend();
         // Every admitted replacement retires queued stamps and qualification,
         // preserving the latched trip and accumulated power history.
@@ -410,11 +421,15 @@ impl Guard {
         self.candidate.new_configuration();
         self.qualification.require_attempt();
         self.publish();
-        self.configuration = Some(conf.guard().clone());
+        self.configuration = Some(RuntimePlan {
+            policy: (*conf.guard().plan).clone(),
+            identity: conf.identity(),
+        });
         self.publish();
         // Playback must retire the old PCM generation even when capture sends
         // no more audio or Pause messages. Coalesce without blocking this owner.
         let _ = self.shared.pipeline_wakeup.try_send(());
+        true
     }
 
     pub fn trip(&self) -> Option<Trip> {
@@ -422,7 +437,24 @@ impl Guard {
     }
 
     fn latch(&mut self, reason: Reason, channel: Option<usize>, frame: u64) {
-        self.fault.latch(reason, channel, frame);
+        self.latch_target(reason, channel, frame, Id::default(), Id::default());
+    }
+
+    fn latch_target(
+        &mut self,
+        reason: Reason,
+        channel: Option<usize>,
+        frame: u64,
+        policy_id: Id,
+        destination_id: Id,
+    ) {
+        let origin = self
+            .configuration
+            .as_ref()
+            .map(|c| c.identity.profile)
+            .unwrap_or_default();
+        self.fault
+            .latch(reason, channel, frame, origin, policy_id, destination_id);
         self.qualification.require_attempt();
     }
 
@@ -439,7 +471,7 @@ impl Guard {
             state: self.state(),
             candidate_observable: self.candidate.observable,
             qualified_frames: self.qualification.frames(),
-            short_power_veto: self.detector.short_power_veto,
+            prearm_veto: self.detector.prearm_veto,
             attempt_required: self.qualification.attempt_required(),
             trip_generation: self.fault.generation,
             trip: self.fault.trip,
@@ -480,7 +512,9 @@ impl Guard {
         }
         #[cfg(any(test, feature = "protection-test-capture"))]
         let decision_ns = monotonic_ns();
-        if !self.qualification.is_active() || self.fault.trip.is_some() || !assessment.shape_valid {
+        let masked =
+            !self.qualification.is_active() || self.fault.trip.is_some() || !assessment.shape_valid;
+        if masked {
             for waveform in &mut chunk.waveforms {
                 waveform.fill(0.0);
             }
@@ -488,7 +522,14 @@ impl Guard {
             chunk.minval = 0.0;
         }
         // Activity and RMS describe the forwarded chunk, after containment.
-        let forwarded = self.account_forwarded_output(chunk, assessment.shape_valid);
+        let forwarded = self.account_forwarded_output(
+            if masked {
+                [0.0; CHANNELS]
+            } else {
+                assessment.powers
+            },
+            assessment.shape_valid,
+        );
         let end = monotonic_ns();
         self.stream.processing_valid = assessment.shape_valid;
         self.stream.source_begin_ns = if assessment.shape_valid { begin } else { 0 };
@@ -523,26 +564,34 @@ impl Guard {
             && chunk.waveforms.len() == CHANNELS
             && chunk.waveforms.iter().all(|w| w.len() == FRAMES);
         let mut finite = true;
+        let mut peaks = [0.0_f64; CHANNELS];
+        let mut powers = [0.0; CHANNELS];
         // Assess available instantaneous evidence before a missing-channel fault.
         for (channel, waveform) in chunk.waveforms.iter().take(CHANNELS).enumerate() {
             for (offset, sample) in waveform.iter().take(FRAMES).enumerate() {
-                let reason = if !sample.is_finite() {
+                peaks[channel] = peaks[channel].max(sample.abs());
+                powers[channel] += sample * sample;
+                let frame = self.stream.frames + offset as u64;
+                if !sample.is_finite() {
                     finite = false;
-                    Some(Reason::Nonfinite)
-                } else if TWEETER_CHANNELS.contains(&channel)
-                    && self
-                        .configuration
-                        .as_ref()
-                        .is_some_and(|c| sample.abs() >= c.peak_limit)
+                    self.latch(Reason::Nonfinite, Some(channel), frame);
+                } else if let Some(config) = &self.configuration
+                    && self.fault.trip.is_none()
+                    && sample.abs() >= config.policy.peak_floor[channel]
                 {
-                    Some(Reason::Peak)
-                } else {
-                    None
-                };
-                if let Some(reason) = reason {
-                    self.latch(reason, Some(channel), self.stream.frames + offset as u64);
+                    let selected = config.policy.destinations[..config.policy.count]
+                        .iter()
+                        .filter(|d| d.lane == channel && d.peak.is_some_and(|l| sample.abs() >= l))
+                        .map(|d| (d.policies[Reason::Peak as usize], d.id))
+                        .min();
+                    if let Some((policy, dest)) = selected {
+                        self.latch_target(Reason::Peak, Some(channel), frame, policy, dest);
+                    }
                 }
             }
+        }
+        for power in &mut powers {
+            *power /= FRAMES as f64;
         }
         if !shape_valid {
             self.latch(Reason::Coverage, None, self.stream.frames);
@@ -550,6 +599,8 @@ impl Guard {
         CandidateAssessment {
             shape_valid,
             finite,
+            peaks,
+            powers,
         }
     }
 
@@ -558,26 +609,68 @@ impl Guard {
         let CandidateAssessment {
             shape_valid,
             finite,
+            peaks,
+            powers,
         } = assessment;
         self.observe_main_volume(chunk, shape_valid);
-        self.detector.short_power_veto = false;
+        self.detector.prearm_veto = false;
         if shape_valid && finite {
-            for (history_index, channel) in TWEETER_CHANNELS.into_iter().enumerate() {
-                let result = self.configuration.as_ref().unwrap().policy.assess(
-                    &mut self.detector.history[history_index],
-                    &chunk.waveforms[channel],
-                    self.control.mode == Mode::Prearm,
-                    self.candidate.observable,
-                );
-                self.detector.short_power_veto |= result.veto;
-                if let Some(reason) = result.reason {
-                    self.latch(reason, Some(channel), self.stream.frames + FRAMES as u64);
+            let plan = &self.configuration.as_ref().unwrap().policy;
+            let mut first = None;
+            for (lane, q) in powers.into_iter().enumerate() {
+                if !q.is_finite() {
+                    let key = (0, lane, 0, Id::default(), Id::default());
+                    if first.is_none_or(|(old, _)| key < old) {
+                        first = Some((key, Reason::Numeric));
+                    }
+                    continue;
                 }
+                let peak = peaks[lane];
+                for (i, d) in plan.destinations[..plan.count]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| d.lane == lane)
+                {
+                    let result = d.policy.assess(
+                        &mut self.detector.history[i],
+                        peak,
+                        q,
+                        self.control.mode == Mode::Prearm,
+                        self.candidate.observable,
+                    );
+                    self.detector.prearm_veto |= result.veto;
+                    if let Some(reason) = result.reason {
+                        let numeric = reason == Reason::Numeric;
+                        // The only policy arithmetic capable of overflow after finite q
+                        // is frozen-signature quantization.
+                        let policy =
+                            d.policies[if numeric { Reason::DcFrozen } else { reason } as usize];
+                        let key = (
+                            if numeric { 0 } else { 1 },
+                            lane,
+                            if numeric { 1 } else { reason as usize },
+                            policy,
+                            d.id,
+                        );
+                        if first.is_none_or(|(old, _)| key < old) {
+                            first = Some((key, reason));
+                        }
+                    }
+                }
+            }
+            if let Some(((_, lane, _, policy, dest), reason)) = first {
+                self.latch_target(
+                    reason,
+                    Some(lane),
+                    self.stream.frames + FRAMES as u64,
+                    policy,
+                    dest,
+                );
             }
         } else {
             self.detector.break_continuity();
         }
-        if self.detector.short_power_veto {
+        if self.detector.prearm_veto {
             // A veto restarts a full window, including after local admission
             // while the parent's independent checks are still qualifying.
             self.qualification.restart_window();
@@ -588,7 +681,7 @@ impl Guard {
 
     fn account_forwarded_output(
         &mut self,
-        chunk: &AudioChunk,
+        rms_power: [f64; CHANNELS],
         shape_valid: bool,
     ) -> ForwardedOutput {
         let frame_begin = self.stream.frames;
@@ -596,11 +689,7 @@ impl Guard {
             self.stream.frames = self.stream.frames.checked_add(FRAMES as u64).unwrap();
             assert!(self.stream.frames <= i64::MAX as u64);
         }
-        let mut rms_power = [0.0; CHANNELS];
         if shape_valid {
-            for (rms, waveform) in rms_power.iter_mut().zip(&chunk.waveforms) {
-                *rms = waveform.iter().map(|x| x * x).sum::<PrcFmt>() / FRAMES as f64;
-            }
             if rms_power
                 .iter()
                 .any(|power| *power > self.configuration.as_ref().unwrap().policy.silence_power)
@@ -687,26 +776,12 @@ impl Guard {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::PrcFmt;
 
     pub(crate) fn parameters() -> Parameters {
-        Parameters {
-            output_channels: OUTPUT_CHANNELS,
-            tweeter_channels: TWEETER_CHANNELS,
-            max_allowed_peak_db: -0.5,
-            dc_freeze_seconds: 2.0,
-            dc_freeze_peak_rms_tolerance_db: 0.25,
-            level_freshness_epsilon_db: 0.05,
-            max_tweeter_rms_db: None,
-            tweeter_rms_fault_seconds: 5.0,
-            max_tweeter_avg_power_db: None,
-            tweeter_avg_power_tau_seconds: 5.0,
-            max_tweeter_long_avg_power_db: None,
-            tweeter_long_avg_power_tau_seconds: 90.0,
-            tone_min_rms_db: None,
-            tone_crest_db: 4.5,
-            tone_fault_seconds: 5.0,
-            silence_threshold_db: -70.0,
-        }
+        let fixture: config::Configuration =
+            yaml_serde::from_str(include_str!("../testdata/protection-parity.yml")).unwrap();
+        admission(&fixture).unwrap()
     }
 
     fn guard() -> Guard {
@@ -812,7 +887,8 @@ pub(crate) mod tests {
             for offset in [0, FRAMES - 1] {
                 let mut guard = guard();
                 let mut input = chunk();
-                input.waveforms[channel][offset] = guard.configuration.as_ref().unwrap().peak_limit;
+                input.waveforms[channel][offset] =
+                    guard.configuration.as_ref().unwrap().policy.peak_floor[channel];
                 guard.process(&mut input);
                 assert!(input.waveforms.iter().flatten().all(|s| *s == 0.0));
                 // A hazardous candidate must not appear as output power/activity.
@@ -944,8 +1020,9 @@ pub(crate) mod tests {
         }
         let mut accepted = Vec::new();
         for (name, value) in invalid {
-            let conf = serde_json::from_value(value).unwrap();
-            if config::validate_config(conf, None).is_ok() {
+            if serde_json::from_value(value)
+                .is_ok_and(|conf| config::validate_config(conf, None).is_ok())
+            {
                 accepted.push(name);
             }
         }

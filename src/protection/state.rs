@@ -1,7 +1,7 @@
 //! Owner-side state grouped by lifetime. Stream interruption, epoch changes and
 //! accepted reset deliberately have different preservation rules.
 
-use super::{FRAMES, Reason, TWEETER_CHANNELS, Trip, bump, monotonic_ns, policy};
+use super::{CHANNELS, FRAMES, Id, Reason, Trip, bump, monotonic_ns, policy};
 
 #[derive(Debug, Default)]
 pub(super) struct StreamState {
@@ -52,8 +52,8 @@ impl StreamState {
 
 #[derive(Debug, Default)]
 pub(super) struct DetectorState {
-    pub history: [policy::History; TWEETER_CHANNELS.len()],
-    pub short_power_veto: bool,
+    pub history: [policy::History; CHANNELS],
+    pub prearm_veto: bool,
 }
 
 impl DetectorState {
@@ -61,7 +61,7 @@ impl DetectorState {
         for history in &mut self.history {
             history.break_continuity();
         }
-        self.short_power_veto = false;
+        self.prearm_veto = false;
     }
 
     pub fn accepted_reset(&mut self) {
@@ -77,12 +77,23 @@ pub(super) struct FaultState {
 }
 
 impl FaultState {
-    pub fn latch(&mut self, reason: Reason, channel: Option<usize>, frame: u64) {
+    pub fn latch(
+        &mut self,
+        reason: Reason,
+        channel: Option<usize>,
+        frame: u64,
+        origin_profile: [u64; 4],
+        policy_id: Id,
+        destination_id: Id,
+    ) {
         if self.trip.is_none() {
             self.generation = bump(self.generation);
             self.trip = Some(Trip {
                 generation: self.generation,
                 reason,
+                origin_profile,
+                policy_id,
+                destination_id,
                 channel,
                 frame,
                 at_ns: monotonic_ns(),
