@@ -214,7 +214,7 @@ mod tests {
         let conf = config::validate_config(serde_json::from_value(raw).unwrap(), None).unwrap();
         let frames = conf.config().devices.chunksize;
         let used = config::used_capture_channels(conf.config());
-        let mut pipeline = Pipeline::from_config(conf.into_config(), Default::default());
+        let mut pipeline = Pipeline::from_config(conf.config(), Default::default());
         let mut routed_sample = |sidechain: i16| {
             let frame = [4096, 0, sidechain, i16::MAX]
                 .map(i16::to_le_bytes)

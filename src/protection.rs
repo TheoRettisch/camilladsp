@@ -1206,7 +1206,7 @@ pub(crate) mod tests {
                 params.clone(),
                 0,
             );
-            let mut pipeline = crate::pipeline::Pipeline::from_config(conf, params.clone());
+            let mut pipeline = crate::pipeline::Pipeline::from_config(&conf, params.clone());
             for block in 0..420 {
                 match block {
                     10 | 60 | 160 | 340 => params.set_mute(0, true),
@@ -1235,7 +1235,7 @@ pub(crate) mod tests {
         let mut conf = configuration();
         conf.devices.volume_ramp_time = Some(400.0);
         let params = Arc::new(crate::ProcessingParameters::new(&[0.0; 5], &[true; 5]));
-        let mut pipeline = crate::pipeline::Pipeline::from_config(conf.clone(), params.clone());
+        let mut pipeline = crate::pipeline::Pipeline::from_config(&conf, params.clone());
         let mut guard = Guard::new(params.protection.clone());
         guard.install(&config::validate_config(conf, None).unwrap());
         for block in 0..160 {
@@ -1270,7 +1270,8 @@ pub(crate) mod tests {
                     let mut conf = configuration();
                     conf.devices.volume_ramp_time = Some(400.0);
                     let params = Arc::new(crate::ProcessingParameters::new(&[0.0; 5], &[false; 5]));
-                    let mut pipeline = crate::pipeline::Pipeline::from_config(conf, params.clone());
+                    let mut pipeline =
+                        crate::pipeline::Pipeline::from_config(&conf, params.clone());
                     let mut guard = guard();
                     let mut previous = pipeline.process_chunk(chunk());
                     guard.process(&mut previous);

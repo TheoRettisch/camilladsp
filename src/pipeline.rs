@@ -40,7 +40,7 @@ impl FilterGroup {
     pub fn from_config(
         channel: usize,
         names: &[String],
-        filter_configs: HashMap<String, config::Filter>,
+        filter_configs: &HashMap<String, config::Filter>,
         waveform_length: usize,
         sample_freq: usize,
         processing_params: Arc<ProcessingParameters>,
@@ -104,7 +104,7 @@ impl FilterGroup {
 
     pub fn update_parameters(
         &mut self,
-        filterconfigs: HashMap<String, config::Filter>,
+        filterconfigs: &HashMap<String, config::Filter>,
         changed: &[String],
     ) {
         for filter in &mut self.filters {
@@ -132,7 +132,7 @@ pub struct ParallelFilters {
 impl ParallelFilters {
     pub fn update_parameters(
         &mut self,
-        filterconfigs: HashMap<String, config::Filter>,
+        filterconfigs: &HashMap<String, config::Filter>,
         changed: &[String],
     ) {
         for channel_filters in &mut self.filters {
@@ -179,14 +179,14 @@ pub struct Pipeline {
 impl Pipeline {
     /// Create a new pipeline from a configuration structure.
     pub fn from_config(
-        conf: config::Configuration,
+        conf: &config::Configuration,
         processing_params: Arc<ProcessingParameters>,
     ) -> Self {
         debug!("Build new pipeline");
         trace!("Pipeline config {:?}", conf.pipeline);
         let mut steps = Vec::<PipelineStep>::new();
         let mut num_channels = conf.devices.capture.channels();
-        for step in conf.pipeline.unwrap_or_default() {
+        for step in conf.pipeline.as_deref().unwrap_or_default() {
             match step {
                 config::PipelineStep::Mixer(step) => {
                     if !step.is_bypassed() {
@@ -196,7 +196,7 @@ impl Pipeline {
                             "Add Mixer step with mixer {}, pipeline becomes {} channels wide",
                             step.name, mixconf.channels.out
                         );
-                        let mixer = mixer::Mixer::from_config(step.name, mixconf);
+                        let mixer = mixer::Mixer::from_config(step.name.clone(), mixconf);
                         steps.push(PipelineStep::MixerStep(mixer));
                     }
                 }
@@ -221,7 +221,7 @@ impl Pipeline {
                             let fltgrp = FilterGroup::from_config(
                                 channel,
                                 &step.names,
-                                conf.filters.as_ref().unwrap().clone(),
+                                conf.filters.as_ref().unwrap(),
                                 conf.devices.chunksize,
                                 conf.devices.samplerate,
                                 processing_params.clone(),
@@ -233,7 +233,7 @@ impl Pipeline {
                 config::PipelineStep::Processor(step) => {
                     if !step.is_bypassed() {
                         debug!("Add Processor step with processor {}", step.name);
-                        let procconf = conf.processors.as_ref().unwrap()[&step.name].clone();
+                        let procconf = &conf.processors.as_ref().unwrap()[&step.name];
                         let proc = match procconf {
                             // Compiled as the processing owner's final operation,
                             // after all ordinary steps and before backend admission.
@@ -241,7 +241,7 @@ impl Pipeline {
                             config::Processor::Compressor { parameters, .. } => {
                                 let comp = processors::compressor::Compressor::from_config(
                                     &step.name,
-                                    parameters,
+                                    parameters.clone(),
                                     conf.devices.samplerate,
                                     conf.devices.chunksize,
                                 );
@@ -250,7 +250,7 @@ impl Pipeline {
                             config::Processor::NoiseGate { parameters, .. } => {
                                 let gate = processors::noisegate::NoiseGate::from_config(
                                     &step.name,
-                                    parameters,
+                                    parameters.clone(),
                                     conf.devices.samplerate,
                                     conf.devices.chunksize,
                                 );
@@ -259,7 +259,7 @@ impl Pipeline {
                             config::Processor::RACE { parameters, .. } => {
                                 let race = processors::race::RACE::from_config(
                                     &step.name,
-                                    parameters,
+                                    parameters.clone(),
                                     conf.devices.samplerate,
                                 );
                                 Box::new(race) as Box<dyn Processor>
@@ -298,7 +298,7 @@ impl Pipeline {
 
     pub fn update_parameters(
         &mut self,
-        conf: config::Configuration,
+        conf: &config::Configuration,
         filters: &[String],
         mixers: &[String],
         processors: &[String],
@@ -312,10 +312,10 @@ impl Pipeline {
                     }
                 }
                 PipelineStep::FilterStep(flt) => {
-                    flt.update_parameters(conf.filters.as_ref().unwrap().clone(), filters);
+                    flt.update_parameters(conf.filters.as_ref().unwrap(), filters);
                 }
                 PipelineStep::ParallelFiltersStep(flt) => {
-                    flt.update_parameters(conf.filters.as_ref().unwrap().clone(), filters);
+                    flt.update_parameters(conf.filters.as_ref().unwrap(), filters);
                 }
                 PipelineStep::ProcessorStep(proc) => {
                     if processors.iter().any(|n| n == proc.name()) {

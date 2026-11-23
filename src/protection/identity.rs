@@ -367,8 +367,7 @@ mod tests {
             std::fs::remove_file(&path).unwrap();
 
             let params = std::sync::Arc::new(crate::ProcessingParameters::default());
-            let mut pipeline =
-                crate::pipeline::Pipeline::from_config(prepared.config().clone(), params);
+            let mut pipeline = crate::pipeline::Pipeline::from_config(prepared.config(), params);
             assert_eq!(impulse(&mut pipeline), 0.125);
             assert_eq!(export(&prepared).unwrap(), exported);
             assert_ne!(prepared.identity().graph, changed.identity().graph);
@@ -380,7 +379,7 @@ mod tests {
             else {
                 panic!("a change to the selected FIR taps must update the filter");
             };
-            pipeline.update_parameters(changed.into_config(), &filters, &mixers, &processors);
+            pipeline.update_parameters(changed.config(), &filters, &mixers, &processors);
             assert_eq!(impulse(&mut pipeline), 0.0625);
         }
     }

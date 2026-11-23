@@ -127,7 +127,7 @@ fn replace_pipeline(
     }
     control.reject_armed(protection);
     assert!(protection.install(new_config));
-    let new_config = new_config.config().clone();
+    let new_config = new_config.config();
     match diff {
         config::ConfigChange::Pipeline | config::ConfigChange::MixerParameters => {
             debug!("Rebuilding pipeline.");
@@ -197,7 +197,8 @@ pub fn run_processing(
                    Performance can improve by adding more threads or disabling multithreading."
             );
         }
-        let mut pipeline = pipeline::Pipeline::from_config(conf_proc, processing_params.clone());
+        let mut pipeline = pipeline::Pipeline::from_config(&conf_proc, processing_params.clone());
+        drop(conf_proc);
         debug!("build filters, waiting to start processing loop");
 
         let thread_handle =
@@ -819,8 +820,7 @@ mod tests {
         let params = Arc::new(ProcessingParameters::default());
         let mut guard = params.protection_owner.lock().unwrap();
         guard.install(&conf);
-        let mut pipeline =
-            pipeline::Pipeline::from_config(conf.clone().into_config(), params.clone());
+        let mut pipeline = pipeline::Pipeline::from_config(conf.config(), params.clone());
         let mut control = ProcessingControl {
             paused: false,
             armed: None,

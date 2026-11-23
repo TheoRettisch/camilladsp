@@ -9,7 +9,7 @@ fn setup(muted: bool, ramp_ms: f32) -> (Arc<ProcessingParameters>, Pipeline, Gua
     let params = Arc::new(ProcessingParameters::new(&[0.0; 5], &[muted; 5]));
     let mut conf = configuration();
     conf.devices.volume_ramp_time = Some(ramp_ms);
-    let pipeline = Pipeline::from_config(conf.clone(), params.clone());
+    let pipeline = Pipeline::from_config(&conf, params.clone());
     let mut guard = Guard::new(params.protection.clone());
     guard.install(&config::validate_config(conf, None).unwrap());
     (params, pipeline, guard)
@@ -177,7 +177,7 @@ fn applied_chunk_state_wins_over_later_control_flags_and_survives_mixer() {
         .as_array_mut()
         .unwrap()
         .insert(0, serde_json::json!({"type": "Mixer", "name": "identity"}));
-    let mut pipeline = Pipeline::from_config(serde_json::from_value(conf).unwrap(), params);
+    let mut pipeline = Pipeline::from_config(&serde_json::from_value(conf).unwrap(), params);
     let mixed = pipeline.process_chunk(chunk());
     assert_eq!(
         mixed.main_volume,
@@ -485,7 +485,7 @@ fn fir_reload_with_capture_device_change_retires_epoch_and_queued_output() {
             .playback_snapshot()
             .is_none_or(|s| !s.valid)
     );
-    let mut replacement_pipeline = Pipeline::from_config(replacement.into_config(), params);
+    let mut replacement_pipeline = Pipeline::from_config(replacement.config(), params);
     let forwarded = process(&mut replacement_pipeline, &mut guard);
     assert!(zero(&forwarded));
     assert_eq!(guard.trip(), trip);
