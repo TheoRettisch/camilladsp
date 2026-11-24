@@ -1,4 +1,6 @@
 //! Sealed single-driver voltage-to-displacement estimate. Compilation is off-thread.
+#[path = "lifted.rs"]
+mod lifted;
 use super::{FRAMES, Reason, plan::Id};
 use crate::{Res, config::ConfigError};
 use serde::{Deserialize, Serialize};
@@ -42,6 +44,7 @@ pub struct Pack {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Model {
     pub index: usize,
+    lifted_coefficients: bool,
     matrix: [[f64; 3]; 3],
     input: [f64; 3],
     gain: f64,
@@ -149,8 +152,16 @@ impl Pack {
         if !budget.is_finite() || budget.next_up() > self.error_margin_mm {
             return Err(ConfigError::new("insufficient excursion settling/error budget").into());
         }
+        let lifted_coefficients = matrix
+            .iter()
+            .flatten()
+            .chain(&input)
+            .chain([&self.volts_peak_per_fs])
+            .copied()
+            .all(lifted::coefficient);
         Ok(Model {
             index,
+            lifted_coefficients,
             matrix,
             input,
             gain: self.volts_peak_per_fs,
@@ -257,6 +268,24 @@ struct Trajectory {
 }
 impl Trajectory {
     fn step(&mut self, m: &Model, u: f64) -> Option<f64> {
+        if m.lifted_coefficients
+            && self.s.into_iter().all(lifted::operand)
+            && lifted::operand(self.previous)
+            && lifted::operand(u)
+        {
+            let [i, v, z] = self.s.map(lifted::up);
+            let pair = lifted::up(u) + lifted::up(self.previous);
+            let next: [f64; 3] = std::array::from_fn(|k| {
+                let [a, b, c] = m.matrix[k];
+                lifted::mul(a, i)
+                    + lifted::mul(b, v)
+                    + lifted::mul(c, z)
+                    + lifted::mul(m.input[k], pair)
+            });
+            self.s = next.map(lifted::down);
+            self.previous = u;
+            return Some(lifted::down(lifted::mul(1000., next[2])));
+        }
         let [i, v, z] = self.s;
         let pair = u + self.previous;
         let next = std::array::from_fn(|k| {
@@ -284,8 +313,13 @@ impl Model {
         history.preview = history.forwarded;
         let mut first = None;
         for (offset, x) in samples.iter().enumerate() {
-            let u = self.gain * x;
-            if u.abs() > self.voltage_limit {
+            let u = if self.lifted_coefficients && lifted::operand(*x) {
+                lifted::down(lifted::mul(self.gain, lifted::up(*x)))
+            } else {
+                self.gain * x
+            };
+            let volts = u.to_bits() & !(1 << 63);
+            if volts <= f64::INFINITY.to_bits() && volts > self.voltage_limit.to_bits() {
                 first.get_or_insert((Reason::ModelDomain, offset));
                 continue;
             }
@@ -294,7 +328,13 @@ impl Model {
             let (Some(a), Some(b)) = (candidate, preview) else {
                 return Some((Reason::Numeric, offset));
             };
-            if a.abs().max(b.abs()) + self.margin_mm >= self.limit_mm {
+            let peak = f64::from_bits((a.to_bits() & !(1 << 63)).max(b.to_bits() & !(1 << 63)));
+            let travel = if lifted::operand(peak) && lifted::operand(self.margin_mm) {
+                lifted::down(lifted::up(peak) + lifted::up(self.margin_mm))
+            } else {
+                peak + self.margin_mm
+            };
+            if travel.to_bits() >= self.limit_mm.to_bits() {
                 first.get_or_insert((Reason::Excursion, offset));
             }
         }
