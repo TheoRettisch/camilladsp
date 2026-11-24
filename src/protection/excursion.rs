@@ -44,7 +44,8 @@ pub struct Pack {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Model {
     pub index: usize,
-    lifted_coefficients: bool,
+    lifted_recurrence: bool,
+    lifted_gain: bool,
     matrix: [[f64; 3]; 3],
     input: [f64; 3],
     gain: f64,
@@ -152,16 +153,18 @@ impl Pack {
         if !budget.is_finite() || budget.next_up() > self.error_margin_mm {
             return Err(ConfigError::new("insufficient excursion settling/error budget").into());
         }
-        let lifted_coefficients = matrix
+        // The gain converts samples to volts. Only the 12 recurrence coefficients
+        // multiply trajectory values after that conversion.
+        let lifted_recurrence = matrix
             .iter()
             .flatten()
             .chain(&input)
-            .chain([&self.volts_peak_per_fs])
             .copied()
             .all(lifted::coefficient);
         Ok(Model {
             index,
-            lifted_coefficients,
+            lifted_recurrence,
+            lifted_gain: lifted::coefficient(self.volts_peak_per_fs),
             matrix,
             input,
             gain: self.volts_peak_per_fs,
@@ -268,7 +271,7 @@ struct Trajectory {
 }
 impl Trajectory {
     fn step(&mut self, m: &Model, u: f64) -> Option<f64> {
-        if m.lifted_coefficients
+        if m.lifted_recurrence
             && self.s.into_iter().all(lifted::operand)
             && lifted::operand(self.previous)
             && lifted::operand(u)
@@ -313,7 +316,7 @@ impl Model {
         history.preview = history.forwarded;
         let mut first = None;
         for (offset, x) in samples.iter().enumerate() {
-            let u = if self.lifted_coefficients && lifted::operand(*x) {
+            let u = if self.lifted_gain && lifted::operand(*x) {
                 lifted::down(lifted::mul(self.gain, lifted::up(*x)))
             } else {
                 self.gain * x

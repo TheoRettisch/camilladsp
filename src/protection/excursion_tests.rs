@@ -239,3 +239,36 @@ fn refuse_incompatible_role_wrong_words_and_insufficient_settling() {
     m["coefficient_words"][1] = json!("bfd8999a57138cd7");
     assert!(prepare(vec![("travel", m)]).is_err());
 }
+
+#[test]
+fn tiny_gain_preserves_the_first_excursion_crossing() {
+    let mut m = model();
+    let gain = 6.0e-306_f64;
+    let sample = 1.0 / 1024.0;
+    let margin = 1.0e-315_f64;
+    let bd = f64::from_bits(
+        u64::from_str_radix(m["coefficient_words"][11].as_str().unwrap(), 16).unwrap(),
+    );
+    let volts = gain * sample;
+    let displacement = 1000.0 * (bd * volts);
+    assert!(volts.is_subnormal() && displacement.is_subnormal());
+    let edge = displacement + margin;
+    m["volts_peak_per_fs"] = json!(gain);
+    m["terminal_peak_bound_v"] = json!(volts);
+    m["validated_error_mm"] = json!(0.0);
+    m["error_margin_mm"] = json!(margin);
+    for (limit, crosses) in [(edge, true), (edge.next_up(), false)] {
+        m["limit_mm_one_way"] = json!(limit);
+        let conf = prepare(vec![("travel", m.clone())]).unwrap();
+        for sign in [-1.0, 1.0] {
+            let mut g = guard(&conf);
+            let mut a = audio(0.0);
+            a.waveforms[4][FRAMES - 1] = sign * sample;
+            g.process(&mut a);
+            assert_eq!(
+                g.trip().map(|t| (t.reason, t.frame)),
+                crosses.then_some((Reason::Excursion, FRAMES as u64 - 1))
+            );
+        }
+    }
+}
