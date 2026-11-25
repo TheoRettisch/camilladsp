@@ -19,7 +19,8 @@ pub(super) fn coefficients(expected_highpass_hz: f64) -> Res<BiquadCoefficients>
 }
 
 fn validate_section(c: BiquadCoefficients) -> Res<BiquadCoefficients> {
-    if !c.is_stable() || ![c.b0, c.b1, c.b2].into_iter().all(f64::is_finite) {
+    if !c.is_stable() || !c.b0.is_finite() || !c.b1.is_finite() || c.b0.to_bits() != c.b2.to_bits()
+    {
         return Err(config::ConfigError::new("invalid tweeter LF measurement filter").into());
     }
     Ok(c)
@@ -50,12 +51,46 @@ impl Cascade {
         x
     }
 
-    pub(super) fn block_power(&mut self, c: &BiquadCoefficients, samples: &[f64]) -> Option<f64> {
-        let mut next = *self;
+    // Advance the bounded prefix in lifted coordinates. A large input can
+    // switch coordinates at any sample without repeating its preceding work.
+    fn lifted_prefix(&mut self, c: &BiquadCoefficients, samples: &[f64]) -> (usize, f64) {
+        if !self.stages.iter().flatten().copied().all(lifted::operand) {
+            return (0, 0.0);
+        }
+        let mut stages = self.stages.map(|s| s.map(lifted::up));
+        let mut count = 0;
         let mut sum = 0.0;
         for &sample in samples {
-            let y = next.step(c, sample);
-            sum += lifted::product(y, y);
+            if !lifted::operand(sample) {
+                break;
+            }
+            let mut x = lifted::up(sample);
+            for [s1, s2] in &mut stages {
+                // The admitted low-pass has identical b0 and b2.
+                let feed = lifted::mul(c.b0, x);
+                let y = *s1 + feed;
+                *s1 = *s2 + lifted::mul(c.b1, x) - lifted::mul(c.a1, y);
+                *s2 = feed - lifted::mul(c.a2, y);
+                x = y;
+            }
+            if !x.is_finite() {
+                return (0, 0.0);
+            }
+            sum += lifted::square(lifted::down(x));
+            count += 1;
+        }
+        if !stages.iter().flatten().all(|x| x.is_finite()) {
+            return (0, 0.0);
+        }
+        self.stages = stages.map(|s| s.map(lifted::down));
+        (count, sum)
+    }
+
+    pub(super) fn block_power(&mut self, c: &BiquadCoefficients, samples: &[f64]) -> Option<f64> {
+        let mut next = *self;
+        let (used, mut sum) = next.lifted_prefix(c, samples);
+        for &sample in &samples[used..] {
+            sum += lifted::square(next.step(c, sample));
         }
         // Non-finite outputs propagate into sum. Check the terminal delays too,
         // including the last sample, before committing any part of this block.
@@ -133,9 +168,14 @@ mod tests {
             let c = coefficients(hp).unwrap();
             let mut filter = Cascade::default();
             let mut reference = [[0.0; 2]; 2];
-            for amplitude in [1e-153, 1e-159, 1e-307, f64::from_bits(17), 0.0, 0.25] {
-                let samples: [f64; FRAMES] =
+            for amplitude in [1e-153, 1e-159, 1e-307, f64::from_bits(17), 0.0, 0.25, 0.5] {
+                let mut samples: [f64; FRAMES] =
                     std::array::from_fn(|i| if i % 7 < 3 { amplitude } else { -amplitude });
+                if amplitude == 0.25 {
+                    // Fall back at the last sample, then start the next block
+                    // with large delays. Both must commit the native history.
+                    samples[FRAMES - 1] = 2.0_f64.powi(300);
+                }
                 let mut sum = 0.0;
                 let mut per_sample = filter;
                 for &x in &samples {

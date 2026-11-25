@@ -90,9 +90,21 @@ pub(super) fn product(a: f64, b: f64) -> f64 {
     down(mul(large, up(small)))
 }
 
+#[inline]
+pub(super) fn square(x: f64) -> f64 {
+    let abs = magnitude(x);
+    if abs >= 512 << 52 {
+        x * x // At or above 2^-511 a finite square cannot underflow.
+    } else if abs <= 485 << 52 {
+        0.0 // At or below 2^-538 the square is below half a least subnormal.
+    } else {
+        product(x, x)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{down, mul, product, up};
+    use super::{down, mul, product, square, up};
     use std::hint::black_box;
 
     #[test]
@@ -120,6 +132,18 @@ mod tests {
             }
         }
         assert!(product(f64::INFINITY, -0.0).is_nan());
+    }
+
+    #[test]
+    fn squares_round_on_both_sides_of_underflow_boundaries() {
+        let small = 2.0_f64.powi(-538);
+        for edge in [small, small * std::f64::consts::SQRT_2, 2.0_f64.powi(-511)] {
+            for x in [edge.next_down(), edge, edge.next_up()] {
+                for x in [black_box(x), black_box(-x)] {
+                    assert_eq!(square(x).to_bits(), (x * x).to_bits());
+                }
+            }
+        }
     }
 
     #[test]

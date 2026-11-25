@@ -42,6 +42,7 @@ pub struct Pack {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Model {
     pub index: usize,
+    native_coefficients: bool,
     lifted_state_limit: u64,
     matrix: [[f64; 3]; 3],
     input: [f64; 3],
@@ -159,6 +160,7 @@ impl Pack {
             .to_bits();
         Ok(Model {
             index,
+            native_coefficients: admitted.into_iter().all(native_operand),
             lifted_state_limit,
             matrix,
             input,
@@ -264,8 +266,38 @@ struct Trajectory {
     s: [f64; 3],
     previous: f64,
 }
+
+// Zero or 2^-200 <= |x| <= 2^200. Every operand, including a cancelled
+// voltage sum, is a multiple of 2^-252. Products and partial row sums are
+// multiples of 2^-504, even after rounding. The row magnitude is at most
+// 5 * 2^400 before conversion to mm, so every nonzero intermediate is normal.
+#[inline]
+fn native_operand(x: f64) -> bool {
+    let magnitude = x.abs().to_bits();
+    magnitude == 0 || ((823_u64 << 52)..=(1223_u64 << 52)).contains(&magnitude)
+}
+
 impl Trajectory {
+    fn same_words(&self, other: &Self) -> bool {
+        self.previous.to_bits() == other.previous.to_bits()
+            && self.s.map(f64::to_bits) == other.s.map(f64::to_bits)
+    }
+
     fn step(&mut self, m: &Model, u: f64) -> Option<f64> {
+        if m.native_coefficients
+            && native_operand(u)
+            && native_operand(self.previous)
+            && self.s.into_iter().all(native_operand)
+        {
+            let [i, v, z] = self.s;
+            let pair = u + self.previous;
+            self.s = std::array::from_fn(|k| {
+                let [a, b, c] = m.matrix[k];
+                a * i + b * v + c * z + m.input[k] * pair
+            });
+            self.previous = u;
+            return Some(1000. * self.s[2]);
+        }
         let fits = |x: f64| x.abs().to_bits() <= m.lifted_state_limit;
         if self.s.into_iter().all(fits) && fits(self.previous) && fits(u) {
             let [i, v, z] = self.s.map(lifted::up);
@@ -309,6 +341,20 @@ pub(super) struct History {
 impl Model {
     pub(super) fn assess(&self, history: &mut History, samples: &[f64]) -> Option<(Reason, usize)> {
         history.preview = history.forwarded;
+        if history.candidate.same_words(&history.preview) {
+            let result = self.assess_samples::<true>(history, samples);
+            history.preview = history.candidate;
+            result
+        } else {
+            self.assess_samples::<false>(history, samples)
+        }
+    }
+
+    fn assess_samples<const SHARED: bool>(
+        &self,
+        history: &mut History,
+        samples: &[f64],
+    ) -> Option<(Reason, usize)> {
         let mut first = None;
         for (offset, x) in samples.iter().enumerate() {
             let u = lifted::product(self.gain, *x);
@@ -318,7 +364,11 @@ impl Model {
                 continue;
             }
             let candidate = history.candidate.step(self, u);
-            let preview = history.preview.step(self, u);
+            let preview = if SHARED {
+                candidate
+            } else {
+                history.preview.step(self, u)
+            };
             let (Some(a), Some(b)) = (candidate, preview) else {
                 return Some((Reason::Numeric, offset));
             };
@@ -343,10 +393,7 @@ impl Model {
                     return Some(offset);
                 }
                 // A bit-identical state repeats exactly for the remaining zeros.
-                if offset == 0
-                    && before.previous.to_bits() == 0
-                    && before.s.map(f64::to_bits) == history.forwarded.s.map(f64::to_bits)
-                {
+                if offset == 0 && before.same_words(&history.forwarded) {
                     break;
                 }
             }
@@ -354,5 +401,26 @@ impl Model {
             history.forwarded = history.preview;
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_uses_its_own_previous_voltage_even_with_identical_state() {
+        let pack: Pack =
+            serde_json::from_str(include_str!("../../testdata/excursion-model.json")).unwrap();
+        let mut model = pack.compile(&pack.destination_id, 0).unwrap();
+        let mut history = History::default();
+        history.forwarded.previous = 1.0;
+        model.limit_mm = 1000.0 * model.input[2].abs() + model.margin_mm;
+        assert_eq!(
+            model.assess(&mut history, &[0.0]),
+            Some((Reason::Excursion, 0))
+        );
+        assert_eq!(history.candidate.s[2].to_bits(), 0.0_f64.to_bits());
+        assert_eq!(history.preview.s[2].to_bits(), model.input[2].to_bits());
     }
 }

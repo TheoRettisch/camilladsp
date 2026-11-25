@@ -634,7 +634,7 @@ impl Guard {
         for (channel, waveform) in chunk.waveforms.iter().take(CHANNELS).enumerate() {
             for (offset, sample) in waveform.iter().take(FRAMES).enumerate() {
                 peaks[channel] = peaks[channel].max(sample.abs());
-                powers[channel] += sample * sample;
+                powers[channel] += lifted::square(*sample);
                 let frame = self.stream.frames + offset as u64;
                 if !sample.is_finite() {
                     finite = false;
