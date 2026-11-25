@@ -1,7 +1,5 @@
 //! Sealed single-driver voltage-to-displacement estimate. Compilation is off-thread.
-#[path = "lifted.rs"]
-mod lifted;
-use super::{FRAMES, Reason, plan::Id};
+use super::{FRAMES, Reason, lifted, plan::Id};
 use crate::{Res, config::ConfigError};
 use serde::{Deserialize, Serialize};
 
@@ -44,8 +42,7 @@ pub struct Pack {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Model {
     pub index: usize,
-    lifted_recurrence: bool,
-    lifted_gain: bool,
+    lifted_state_limit: u64,
     matrix: [[f64; 3]; 3],
     input: [f64; 3],
     gain: f64,
@@ -153,18 +150,16 @@ impl Pack {
         if !budget.is_finite() || budget.next_up() > self.error_margin_mm {
             return Err(ConfigError::new("insufficient excursion settling/error budget").into());
         }
-        // The gain converts samples to volts. Only the 12 recurrence coefficients
-        // multiply trajectory values after that conversion.
-        let lifted_recurrence = matrix
-            .iter()
-            .flatten()
-            .chain(&input)
-            .copied()
-            .all(lifted::coefficient);
+        // Each row has three state products and one product of a voltage pair.
+        // Bound their lifted sum by 5 * 2^(498+512), leaving room for the
+        // final factor of 1000. Large coefficients can still advance tiny states.
+        let max_coefficient = admitted.into_iter().map(f64::abs).fold(1.0, f64::max);
+        let lifted_state_limit = (2.0_f64.powi(498) / max_coefficient)
+            .min(2.0_f64.powi(256))
+            .to_bits();
         Ok(Model {
             index,
-            lifted_recurrence,
-            lifted_gain: lifted::coefficient(self.volts_peak_per_fs),
+            lifted_state_limit,
             matrix,
             input,
             gain: self.volts_peak_per_fs,
@@ -271,11 +266,8 @@ struct Trajectory {
 }
 impl Trajectory {
     fn step(&mut self, m: &Model, u: f64) -> Option<f64> {
-        if m.lifted_recurrence
-            && self.s.into_iter().all(lifted::operand)
-            && lifted::operand(self.previous)
-            && lifted::operand(u)
-        {
+        let fits = |x: f64| x.abs().to_bits() <= m.lifted_state_limit;
+        if self.s.into_iter().all(fits) && fits(self.previous) && fits(u) {
             let [i, v, z] = self.s.map(lifted::up);
             let pair = lifted::up(u) + lifted::up(self.previous);
             let next: [f64; 3] = std::array::from_fn(|k| {
@@ -293,7 +285,10 @@ impl Trajectory {
         let pair = u + self.previous;
         let next = std::array::from_fn(|k| {
             let [a, b, c] = m.matrix[k];
-            a * i + b * v + c * z + m.input[k] * pair
+            lifted::product(a, i)
+                + lifted::product(b, v)
+                + lifted::product(c, z)
+                + lifted::product(m.input[k], pair)
         });
         let mm = 1000. * next[2];
         if !mm.is_finite() || !next.iter().all(|v| v.is_finite()) {
@@ -316,11 +311,7 @@ impl Model {
         history.preview = history.forwarded;
         let mut first = None;
         for (offset, x) in samples.iter().enumerate() {
-            let u = if self.lifted_gain && lifted::operand(*x) {
-                lifted::down(lifted::mul(self.gain, lifted::up(*x)))
-            } else {
-                self.gain * x
-            };
+            let u = lifted::product(self.gain, *x);
             let volts = u.to_bits() & !(1 << 63);
             if volts <= f64::INFINITY.to_bits() && volts > self.voltage_limit.to_bits() {
                 first.get_or_insert((Reason::ModelDomain, offset));
@@ -347,8 +338,16 @@ impl Model {
     pub(super) fn commit(&self, history: &mut History, masked: bool) -> Option<usize> {
         if masked {
             for offset in 0..FRAMES {
+                let before = history.forwarded;
                 if history.forwarded.step(self, 0.).is_none() {
                     return Some(offset);
+                }
+                // A bit-identical state repeats exactly for the remaining zeros.
+                if offset == 0
+                    && before.previous.to_bits() == 0
+                    && before.s.map(f64::to_bits) == history.forwarded.s.map(f64::to_bits)
+                {
+                    break;
                 }
             }
         } else {

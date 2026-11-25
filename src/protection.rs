@@ -20,6 +20,7 @@ mod excursion_tests;
 pub mod identity;
 #[cfg(test)]
 mod lifecycle_tests;
+mod lifted;
 pub mod playback;
 mod policy;
 mod record;

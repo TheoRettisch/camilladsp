@@ -68,9 +68,19 @@ impl BiquadCoefficients {
 
     /// Advance one direct-form II transposed section with caller-owned state.
     pub(crate) fn step(&self, input: PrcFmt, s1: &mut PrcFmt, s2: &mut PrcFmt) -> PrcFmt {
-        let out = *s1 + self.b0 * input;
-        *s1 = *s2 + self.b1 * input - self.a1 * out;
-        *s2 = self.b2 * input - self.a2 * out;
+        self.step_with(input, s1, s2, |a, b| a * b)
+    }
+
+    pub(crate) fn step_with(
+        &self,
+        input: PrcFmt,
+        s1: &mut PrcFmt,
+        s2: &mut PrcFmt,
+        mul: impl Fn(PrcFmt, PrcFmt) -> PrcFmt,
+    ) -> PrcFmt {
+        let out = *s1 + mul(self.b0, input);
+        *s1 = *s2 + mul(self.b1, input) - mul(self.a1, out);
+        *s2 = mul(self.b2, input) - mul(self.a2, out);
         out
     }
 

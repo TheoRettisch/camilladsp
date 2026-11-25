@@ -1,5 +1,5 @@
 //! Measurement-only LR4 low-pass on the final tweeter candidate.
-use super::{FRAMES, Reason, SAMPLE_RATE, policy::Assessment};
+use super::{FRAMES, Reason, SAMPLE_RATE, lifted, policy::Assessment};
 use crate::{Res, config, filters::biquad::BiquadCoefficients};
 
 pub(super) fn coefficients(expected_highpass_hz: f64) -> Res<BiquadCoefficients> {
@@ -32,11 +32,22 @@ pub(super) struct Cascade {
 
 impl Cascade {
     fn step(&mut self, coefficients: &BiquadCoefficients, sample: f64) -> f64 {
-        let [first, second] = &mut self.stages;
-        let [s1, s2] = first;
-        let y = coefficients.step(sample, s1, s2);
-        let [s1, s2] = second;
-        coefficients.step(y, s1, s2)
+        let mut x = sample;
+        for [s1, s2] in &mut self.stages {
+            if [x, *s1, *s2].into_iter().all(lifted::operand) {
+                // Keep the additions on the lifted grid as well. Admitted
+                // low-pass coefficients have magnitude below two, leaving
+                // ample exponent range for both sums and the output feedback.
+                let (mut a, mut b) = (lifted::up(*s1), lifted::up(*s2));
+                let out = coefficients.step_with(lifted::up(x), &mut a, &mut b, lifted::mul);
+                *s1 = lifted::down(a);
+                *s2 = lifted::down(b);
+                x = lifted::down(out);
+            } else {
+                x = coefficients.step_with(x, s1, s2, lifted::product);
+            }
+        }
+        x
     }
 
     pub(super) fn block_power(&mut self, c: &BiquadCoefficients, samples: &[f64]) -> Option<f64> {
@@ -44,7 +55,7 @@ impl Cascade {
         let mut sum = 0.0;
         for &sample in samples {
             let y = next.step(c, sample);
-            sum += y * y;
+            sum += lifted::product(y, y);
         }
         // Non-finite outputs propagate into sum. Check the terminal delays too,
         // including the last sample, before committing any part of this block.
@@ -115,6 +126,44 @@ mod tests {
     use super::*;
     use num_complex::Complex64;
     use std::f64::consts::{PI, SQRT_2, TAU};
+
+    #[test]
+    fn tiny_samples_and_decaying_delays_match_native_through_block_cleanup() {
+        for hp in [600.0, 3000.0, 12000.0] {
+            let c = coefficients(hp).unwrap();
+            let mut filter = Cascade::default();
+            let mut reference = [[0.0; 2]; 2];
+            for amplitude in [1e-153, 1e-159, 1e-307, f64::from_bits(17), 0.0, 0.25] {
+                let samples: [f64; FRAMES] =
+                    std::array::from_fn(|i| if i % 7 < 3 { amplitude } else { -amplitude });
+                let mut sum = 0.0;
+                let mut per_sample = filter;
+                for &x in &samples {
+                    let mut y = x;
+                    for [s1, s2] in &mut reference {
+                        y = c.step(y, s1, s2);
+                    }
+                    assert_eq!(per_sample.step(&c, x).to_bits(), y.to_bits());
+                    assert_eq!(
+                        per_sample.stages.map(|s| s.map(f64::to_bits)),
+                        reference.map(|s| s.map(f64::to_bits))
+                    );
+                    sum += y * y;
+                }
+                for delay in reference.iter_mut().flatten() {
+                    if delay.is_subnormal() {
+                        *delay = 0.0;
+                    }
+                }
+                let power = filter.block_power(&c, &samples).unwrap();
+                assert_eq!(power.to_bits(), (sum / FRAMES as f64).to_bits());
+                assert_eq!(
+                    filter.stages.map(|s| s.map(f64::to_bits)),
+                    reference.map(|s| s.map(f64::to_bits))
+                );
+            }
+        }
+    }
 
     #[test]
     fn impulse_response_matches_prewarped_butterworth_pair_across_allowed_corners() {

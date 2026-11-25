@@ -1,6 +1,5 @@
-// The model uses this coordinate change only with the checked coefficient and
-// operand ranges below. Each value in these coordinates is an exact multiple
-// of 2^-562, the lifted least binary64 subnormal.
+// Scale binary64 by 2^512 to avoid hardware subnormal assists. Values on
+// this grid are exact multiples of 2^-562, the lifted least binary64 subnormal.
 const SIGN: u64 = 1 << 63;
 const FRACTION: u64 = (1 << 52) - 1;
 const SHIFT: u64 = 512 << 52;
@@ -8,10 +7,6 @@ const GRID_BOUNDARY: f64 = f64::from_bits(513 << 52); // 2^-510
 
 fn magnitude(x: f64) -> u64 {
     x.to_bits() & !SIGN
-}
-
-pub(super) fn coefficient(x: f64) -> bool {
-    magnitude(x) <= 1151 << 52 // at most 2^128
 }
 
 pub(super) fn operand(x: f64) -> bool {
@@ -76,10 +71,56 @@ pub(super) fn mul(coefficient: f64, lifted: f64) -> f64 {
     }
 }
 
+/// One binary64 product, including gradual underflow, for unrestricted operands.
+#[inline]
+pub(super) fn product(a: f64, b: f64) -> f64 {
+    let ea = magnitude(a) >> 52;
+    let eb = magnitude(b) >> 52;
+    if ea == 2047 || eb == 2047 || (ea != 0 && eb != 0 && ea + eb >= 1024) {
+        return a * b;
+    }
+    // |x| < 2^(E-1022), even for E=0. Below half a least subnormal
+    // the result is signed zero. Otherwise lift the smaller operand: the
+    // unscaled product is tiny, or one operand is subnormal and the other
+    // is at most MAX, so the scaled product cannot overflow.
+    if ea + eb <= 969 {
+        return f64::from_bits((a.to_bits() ^ b.to_bits()) & SIGN);
+    }
+    let (small, large) = if ea <= eb { (a, b) } else { (b, a) };
+    down(mul(large, up(small)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{down, mul, up};
+    use super::{down, mul, product, up};
     use std::hint::black_box;
+
+    #[test]
+    fn unrestricted_products_match_native_at_underflow_and_overflow() {
+        let least = f64::from_bits(1);
+        let operands = [
+            0.0,
+            least,
+            f64::MIN_POSITIVE.next_down(),
+            f64::MIN_POSITIVE,
+            2.0_f64.powi(-538),
+            2.0_f64.powi(-537),
+            0.5,
+            0.5_f64.next_up(),
+            2.0_f64.powi(52),
+            2.0_f64.powi(145),
+            2.0_f64.powi(300),
+            f64::MAX,
+        ];
+        for a in operands {
+            for b in operands {
+                let a = black_box(a);
+                let b = black_box(-b);
+                assert_eq!(product(a, b).to_bits(), (a * b).to_bits());
+            }
+        }
+        assert!(product(f64::INFINITY, -0.0).is_nan());
+    }
 
     #[test]
     fn tiny_product_rounds_once_on_either_side_of_zero() {
