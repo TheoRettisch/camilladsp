@@ -162,6 +162,13 @@ impl Volume {
         // are we above the set limit?
         let target_volume = shared_vol.min(self.volume_limit);
 
+        // A level edit under mute only sets the destination for the next unmute.
+        // Let an ongoing fade to silence finish on its original schedule.
+        if self.mute && shared_mute {
+            self.target_volume = target_volume;
+            return;
+        }
+
         // Volume setting changed
         if (target_volume - self.target_volume).abs() > 0.01 || self.mute != shared_mute {
             if self.mute != shared_mute {

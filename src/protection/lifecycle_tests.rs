@@ -124,6 +124,9 @@ fn admitted_ordinary_mute_and_volume_ramps_keep_native_samples() {
             if block == 30 {
                 params.set_target_volume(0, -12.0);
             }
+            if block == 110 {
+                params.set_target_volume(0, -36.0);
+            }
             let mut input = chunk();
             for waveform in &mut input.waveforms {
                 waveform.fill(sign * 0.1);
@@ -133,6 +136,10 @@ fn admitted_ordinary_mute_and_volume_ramps_keep_native_samples() {
             let mut actual = pipeline.process_chunk(input);
             guard.process(&mut actual);
             assert_eq!(actual.waveforms, expected.waveforms, "block {block}");
+            // The 75-chunk fade started at block 10. Neither edit may extend or restart it.
+            if block >= 85 {
+                assert!(zero(&actual), "muted output at block {block}");
+            }
             assert!(guard.qualification.is_active());
             if block < 10 {
                 assert!(guard.candidate.observable);
@@ -148,6 +155,12 @@ fn admitted_ordinary_mute_and_volume_ramps_keep_native_samples() {
         assert!(zero(&process(&mut pipeline, &mut guard)));
         assert!(!guard.qualification.is_active());
         assert!(guard.qualification.attempt_required());
+        // Observe the native candidate through the opening fade, before guard containment.
+        for _ in 1..75 {
+            pipeline.process_chunk(chunk());
+        }
+        let opened = pipeline.process_chunk(chunk());
+        assert!((opened.waveforms[0][0] - 0.1 * 10.0_f64.powf(-36.0 / 20.0)).abs() < 1e-12);
     }
 }
 
