@@ -61,6 +61,9 @@ pub struct Volume {
     mute: bool,
     opening: bool,
     ramp_start: PrcFmt,
+    ramp_end: PrcFmt,
+    // First chunk of the current ramp segment, numbered from 1 like ramp_step.
+    ramp_start_step: usize,
     ramp_step: usize,
     samplerate: usize,
     chunksize: usize,
@@ -97,6 +100,8 @@ impl Volume {
             ramptime_in_chunks,
             current_volume: current_volume_with_mute as PrcFmt,
             ramp_start: current_volume as PrcFmt,
+            ramp_end: current_volume_with_mute as PrcFmt,
+            ramp_start_step: 1,
             target_volume: current_volume,
             target_linear_gain,
             mute,
@@ -133,25 +138,19 @@ impl Volume {
         )
     }
 
-    fn make_ramp(&self) -> Vec<PrcFmt> {
-        let target_volume = if self.mute {
-            -100.0
-        } else {
-            self.target_volume
-        };
+    /// First sample level and dB change per chunk for the active segment.
+    fn ramp_chunk_db(&self) -> (PrcFmt, PrcFmt) {
+        let chunks = self.ramptime_in_chunks - self.ramp_start_step + 1;
+        let change = (self.ramp_end - self.ramp_start) / chunks as PrcFmt;
+        let start = self.ramp_start + change * (self.ramp_step - self.ramp_start_step) as PrcFmt;
+        (start, change)
+    }
 
-        let ramprange =
-            (target_volume as PrcFmt - self.ramp_start) / self.ramptime_in_chunks as PrcFmt;
-        let stepsize = ramprange / self.chunksize as PrcFmt;
+    fn make_ramp(&self) -> Vec<PrcFmt> {
+        let (start, change) = self.ramp_chunk_db();
+        let stepsize = change / self.chunksize as PrcFmt;
         (0..self.chunksize)
-            .map(|val| {
-                (PrcFmt::coerce(10.0)).powf(
-                    (self.ramp_start
-                        + ramprange * (self.ramp_step as PrcFmt - 1.0)
-                        + val as PrcFmt * stepsize)
-                        / 20.0,
-                )
-            })
+            .map(|val| (PrcFmt::coerce(10.0)).powf((start + val as PrcFmt * stepsize) / 20.0))
             .collect()
     }
 
@@ -180,6 +179,12 @@ impl Volume {
                     self.current_volume, target_volume, shared_mute
                 );
                 self.ramp_start = self.current_volume;
+                self.ramp_end = if shared_mute {
+                    self.volume_limit.min(-100.0)
+                } else {
+                    target_volume
+                } as PrcFmt;
+                self.ramp_start_step = 1;
                 self.ramp_step = 1;
             } else {
                 trace!(
@@ -293,7 +298,22 @@ impl Filter for Volume {
                 / (1000.0 * self.chunksize as f32 / self.samplerate as f32))
                 .round() as usize;
             self.fader = conf.fader as usize;
-            self.volume_limit = conf.limit();
+            let limit = conf.limit();
+            if self.ramp_step > self.ramptime_in_chunks {
+                // A shorter configured ramp may already have reached its deadline.
+                self.ramp_step = 0;
+                self.current_volume = self.ramp_end;
+            } else if self.mute && self.ramp_step > 0 && limit < self.volume_limit {
+                let ceiling = limit as PrcFmt;
+                let (next_db, _) = self.ramp_chunk_db();
+                if next_db > ceiling || self.ramp_end > ceiling {
+                    // Cap the remaining fade from its next sample, keeping the end chunk.
+                    self.ramp_start = next_db.min(ceiling);
+                    self.ramp_end = self.ramp_end.min(self.ramp_start);
+                    self.ramp_start_step = self.ramp_step;
+                }
+            }
+            self.volume_limit = limit;
             if (self.volume_limit as PrcFmt) < self.current_volume {
                 self.current_volume = self.volume_limit as PrcFmt;
             }
@@ -519,7 +539,9 @@ pub fn validate_gain_config(conf: &config::GainParameters) -> Res<()> {
 mod tests {
     use crate::PrcFmt;
     use crate::filters::Filter;
-    use crate::filters::basicfilters::{Delay, Gain};
+    use crate::filters::basicfilters::{Delay, Gain, Volume};
+    use crate::{ProcessingParameters, config};
+    use std::sync::Arc;
 
     fn is_close(left: PrcFmt, right: PrcFmt, maxdiff: PrcFmt) -> bool {
         println!("{left} - {right}");
@@ -533,6 +555,66 @@ mod tests {
             }
         }
         true
+    }
+
+    #[test]
+    fn aux_limit_reload_caps_the_mute_fade_until_its_original_deadline() {
+        let parameters = |limit| config::VolumeParameters {
+            fader: config::VolumeFader::Aux1,
+            ramp_time: Some(100.0),
+            limit: Some(limit),
+        };
+        let reload_limit = |volume: &mut Volume, limit| {
+            volume.update_parameters(config::Filter::Volume {
+                description: None,
+                parameters: parameters(limit),
+            });
+        };
+        let next_chunk = |volume: &mut Volume| {
+            let mut samples = [1.0; 480]; // 10 ms at 48 kHz
+            volume.process_waveform(&mut samples).unwrap();
+            samples
+        };
+
+        for limit in [-40.0, -120.0] {
+            let params = Arc::new(ProcessingParameters::default());
+            let mut volume =
+                Volume::from_config("aux", parameters(0.0), 480, 48_000, params.clone());
+            params.set_mute(1, true);
+            let first = next_chunk(&mut volume);
+            let ceiling = 10.0_f64.powf(limit as f64 / 20.0);
+            assert!(first[first.len() - 1] > ceiling);
+
+            reload_limit(&mut volume, limit);
+            let mut previous = ceiling;
+            for block in 1..10 {
+                if block == 5 {
+                    reload_limit(&mut volume, 0.0); // Relaxing the ceiling must not lift the fade.
+                }
+                let samples = next_chunk(&mut volume);
+                if block == 1 {
+                    assert!(
+                        (samples[0] - ceiling).abs() <= ceiling * 1e-12,
+                        "first gain after reload: {}, expected {ceiling}",
+                        samples[0]
+                    );
+                    if limit == -40.0 {
+                        assert!(samples[samples.len() - 1] < samples[0]);
+                    }
+                }
+                for gain in samples {
+                    assert!(gain > 0.0 && gain <= previous);
+                    previous = gain;
+                }
+            }
+            assert_eq!(next_chunk(&mut volume), [0.0; 480]);
+
+            params.set_mute(1, false);
+            for _ in 0..10 {
+                assert!(next_chunk(&mut volume)[0] < 1.0);
+            }
+            assert_eq!(next_chunk(&mut volume), [1.0; 480]);
+        }
     }
 
     #[test]
