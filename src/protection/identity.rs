@@ -8,6 +8,7 @@ pub const FORK_REVISION: &str = env!("CAMILLA_PROTECTION_BUILD_REVISION");
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Identity {
+    pub sample_rate: u64,
     pub graph: [u64; 4],
     pub profile: [u64; 4],
 }
@@ -115,6 +116,7 @@ pub(super) fn prepare(conf: &config::Configuration, profile: &Value) -> Res<Iden
     // canonicalization so f32 config scalars have the same text semantics.
     let graph: Value = yaml_serde::from_str(&yaml_serde::to_string(conf)?)?;
     Ok(Identity {
+        sample_rate: conf.devices.samplerate as u64,
         graph: digest(&graph)?,
         profile: digest(profile)?,
     })

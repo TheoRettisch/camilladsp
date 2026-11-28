@@ -53,12 +53,12 @@ pub(super) struct Model {
 }
 
 impl Pack {
-    pub(super) fn compile(&self, dest: &str, index: usize) -> Res<Model> {
+    pub(super) fn compile(&self, dest: &str, index: usize, sample_rate: usize) -> Res<Model> {
         let s = &self.si;
         if self.model_type != "sealed_linear_v1"
             || self.loading != "sealed_independent_single_coil"
             || !matches!(self.registration.as_str(), "physical" | "synthetic")
-            || self.sample_rate_hz != 48000
+            || self.sample_rate_hz as usize != sample_rate
             || self.destination_id != dest
             || !Id::valid(dest)
             || !(1..=1875).contains(&self.settle_blocks)
@@ -94,7 +94,7 @@ impl Pack {
             return Err(ConfigError::new("invalid sealed excursion pack").into());
         }
 
-        let t = 1. / 96000.;
+        let t = 0.5 / sample_rate as f64;
         let spring = 1. / s.cms_m_per_n
             + s.rho_kg_per_m3 * s.c_m_per_s * s.c_m_per_s * s.sd_m2 * s.sd_m2 / s.vb_m3;
         let (a, b) = (1. + t * s.re_ohm / s.le_h, t * s.bl_n_per_a / s.le_h);
@@ -412,7 +412,9 @@ mod tests {
     fn preview_uses_its_own_previous_voltage_even_with_identical_state() {
         let pack: Pack =
             serde_json::from_str(include_str!("../../testdata/excursion-model.json")).unwrap();
-        let mut model = pack.compile(&pack.destination_id, 0).unwrap();
+        let mut model = pack
+            .compile(&pack.destination_id, 0, crate::protection::SAMPLE_RATE)
+            .unwrap();
         let mut history = History::default();
         history.forwarded.previous = 1.0;
         model.limit_mm = 1000.0 * model.input[2].abs() + model.margin_mm;

@@ -1,15 +1,18 @@
 //! Measurement-only LR4 low-pass on the final tweeter candidate.
-use super::{FRAMES, Reason, SAMPLE_RATE, lifted, policy::Assessment};
+use super::{FRAMES, Reason, lifted, policy::Assessment};
 use crate::{Res, config, filters::biquad::BiquadCoefficients};
 
-pub(super) fn coefficients(expected_highpass_hz: f64) -> Res<BiquadCoefficients> {
+pub(super) fn coefficients(
+    expected_highpass_hz: f64,
+    sample_rate: usize,
+) -> Res<BiquadCoefficients> {
     if !(600.0..=12000.0).contains(&expected_highpass_hz) {
         return Err(
             config::ConfigError::new("invalid expected tweeter high-pass frequency").into(),
         );
     }
     let c = BiquadCoefficients::from_config(
-        SAMPLE_RATE,
+        sample_rate,
         config::BiquadParameters::Lowpass {
             freq: expected_highpass_hz / 3.0,
             q: std::f64::consts::FRAC_1_SQRT_2,
@@ -159,13 +162,14 @@ impl TweeterLf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protection::SAMPLE_RATE;
     use num_complex::Complex64;
     use std::f64::consts::{PI, SQRT_2, TAU};
 
     #[test]
     fn tiny_samples_and_decaying_delays_match_native_through_block_cleanup() {
         for hp in [600.0, 3000.0, 12000.0] {
-            let c = coefficients(hp).unwrap();
+            let c = coefficients(hp, SAMPLE_RATE).unwrap();
             let mut filter = Cascade::default();
             let mut reference = [[0.0; 2]; 2];
             for amplitude in [1e-153, 1e-159, 1e-307, f64::from_bits(17), 0.0, 0.25, 0.5] {
@@ -210,7 +214,7 @@ mod tests {
         let fs = SAMPLE_RATE as f64;
         for hp in (600..=12000).step_by(100) {
             let corner = f64::from(hp) / 3.0;
-            let c = coefficients(f64::from(hp)).unwrap();
+            let c = coefficients(f64::from(hp), SAMPLE_RATE).unwrap();
             let mut filter = Cascade::default();
             let impulse: Vec<_> = (0..8 * FRAMES)
                 .map(|i| filter.step(&c, f64::from(i == 0)))
@@ -243,10 +247,10 @@ mod tests {
             }
             assert!((step.step(&c, 1.0) - 1.0).abs() < 2e-11);
         }
-        let mut unstable = coefficients(600.0).unwrap();
+        let mut unstable = coefficients(600.0, SAMPLE_RATE).unwrap();
         unstable.a2 = 1.0;
         assert!(validate_section(unstable).is_err());
-        let mut nonfinite = coefficients(12000.0).unwrap();
+        let mut nonfinite = coefficients(12000.0, SAMPLE_RATE).unwrap();
         nonfinite.b1 = f64::NAN;
         assert!(validate_section(nonfinite).is_err());
     }

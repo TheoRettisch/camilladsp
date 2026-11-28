@@ -46,6 +46,10 @@ pub const OUTPUT_CHANNELS: [usize; 24] = [
 pub const CHANNELS: usize = OUTPUT_CHANNELS.len();
 pub const FRAMES: usize = 256;
 pub const SAMPLE_RATE: usize = 48_000;
+pub(crate) const RATE_44100: usize = 44_100;
+pub(crate) const PERIOD_44100: usize = 128;
+pub(crate) const BUFFER_44100: usize = 1024;
+const TARGET_44100: usize = 768;
 // Reviewed parity fixture window. Runtime admission uses the compiled Q.
 #[cfg(test)]
 pub const QUALIFICATION_FRAMES: u64 = 2 * SAMPLE_RATE as u64;
@@ -64,12 +68,12 @@ fn admission(conf: &config::Configuration) -> Res<Parameters> {
         )
         .into());
     }
-    if conf.devices.samplerate != SAMPLE_RATE
+    if !matches!(conf.devices.samplerate, SAMPLE_RATE | RATE_44100)
         || conf.devices.chunksize != FRAMES
         || conf.devices.playback.channels() != CHANNELS
     {
         return Err(config::ConfigError::new(
-            "Protection requires 48000 Hz, 256 frames and 24 outputs",
+            "Protection requires 44100 or 48000 Hz, 256 frames and 24 outputs",
         )
         .into());
     }
@@ -84,6 +88,21 @@ fn admission(conf: &config::Configuration) -> Res<Parameters> {
             "Protection requires direct hw: ALSA S24_3_LE playback",
         )
         .into());
+    }
+    if conf.devices.samplerate == RATE_44100 {
+        let native_capture = matches!(&conf.devices.capture,
+            config::CaptureDevice::Alsa { device, channels: 4, format: Some(config::AlsaSampleFormat::S32_LE), .. }
+            if device.starts_with("hw:"));
+        if !native_capture
+            || conf.devices.capture_samplerate() != RATE_44100
+            || conf.devices.resampler.is_some()
+            || !conf.devices.rate_adjust()
+            || conf.devices.target_level() != TARGET_44100
+        {
+            return Err(config::ConfigError::new(
+                "44100 Hz protection requires native four-channel S32_LE hw: capture, rate adjust and a 768-frame target",
+            ).into());
+        }
     }
     let pipeline = conf.pipeline.as_deref().unwrap_or_default();
     let mut found = None;
@@ -116,7 +135,7 @@ pub(crate) struct AdmittedGuard {
 
 impl AdmittedGuard {
     pub(crate) fn new(conf: &config::Configuration) -> Res<Self> {
-        let (plan, profile) = admission(conf)?.compile()?;
+        let (plan, profile) = admission(conf)?.compile(conf.devices.samplerate)?;
         let identity = identity::prepare(conf, &profile)?;
         Ok(Self {
             plan: Box::new(plan),
@@ -1103,7 +1122,7 @@ pub(crate) mod tests {
             invalid.push((name, nonfinal));
         }
         for (name, key, value) in [
-            ("sample rate", "samplerate", 44100),
+            ("sample rate", "samplerate", 88200),
             ("chunk size", "chunksize", 128),
         ] {
             let mut wrong_shape = base.clone();

@@ -281,7 +281,7 @@ fn final_sample_impulse_resolves_adjacent_powers_at_inclusive_threshold() {
     // On the last sample with zero history, y = b0 * (b0 * input).
     // Choose a representable impulse whose single-sample block power is
     // exactly the compiled threshold. Its neighbors straddle that power.
-    let c = tweeter_lf::coefficients(3000.0).unwrap();
+    let c = tweeter_lf::coefficients(3000.0, SAMPLE_RATE).unwrap();
     let limit = 10f64.powf(-159.0 / 10.0);
     let equal = (limit * FRAMES as f64).sqrt() / c.b0 / c.b0;
     for (pulse, order) in [

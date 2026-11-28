@@ -264,7 +264,7 @@ mod tests {
     fn destination_policy(p: &Value) -> Policy {
         let (plan, _) = serde_json::from_value::<Parameters>(p.clone())
             .unwrap()
-            .compile()
+            .compile(SAMPLE_RATE)
             .unwrap();
         plan.destinations
             .iter()
@@ -456,7 +456,7 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Parameters>(p)
                 .unwrap()
-                .compile()
+                .compile(SAMPLE_RATE)
                 .unwrap()
                 .0
                 .qualification_frames,
@@ -667,7 +667,8 @@ mod tests {
         let mut p = fixture();
         p["policies"]["long"] = power("long_power", -30.0, 90.0);
         let valid = |p: &Value| {
-            serde_json::from_value::<Parameters>(p.clone()).is_ok_and(|p| p.compile().is_ok())
+            serde_json::from_value::<Parameters>(p.clone())
+                .is_ok_and(|p| p.compile(SAMPLE_RATE).is_ok())
         };
         assert!(!valid(&p));
         p["policies"]["short"] = power("short_power", -20.0, 5.0);

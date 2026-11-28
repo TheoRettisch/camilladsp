@@ -441,6 +441,7 @@ fn open_pcm(
     sample_format: &Option<AlsaSampleFormat>,
     buf_manager: &mut dyn DeviceBufferManager,
     capture: bool,
+    engine_rate: usize,
 ) -> Res<(alsa::PCM, AlsaSampleFormat)> {
     let direction = if capture { "Capture" } else { "Playback" };
     debug!(
@@ -503,6 +504,13 @@ fn open_pcm(
     {
         // Set software parameters
         let hwp = pcmdev.hw_params_current()?;
+        if engine_rate == crate::protection::RATE_44100
+            && (hwp.get_rate()? != samplerate
+                || hwp.get_period_size()? != crate::protection::PERIOD_44100 as Frames
+                || hwp.get_buffer_size()? != crate::protection::BUFFER_44100 as Frames)
+        {
+            return Err(DeviceError::new("44100 Hz protection requires a 128-frame period and 1024-frame buffer at the requested rate").into());
+        }
         let swp = pcmdev.sw_params_current()?;
         buf_manager.apply_start_threshold(&swp)?;
         buf_manager.apply_avail_min(&swp)?;
@@ -1224,6 +1232,7 @@ impl PlaybackDevice for AlsaPlaybackDevice {
                     &conf_sample_format,
                     &mut buf_manager,
                     false,
+                    samplerate,
                 ) {
                     Ok((pcmdevice, sample_format)) => {
                         match status_channel.send(StatusMessage::PlaybackReady) {
@@ -1320,6 +1329,7 @@ impl CaptureDevice for AlsaCaptureDevice {
                     &conf_sample_format,
                     &mut buf_manager,
                     true,
+                    samplerate,
                 ) {
                     Ok((pcmdevice, sample_format)) => {
                         match status_channel.send(StatusMessage::CaptureReady) {
@@ -1402,6 +1412,7 @@ mod protection_tests {
             &Some(AlsaSampleFormat::S24_3_LE),
             &mut manager,
             false,
+            SAMPLE_RATE,
         )
         .unwrap();
         (pcm, manager)

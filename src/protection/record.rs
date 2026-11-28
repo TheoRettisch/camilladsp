@@ -7,7 +7,7 @@ use super::control::{self, ControlSnapshot, Mode, Receipt, State};
 use super::{CHANNELS, Reason, Trip, identity};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(super) const GUARD_WORDS: usize = 57;
+pub(super) const GUARD_WORDS: usize = 58;
 pub(super) const PLAYBACK_WORDS: usize = 43;
 
 /// Every element is atomic; the sequence counter does not excuse non-atomic
@@ -224,6 +224,7 @@ impl GuardRecord {
         e.put(receipt.map_or(0, |r| r.revision));
         e.put(receipt.map_or(0, |r| r.parent_reset_generation));
         e.put(receipt.map_or(0, |r| r.qualification_id));
+        e.put(self.identity.sample_rate);
         for word in self.identity.graph.into_iter().chain(self.identity.profile) {
             e.put(word);
         }
@@ -301,6 +302,7 @@ impl GuardRecord {
             }),
         };
         let identity = identity::Identity {
+            sample_rate: d.take(),
             graph: std::array::from_fn(|_| d.take()),
             profile: std::array::from_fn(|_| d.take()),
         };
@@ -485,6 +487,7 @@ mod tests {
                 }),
             },
             identity: identity::Identity {
+                sample_rate: 44100,
                 graph: [125, 126, 127, 128],
                 profile: [129, 130, 131, 132],
             },

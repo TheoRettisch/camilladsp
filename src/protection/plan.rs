@@ -1,5 +1,5 @@
 //! Closed graph schema and off-thread compilation for the final audio guard.
-use super::{CHANNELS, FRAMES, Reason, SAMPLE_RATE, identity, policy::Policy};
+use super::{CHANNELS, FRAMES, Reason, identity, policy::Policy};
 use crate::{Res, config::ConfigError};
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -203,20 +203,20 @@ fn positive(value: f64) -> Res<f64> {
         Err(invalid("invalid positive protection parameter"))
     }
 }
-fn frames(seconds: f64) -> Res<u64> {
-    let count = (positive(seconds)? * SAMPLE_RATE as f64).ceil();
+fn frames(seconds: f64, sample_rate: usize) -> Res<u64> {
+    let count = (positive(seconds)? * sample_rate as f64).ceil();
     if count >= i64::MAX as f64 {
         return Err(invalid("protection duration overflow"));
     }
     Ok(count as u64)
 }
-fn alpha(tau: f64) -> Res<f64> {
-    frames(tau)?;
-    positive(-(-(FRAMES as f64 / SAMPLE_RATE as f64) / tau).exp_m1())
+fn alpha(tau: f64, sample_rate: usize) -> Res<f64> {
+    frames(tau, sample_rate)?;
+    positive(-(-(FRAMES as f64 / sample_rate as f64) / tau).exp_m1())
 }
 
 impl Parameters {
-    pub(super) fn compile(&self) -> Res<(Plan, Value)> {
+    pub(super) fn compile(&self, sample_rate: usize) -> Res<(Plan, Value)> {
         if self.routing_sha256.len() != 64
             || !self
                 .routing_sha256
@@ -302,7 +302,7 @@ impl Parameters {
                     } => {
                         ceiling = ceiling.max(limit_dbfs);
                         p.rms_limit = Some(power(limit_dbfs)?);
-                        p.rms_frames = frames(hold_s)?;
+                        p.rms_frames = frames(hold_s, sample_rate)?;
                         p.rms_frames
                     }
                     Instance::ShortPower {
@@ -310,17 +310,17 @@ impl Parameters {
                     } => {
                         ceiling = ceiling.max(limit_dbfs);
                         p.short_limit = Some(power(limit_dbfs)?);
-                        p.short_alpha = alpha(tau_s)?;
-                        p.prearm_alpha = alpha(tau_s / 2.5)?;
+                        p.short_alpha = alpha(tau_s, sample_rate)?;
+                        p.prearm_alpha = alpha(tau_s / 2.5, sample_rate)?;
                         short = Some((limit_dbfs, tau_s));
-                        frames(2.0 * tau_s)?
+                        frames(2.0 * tau_s, sample_rate)?
                     }
                     Instance::LongPower {
                         limit_dbfs, tau_s, ..
                     } => {
                         ceiling = ceiling.max(limit_dbfs);
                         p.long_limit = Some(power(limit_dbfs)?);
-                        p.long_alpha = alpha(tau_s)?;
+                        p.long_alpha = alpha(tau_s, sample_rate)?;
                         long = Some((limit_dbfs, tau_s));
                         0
                     }
@@ -336,7 +336,7 @@ impl Parameters {
                         ceiling = ceiling.max(min_rms_dbfs);
                         p.tone_limit = Some(power(min_rms_dbfs)?);
                         p.tone_crest = positive(max_crest_db)?;
-                        p.tone_frames = frames(hold_s)?;
+                        p.tone_frames = frames(hold_s, sample_rate)?;
                         p.tone_frames
                     }
                     Instance::Excursion { ref model, .. } => {
@@ -345,7 +345,7 @@ impl Parameters {
                                 "excursion requires one sub or midwoofer destination",
                             ));
                         }
-                        dest.model = Some(model.compile(id, plan.model_count)?);
+                        dest.model = Some(model.compile(id, plan.model_count, sample_rate)?);
                         plan.model_count += 1;
                         model_binding = Some(model);
                         FRAMES as u64 * u64::from(model.settle_blocks)
@@ -370,7 +370,10 @@ impl Parameters {
                             .entry((signal.lane, expected_highpass_hz.to_bits()))
                             .or_insert(index);
                         p.tweeter_lf = Some(super::tweeter_lf::TweeterLf {
-                            coefficients: super::tweeter_lf::coefficients(expected_highpass_hz)?,
+                            coefficients: super::tweeter_lf::coefficients(
+                                expected_highpass_hz,
+                                sample_rate,
+                            )?,
                             source,
                             limit_power: power(limit_dbfs)?,
                             energy_blocks,
@@ -411,7 +414,7 @@ impl Parameters {
                         p.freeze_floor = Some(power(floor_dbfs)?);
                         p.dc_tolerance = positive(crest_tolerance_db)?;
                         p.epsilon = positive(quantum_db)?;
-                        p.dc_frames = frames(hold_s)?;
+                        p.dc_frames = frames(hold_s, sample_rate)?;
                         p.dc_frames
                     }
                 };
@@ -440,13 +443,22 @@ impl Parameters {
                 ]),
             );
         }
-        plan.binding = identity::digest(&json!([self.routing_sha256, bindings]))?;
+        plan.binding = identity::digest(&json!([sample_rate, self.routing_sha256, bindings]))?;
         resolved.sort_by_key(|&(name, kind, id, _, _)| (name, kind, id));
         let targets:Vec<_>=resolved.into_iter().map(|(policy,kind,destination,lane,role)|
             json!({ "policy":policy, "kind":kind, "destination":destination, "lane":lane, "role":role })).collect();
-        let profile = json!({"parameters":self, "algorithms":algorithms, "resolved_targets":targets,
+        let mut profile = json!({"parameters":self, "algorithms":algorithms, "resolved_targets":targets,
             "qualification_frames":plan.qualification_frames, "qualification_rule":"candidate-baseline-max-windows-v2",
             "activity_rule":"all-forwarded-power-v1", "precedence":"channel-sample-kind-id-v2", "short_prearm_factor":2.5});
+        // Protocol 2's original profile encodes the fixed 48 kHz contract.
+        // Bind the new rate explicitly even for a peak-only or block-count policy.
+        if sample_rate == super::RATE_44100 {
+            profile["geometry"] = json!({
+                "sample_rate": sample_rate, "chunk_frames": FRAMES, "playback_channels": CHANNELS,
+                "period_frames": super::PERIOD_44100, "buffer_frames": super::BUFFER_44100,
+                "target_level": super::TARGET_44100
+            });
+        }
         Ok((plan, profile))
     }
 }
@@ -469,6 +481,44 @@ mod tests {
         let mut graph = serde_json::to_value(p)?;
         edit(&mut graph["processors"]["protection"]["parameters"]);
         config::validate_config(serde_json::from_value(graph)?, None)
+    }
+
+    #[test]
+    fn native_rate_binds_guard_timing_and_live_identity_to_the_open_pipeline() {
+        let legacy = parity();
+        let mut graph = legacy.config().clone();
+        graph.devices.samplerate = super::super::RATE_44100;
+        let native = config::validate_config(graph.clone(), None).unwrap();
+        let export = identity::export(&native).unwrap();
+        assert_eq!(export["profile"]["qualification_frames"], 88_200);
+        graph.devices.target_level = Some(256);
+        assert!(config::validate_config(graph, None).is_err());
+
+        let shared = Arc::new(Shared::default());
+        let mut guard = Guard::new(shared.clone());
+        assert!(guard.install(&native));
+        let _playback = crate::protection::playback::Playback::new(shared.clone());
+        let live = crate::protection::wire::tests::status(&shared);
+        assert_eq!(live["identity"]["sample_rate"], 44_100);
+        for key in ["graph_sha256", "profile_sha256"] {
+            assert_eq!(live["identity"][key], export[key]);
+        }
+        assert!(shared.check_binding(&legacy).is_err());
+
+        // Identical frame counts must still distinguish the effective policies.
+        let peak_only = |params: &mut Value| {
+            params["policies"]
+                .as_object_mut()
+                .unwrap()
+                .retain(|_, p| p["kind"] == "peak");
+        };
+        let a = changed(&legacy, peak_only).unwrap();
+        let b = changed(&native, peak_only).unwrap();
+        assert_eq!(
+            a.guard().plan.qualification_frames,
+            b.guard().plan.qualification_frames
+        );
+        assert_ne!(a.identity().profile, b.identity().profile);
     }
 
     #[test]

@@ -2403,7 +2403,14 @@ This is intended for the user and is not used by CamillaDSP itself.
 
 ### Protection (final output guard)
 
-One enabled `Protection` processor must end the 48 kHz, 256-frame pipeline.
+One enabled `Protection` processor must end the 44.1 or 48 kHz, 256-frame pipeline.
+At 44.1 kHz the protected graph uses native four-channel S32_LE hardware capture,
+rate adjustment and a 768-frame playback target. Both direct ALSA endpoints
+must open with 128-frame periods and 1,024-frame buffers. The effective profile
+includes this geometry. Time-based policies use the graph rate, so a two-second
+window needs 88,200 frames after baseline and reaches 88,320 on full chunks.
+A rate change requires a cold DSP start and fresh qualification. Excursion
+packs must match the graph rate and its recomputed coefficient words.
 The guard checks shape and finite samples on all 24 final playback channels.
 Its signals name distinct lanes and roles. Destinations name individual speaker
 feeds and may share a signal. Each policy names its kind, parameters and sorted

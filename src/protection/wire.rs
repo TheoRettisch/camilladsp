@@ -202,7 +202,7 @@ impl Shared {
                 "epoch_frame_floor": guard.frame_floor,
                 "identity": {"fork_revision": identity::FORK_REVISION,
                     "graph_sha256": identity::hex(guard.identity.graph), "profile_sha256": identity::hex(guard.identity.profile),
-                    "backend": "alsa-hw-ring-v1", "sample_rate": super::SAMPLE_RATE, "chunk_frames": super::FRAMES,
+                    "backend": "alsa-hw-ring-v1", "sample_rate": guard.identity.sample_rate, "chunk_frames": super::FRAMES,
                     "playback_channels":super::CHANNELS},
                 "guard": {"state": state, "final": guard.final_guard, "coverage_valid": guard.final_guard && guard.processing_valid,
                     "candidate_observable": guard.candidate_observable, "prearm_veto": guard.prearm_veto,
